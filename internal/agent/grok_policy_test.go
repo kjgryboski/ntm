@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -50,6 +51,29 @@ func TestDefaultGrokAutomationACPPolicyIsExplicitAndDigestStable(t *testing.T) {
 	}
 	if digest := DefaultGrokAutomationPolicySHA256(); len(digest) != 64 || digest != DefaultGrokAutomationPolicySHA256() {
 		t.Fatalf("policy digest = %q", digest)
+	}
+}
+
+func TestGrokAutomationLifecyclePolicyArgsOmitOnlySessionBoundSandbox(t *testing.T) {
+	for _, name := range []string{DefaultGrokAutomationPolicyName, GrokWorkspaceWritePolicyName} {
+		full := GrokAutomationACPPolicyArgs(name)
+		lifecycle := GrokAutomationLifecyclePolicyArgs(name)
+		want := make([]string, 0, len(full)-1)
+		for _, arg := range full {
+			if strings.HasPrefix(arg, "--sandbox=") {
+				continue
+			}
+			want = append(want, arg)
+		}
+		if !slices.Equal(lifecycle, want) {
+			t.Fatalf("policy %q lifecycle args changed more than sandbox: got=%#v want=%#v", name, lifecycle, want)
+		}
+		if strings.Contains(strings.Join(lifecycle, "\n"), "--sandbox=") {
+			t.Fatalf("policy %q lifecycle args still force a sandbox: %#v", name, lifecycle)
+		}
+	}
+	if args := GrokAutomationLifecyclePolicyArgs("unknown"); args != nil {
+		t.Fatalf("unknown lifecycle policy args = %#v, want nil", args)
 	}
 }
 

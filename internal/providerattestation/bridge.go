@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/providercredential"
@@ -462,7 +463,7 @@ func validateBridgeSessionReceipt(object map[string]json.RawMessage) error {
 		return errors.New("session receipt is not an object")
 	}
 	required := []string{"action", "fork", "parent_session_sha256", "cwd_sha256", "worktree_sha256", "policy_sha256", "lineage_bound", "provider_acknowledged", "completion_confirmed", "stderr", "cancellation"}
-	allowed := append(required, "child_session_sha256", "config_sha256", "binary_sha256", "nonce_sha256", "stop_reason", "model", "model_evidence", "usage", "output_sha256", "exit_code")
+	allowed := append(required, "child_session_sha256", "config_sha256", "binary_sha256", "nonce_sha256", "stop_reason", "requested_model", "expected_receipt_model", "model", "model_evidence", "usage", "output_sha256", "exit_code")
 	if err := bridgeAllowed(receipt, required, allowed...); err != nil {
 		return err
 	}
@@ -479,6 +480,19 @@ func validateBridgeSessionReceipt(object map[string]json.RawMessage) error {
 	if action, ok := bridgeString(receipt, "action"); !ok || action != "resume" && action != "fork" {
 		return errors.New("session receipt action is invalid")
 	}
+	_, hasRequestedModel := receipt["requested_model"]
+	_, hasExpectedReceiptModel := receipt["expected_receipt_model"]
+	if hasRequestedModel != hasExpectedReceiptModel {
+		return errors.New("session receipt model binding is incomplete")
+	}
+	for _, name := range []string{"stop_reason", "requested_model", "expected_receipt_model", "model", "model_evidence"} {
+		if _, present := receipt[name]; present {
+			value, valid := bridgeString(receipt, name)
+			if !valid || len(value) > 4096 || strings.IndexFunc(value, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+				return fmt.Errorf("session receipt field %q is invalid", name)
+			}
+		}
+	}
 	for _, name := range []string{"fork", "lineage_bound", "provider_acknowledged", "completion_confirmed"} {
 		var value bool
 		if json.Unmarshal(receipt[name], &value) != nil {
@@ -492,6 +506,11 @@ func validateBridgeSessionReceipt(object map[string]json.RawMessage) error {
 	cancellation, ok := bridgeObject(receipt, "cancellation")
 	if !ok || bridgeAllowed(cancellation, []string{"provider_acknowledged", "local_termination", "residual_pids", "observed_at"}, "provider_acknowledged", "local_termination", "residual_pids", "observed_at") != nil || !bridgeTimestamp(cancellation, "observed_at") {
 		return errors.New("session cancellation receipt is invalid")
+	}
+	var providerAcknowledged bool
+	var residualPIDs []int32
+	if _, valid := bridgeString(cancellation, "local_termination"); !valid || json.Unmarshal(cancellation["provider_acknowledged"], &providerAcknowledged) != nil || json.Unmarshal(cancellation["residual_pids"], &residualPIDs) != nil || residualPIDs == nil {
+		return errors.New("session cancellation receipt fields are invalid")
 	}
 	return nil
 }

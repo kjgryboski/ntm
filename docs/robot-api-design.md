@@ -319,6 +319,14 @@ and cleanup can be authoritative for the locally observed process tree while
 provider-side cancellation remains unavailable; the capability output exposes
 that authority scope explicitly.
 
+The parent session owns its sandbox selection. Lifecycle invocations therefore
+inherit that sandbox and retain the complete compiled permission-rule set. The
+completion model check uses an exact, runtime-pinned binding: Grok CLI `1.0.13`
+may map selectable `grok-4.6` only to receipt token `grok-4.6-build`; every
+unknown version/model combination falls back to exact equality. The signed
+receipt records the requested alias, expected receipt token, and actual
+provider token separately.
+
 Cooperating local NTM processes share exact-identity concurrency, token-bucket,
 backoff, and circuit state through a crash-tolerant local store. This is not a
 fleet-wide reservation. A process-local fallback is surfaced by doctor and

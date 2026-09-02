@@ -17,10 +17,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/process"
+
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 )
 
 const HeadlessStreamingJSON = "streaming-json"
@@ -45,11 +48,15 @@ type SessionRequest struct {
 	// Worktree identifies the already-created worktree this session is bound
 	// to. It is receipt context only: lifecycle resume/fork must never create
 	// or delete a worktree as a side effect. An omitted value binds to CWD.
-	Worktree      string
-	Binary        string
-	Model         string
-	ExpectedNonce string
-	PolicyArgs    []string
+	Worktree string
+	Binary   string
+	Model    string
+	// RuntimeVersion is the exact pinned Grok CLI version that owns the
+	// selectable model alias. It is used only to select an audited, exact
+	// receipt-model binding; an unknown runtime never gets alias expansion.
+	RuntimeVersion string
+	ExpectedNonce  string
+	PolicyArgs     []string
 	// These are non-secret, immutable attestation digests supplied by the
 	// adapter that owns the corresponding configuration discovery. Empty
 	// values mean the adapter did not attest that source; malformed values are
@@ -77,6 +84,8 @@ type SessionReceipt struct {
 	ProviderAcknowledged bool                `json:"provider_acknowledged"`
 	CompletionConfirmed  bool                `json:"completion_confirmed"`
 	StopReason           string              `json:"stop_reason,omitempty"`
+	RequestedModel       string              `json:"requested_model,omitempty"`
+	ExpectedReceiptModel string              `json:"expected_receipt_model,omitempty"`
 	Model                string              `json:"model,omitempty"`
 	ModelEvidence        string              `json:"model_evidence,omitempty"`
 	Usage                *Usage              `json:"usage,omitempty"`
@@ -84,6 +93,25 @@ type SessionReceipt struct {
 	Stderr               StderrDigest        `json:"stderr"`
 	ExitCode             *int                `json:"exit_code,omitempty"`
 	Cancellation         CancellationReceipt `json:"cancellation"`
+}
+
+// lifecycleReceiptModelBindings is intentionally narrow. Grok CLI 1.0.13
+// accepts the selectable alias "grok-4.6" but its streaming-json end event
+// identifies the concrete backend as "grok-4.6-build". The mapping is keyed
+// by the exact pinned CLI version and exact strings on both sides; it is not a
+// prefix, family, or compatibility match. A CLI upgrade must be requalified
+// before it can introduce another binding.
+var lifecycleReceiptModelBindings = map[string]map[string]string{
+	"1.0.13": {
+		"grok-4.6": "grok-4.6-build",
+	},
+}
+
+func expectedLifecycleReceiptModel(runtimeVersion, requestedModel string) string {
+	if concrete, ok := lifecycleReceiptModelBindings[runtimeVersion][requestedModel]; ok {
+		return concrete
+	}
+	return requestedModel
 }
 
 // BuildSessionSpec compiles a native headless resume/fork command.  The
@@ -127,9 +155,9 @@ func BuildSessionSpec(req SessionRequest) (StartSpec, SessionReceipt, error) {
 		}
 	}
 	if len(req.PolicyArgs) == 0 {
-		req.PolicyArgs = defaultReadOnlyAutomationPolicyArgs()
+		req.PolicyArgs = defaultReadOnlyLifecyclePolicyArgs()
 	}
-	if err := validateAutomationPolicyArgs(req.PolicyArgs); err != nil {
+	if err := validateLifecycleAutomationPolicyArgs(req.PolicyArgs); err != nil {
 		return StartSpec{}, SessionReceipt{}, err
 	}
 	args := []string{"--no-auto-update"}
@@ -161,11 +189,36 @@ func BuildSessionSpec(req SessionRequest) (StartSpec, SessionReceipt, error) {
 		ConfigSHA256:        req.ConfigSHA256,
 		BinarySHA256:        req.BinarySHA256,
 		NonceSHA256:         lifecycleHash(req.ExpectedNonce),
+		Cancellation: CancellationReceipt{
+			LocalTermination: "not_started",
+			ResidualPIDs:     []int32{},
+			ObservedAt:       time.Now().UTC(),
+		},
 	}
 	if err := validateSessionLineageContext(receipt); err != nil {
 		return StartSpec{}, SessionReceipt{}, err
 	}
 	return StartSpec{Binary: req.Binary, Args: args, CWD: req.CWD}, receipt, nil
+}
+
+func defaultReadOnlyLifecyclePolicyArgs() []string {
+	return agentpkg.GrokAutomationLifecyclePolicyArgs(agentpkg.DefaultGrokAutomationPolicyName)
+}
+
+// validateLifecycleAutomationPolicyArgs admits only the reviewed lifecycle
+// form of a compiled policy. It intentionally differs from ACP validation:
+// session resume/fork must not force --sandbox, because Grok validates that
+// option against the sandbox recorded on the parent session.
+func validateLifecycleAutomationPolicyArgs(args []string) error {
+	for _, policyName := range []string{
+		agentpkg.DefaultGrokAutomationPolicyName,
+		agentpkg.GrokWorkspaceWritePolicyName,
+	} {
+		if slices.Equal(args, agentpkg.GrokAutomationLifecyclePolicyArgs(policyName)) {
+			return nil
+		}
+	}
+	return errors.New("lifecycle automation policy arguments must exactly match a compiled NTM Grok lifecycle policy")
 }
 
 // BindSessionLineage accepts only a child ID that differs from the resumed
@@ -353,6 +406,9 @@ func executeSession(ctx context.Context, runner LifecycleRunner, req SessionRequ
 		receipt.Cancellation = CancellationReceipt{LocalTermination: "not_started", ObservedAt: time.Now().UTC(), ResidualPIDs: []int32{}}
 		return receipt, &Error{Code: ErrOutcomeUnknown, Err: err}
 	}
+	expectedReceiptModel := expectedLifecycleReceiptModel(req.RuntimeVersion, req.Model)
+	receipt.RequestedModel = req.Model
+	receipt.ExpectedReceiptModel = expectedReceiptModel
 	proc, err := runner.Start(ctx, spec)
 	if err != nil {
 		return receipt, fmt.Errorf("start Grok headless lifecycle: %w", err)
@@ -361,7 +417,7 @@ func executeSession(ctx context.Context, runner LifecycleRunner, req SessionRequ
 	stderrDone := make(chan StderrDigest, 1)
 	go func() { stderrDone <- drainAndDigest(proc.Stderr(), MaxStderrCaptureBytes) }()
 	parsed := make(chan lifecycleParseResult, 1)
-	go func() { parsed <- parser(proc.Stdout(), req.ExpectedNonce, req.Model) }()
+	go func() { parsed <- parser(proc.Stdout(), req.ExpectedNonce, expectedReceiptModel) }()
 	waited := make(chan error, 1)
 	go func() { waited <- proc.Wait() }()
 	var parsedResult lifecycleParseResult
@@ -401,6 +457,16 @@ func executeSession(ctx context.Context, runner LifecycleRunner, req SessionRequ
 		}
 	}
 	receipt.ExitCode = &exitCode
+	// Wait returning proves the owned Grok process has exited, so a successful
+	// operation does not need local cancellation. Record that observation
+	// explicitly: zero timestamps and nil PID sets are ambiguous to durable
+	// receipt validators, while this label deliberately makes no claim about
+	// provider-side cancellation.
+	receipt.Cancellation = CancellationReceipt{
+		LocalTermination: "not_required_process_exited",
+		ResidualPIDs:     []int32{},
+		ObservedAt:       time.Now().UTC(),
+	}
 	if waitErr != nil {
 		return receipt, &Error{Code: ErrProcessFailed, Err: waitErr}
 	}
@@ -422,7 +488,7 @@ func executeSession(ctx context.Context, runner LifecycleRunner, req SessionRequ
 	if !parsedResult.nonceAcknowledged {
 		return receipt, &Error{Code: ErrAcknowledgementUnconfirmed, Err: errors.New("headless completion omitted exact nonce acknowledgement")}
 	}
-	if req.Model != "" && parsedResult.model != req.Model {
+	if expectedReceiptModel != "" && parsedResult.model != expectedReceiptModel {
 		return receipt, &Error{Code: ErrIdentityMismatch, Err: errors.New("headless completion model does not match requested model")}
 	}
 	receipt, err = BindSessionLineage(receipt, parsedResult.sessionID, parsedResult.nonceAcknowledged)

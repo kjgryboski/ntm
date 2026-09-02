@@ -3,6 +3,7 @@
 package providerattestation
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -81,10 +82,12 @@ func TestWindowsBridgeSignerValidatesEnsureAndSignResponsesLocally(t *testing.T)
 }
 
 func TestValidateBridgePayloadRejectsUnknownAndRecursiveFields(t *testing.T) {
+	incompleteModelBinding := bytes.Replace(validBridgeSessionPayload(), []byte(`,"expected_receipt_model":"grok-4.6-build"`), nil, 1)
 	for _, payload := range [][]byte{
 		[]byte(`{"schema_version":"ntm.provider-qualification.v1","mode":"live","provider":"zai","transport":"zai_native_api","identity_sha256":"` + bridgeTestDigest + `","policy_sha256":"` + bridgeTestDigest + `","runtime_version":"zai-native-http-v1","started_at":"2026-09-02T12:00:00Z","completed_at":"2026-09-02T12:01:00Z","disposable_repo_sha256":"` + bridgeTestDigest + `","checks":[{"name":"gate","passed":true,"provenance":"live","evidence_sha256":"` + bridgeTestDigest + `","unexpected":true}],"passed":true,"receipt_sha256":"` + bridgeTestDigest + `"}`),
 		[]byte(`{"schema_version":"ntm.provider-session.v2","schema_version":"ntm.provider-session.v2"}`),
 		[]byte(`{"schema_version":"ntm.provider-qualification.v1","mode":"live","provider":"zai","transport":"zai_native_api","identity_sha256":"` + bridgeTestDigest + `","policy_sha256":"` + bridgeTestDigest + `","runtime_version":"zai-native-http-v1","started_at":"not-a-time","completed_at":"2026-09-02T12:01:00Z","disposable_repo_sha256":"` + bridgeTestDigest + `","checks":[{"name":"gate","passed":true,"provenance":"live","evidence_sha256":"` + bridgeTestDigest + `"}],"passed":true,"receipt_sha256":"` + bridgeTestDigest + `","attestation":null}`),
+		incompleteModelBinding,
 	} {
 		if err := ValidateBridgePayload(payload); !errors.Is(err, ErrBridgePayloadDenied) {
 			t.Fatalf("payload %q error=%v", payload, err)
@@ -103,7 +106,7 @@ func validBridgeNativePayload() []byte {
 }
 
 func validBridgeSessionPayload() []byte {
-	return []byte(`{"schema_version":"ntm.provider-session.v2","success":false,"profile":"grok-observe","transport":"xai_headless_session","identity_sha256":"` + bridgeTestDigest + `","policy":"grok-readonly-ci","policy_sha256":"` + bridgeTestDigest + `","config_sha256":"` + bridgeTestDigest + `","binary_sha256":"` + bridgeTestDigest + `","cwd_sha256":"` + bridgeTestDigest + `","worktree_sha256":"` + bridgeTestDigest + `","dispatched":true,"admission":{"allowed":true,"no_failover":true,"capacity_control_scope":"local_shared"},"receipt":{"action":"resume","fork":false,"parent_session_sha256":"` + bridgeTestDigest + `","cwd_sha256":"` + bridgeTestDigest + `","worktree_sha256":"` + bridgeTestDigest + `","policy_sha256":"` + bridgeTestDigest + `","lineage_bound":false,"provider_acknowledged":false,"completion_confirmed":false,"stderr":{"bytes":0,"sha256":"` + bridgeTestDigest + `","truncated":false},"cancellation":{"provider_acknowledged":false,"local_termination":"not_started","residual_pids":[],"observed_at":"2026-09-02T12:00:00Z"}},"failure_code":"provider","error_sha256":"` + bridgeTestDigest + `","telemetry":{"state":"failed","error_sha256":"` + bridgeTestDigest + `"}}`)
+	return []byte(`{"schema_version":"ntm.provider-session.v2","success":true,"profile":"grok-observe","transport":"xai_headless_session","identity_sha256":"` + bridgeTestDigest + `","policy":"grok-readonly-ci","policy_sha256":"` + bridgeTestDigest + `","config_sha256":"` + bridgeTestDigest + `","binary_sha256":"` + bridgeTestDigest + `","cwd_sha256":"` + bridgeTestDigest + `","worktree_sha256":"` + bridgeTestDigest + `","dispatched":true,"admission":{"allowed":true,"no_failover":true,"capacity_control_scope":"local_shared"},"receipt":{"action":"resume","fork":false,"parent_session_sha256":"` + bridgeTestDigest + `","child_session_sha256":"` + bridgeTestDigest + `","cwd_sha256":"` + bridgeTestDigest + `","worktree_sha256":"` + bridgeTestDigest + `","policy_sha256":"` + bridgeTestDigest + `","config_sha256":"` + bridgeTestDigest + `","binary_sha256":"` + bridgeTestDigest + `","nonce_sha256":"` + bridgeTestDigest + `","lineage_bound":true,"provider_acknowledged":true,"completion_confirmed":true,"stop_reason":"end_turn","requested_model":"grok-4.6","expected_receipt_model":"grok-4.6-build","model":"grok-4.6-build","model_evidence":"end.modelUsage_singleton","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3},"output_sha256":"` + bridgeTestDigest + `","stderr":{"bytes":0,"sha256":"` + bridgeTestDigest + `","truncated":false},"exit_code":0,"cancellation":{"provider_acknowledged":false,"local_termination":"not_required_process_exited","residual_pids":[],"observed_at":"2026-09-02T12:00:00Z"}},"telemetry":{"state":"recorded","observation_id":"0123456789abcdef0123456789abcdef","observation_sha256":"` + bridgeTestDigest + `"}}`)
 }
 
 func TestWindowsBridgeSignerRejectsUnallowlistedPayloadBeforeInvoke(t *testing.T) {

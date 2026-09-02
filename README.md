@@ -465,6 +465,15 @@ only for the locally observed process tree; they are not provider-side
 cancellation acknowledgements. Arbitrary provider output, raw tool arguments,
 credentials, and opaque runtime settings are not authoritative evidence.
 
+Grok sessions retain the sandbox recorded when the parent was created, so a
+resume or fork omits only the per-invocation sandbox selector while preserving
+every compiled allow/deny rule from the root-owned policy. Model identity stays
+fail-closed: for the reviewed Grok CLI `1.0.13`, NTM binds the selectable
+`grok-4.6` alias to the exact `grok-4.6-build` token emitted by the
+`streaming-json` completion's singleton `modelUsage` record. Unknown runtime
+versions and model pairs require strict equality and must be requalified; no
+prefix or family matching is accepted.
+
 The local shared store coordinates concurrency, token budget, backoff, and
 circuits across cooperating local NTM processes, keyed by exact identity. It
 is not a fleet-wide quota service; if it falls back to process-local state,

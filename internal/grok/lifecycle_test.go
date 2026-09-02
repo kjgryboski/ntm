@@ -60,7 +60,7 @@ func TestBuildSessionSpecRejectsMalformedAttestationDigest(t *testing.T) {
 
 func TestBuildSessionSpecAcceptsExactWorkspaceWritePolicy(t *testing.T) {
 	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
-	policyArgs := agentpkg.GrokAutomationACPPolicyArgs(agentpkg.GrokWorkspaceWritePolicyName)
+	policyArgs := agentpkg.GrokAutomationLifecyclePolicyArgs(agentpkg.GrokWorkspaceWritePolicyName)
 	spec, _, err := BuildSessionSpec(SessionRequest{
 		Action: SessionResume, SessionID: "parent", Prompt: nonce, CWD: "/repo",
 		ExpectedNonce: nonce, PolicyArgs: policyArgs,
@@ -70,6 +70,27 @@ func TestBuildSessionSpecAcceptsExactWorkspaceWritePolicy(t *testing.T) {
 	}
 	if !sameStrings(spec.Args[1:1+len(policyArgs)], policyArgs) {
 		t.Fatalf("workspace policy args = %#v", spec.Args)
+	}
+}
+
+func TestBuildSessionSpecInheritsSessionSandboxButRetainsCompiledRules(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	policyArgs := agentpkg.GrokAutomationLifecyclePolicyArgs(agentpkg.DefaultGrokAutomationPolicyName)
+	spec, _, err := BuildSessionSpec(SessionRequest{
+		Action: SessionResume, SessionID: "parent", Prompt: nonce, CWD: "/repo",
+		ExpectedNonce: nonce, PolicyArgs: policyArgs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(spec.Args, "\n")
+	if strings.Contains(joined, "--sandbox=") {
+		t.Fatalf("resume forced a sandbox instead of inheriting the parent session: %#v", spec.Args)
+	}
+	for _, required := range []string{"--permission-mode=dontAsk", "--allow=Read", "--deny=Edit", "--deny=Bash(*)", "--deny=Read(**/.grok/**)"} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("resume omitted compiled rule %q: %#v", required, spec.Args)
+		}
 	}
 }
 
@@ -124,13 +145,13 @@ func TestExecuteSessionAcceptsGrok1013StreamingEndSchema(t *testing.T) {
 	p.wait <- nil
 	r, err := ExecuteSession(t.Context(), &lifecycleRunnerFake{proc: p}, SessionRequest{
 		Action: SessionFork, SessionID: "parent", Prompt: nonce, CWD: "/repo",
-		ExpectedNonce: nonce, Model: "grok-4.6-build",
+		ExpectedNonce: nonce, Model: "grok-4.6", RuntimeVersion: "1.0.13",
 	})
 	wantHash := sha256.Sum256([]byte(nonce))
 	if err != nil || !r.LineageBound || !r.ProviderAcknowledged || !r.CompletionConfirmed {
 		t.Fatalf("receipt=%+v err=%v", r, err)
 	}
-	if r.Model != "grok-4.6-build" || r.ModelEvidence != "end.modelUsage_singleton" || r.StopReason != "end_turn" {
+	if r.RequestedModel != "grok-4.6" || r.ExpectedReceiptModel != "grok-4.6-build" || r.Model != "grok-4.6-build" || r.ModelEvidence != "end.modelUsage_singleton" || r.StopReason != "end_turn" {
 		t.Fatalf("provider evidence=%+v", r)
 	}
 	if r.OutputSHA256 != hex.EncodeToString(wantHash[:]) {
@@ -138,6 +159,9 @@ func TestExecuteSessionAcceptsGrok1013StreamingEndSchema(t *testing.T) {
 	}
 	if r.Usage == nil || r.Usage.TotalTokens == nil || *r.Usage.TotalTokens != 5 {
 		t.Fatalf("usage=%+v", r.Usage)
+	}
+	if r.Cancellation.ProviderAcknowledged || r.Cancellation.LocalTermination != "not_required_process_exited" || len(r.Cancellation.ResidualPIDs) != 0 || r.Cancellation.ObservedAt.IsZero() {
+		t.Fatalf("normal completion cleanup evidence=%+v", r.Cancellation)
 	}
 }
 
@@ -149,7 +173,7 @@ func TestExecuteSessionFailsClosedOnUndocumentedModelAliasAndRetainsEvidence(t *
 	p.wait <- nil
 	r, err := ExecuteSession(t.Context(), &lifecycleRunnerFake{proc: p}, SessionRequest{
 		Action: SessionFork, SessionID: "parent", Prompt: nonce, CWD: "/repo",
-		ExpectedNonce: nonce, Model: "grok-4.6",
+		ExpectedNonce: nonce, Model: "grok-4.5", RuntimeVersion: "1.0.13",
 	})
 	var got *Error
 	if !errors.As(err, &got) || got.Code != ErrIdentityMismatch {
@@ -157,6 +181,31 @@ func TestExecuteSessionFailsClosedOnUndocumentedModelAliasAndRetainsEvidence(t *
 	}
 	if !r.CompletionConfirmed || r.Model != "grok-4.6-build" || r.ModelEvidence != "end.modelUsage_singleton" || r.LineageBound {
 		t.Fatalf("identity mismatch evidence=%+v", r)
+	}
+}
+
+func TestExecuteSessionRejectsReceiptModelOutsideExactPinnedBinding(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	for _, tc := range []struct {
+		name, runtimeVersion, receiptModel string
+	}{
+		{name: "runtime drift", runtimeVersion: "1.0.130", receiptModel: "grok-4.6-build"},
+		{name: "lookalike backend", runtimeVersion: "1.0.13", receiptModel: "grok-4.6-build-preview"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout := `{"type":"text","data":"` + nonce + `"}` + "\n" +
+				`{"type":"end","stopReason":"end_turn","sessionId":"child","modelUsage":{"` + tc.receiptModel + `":{}}}` + "\n"
+			p := &lifecycleProcessFake{stdout: stdout, wait: make(chan error, 1)}
+			p.wait <- nil
+			r, err := ExecuteSession(t.Context(), &lifecycleRunnerFake{proc: p}, SessionRequest{
+				Action: SessionFork, SessionID: "parent", Prompt: nonce, CWD: "/repo",
+				ExpectedNonce: nonce, Model: "grok-4.6", RuntimeVersion: tc.runtimeVersion,
+			})
+			var got *Error
+			if !errors.As(err, &got) || got.Code != ErrIdentityMismatch || r.LineageBound {
+				t.Fatalf("receipt=%+v err=%v", r, err)
+			}
+		})
 	}
 }
 

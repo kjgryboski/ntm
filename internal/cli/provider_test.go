@@ -481,8 +481,12 @@ func TestProviderSessionUsesSharedAdmissionAndReturnsOnlyHashedLineage(t *testin
 	runCalls := 0
 	deps.run = func(_ context.Context, _ grok.LifecycleRunner, request grok.SessionRequest) (grok.SessionReceipt, error) {
 		runCalls++
-		if request.ExpectedNonce == "" || !strings.Contains(request.Prompt, request.ExpectedNonce) || request.SessionID != "raw-parent-session" || request.Worktree != request.CWD || request.PolicySHA256 == "" || request.ConfigSHA256 == "" || request.BinarySHA256 == "" {
+		if request.ExpectedNonce == "" || !strings.Contains(request.Prompt, request.ExpectedNonce) || request.SessionID != "raw-parent-session" || request.Worktree != request.CWD || request.RuntimeVersion != profile.RuntimeVersion || request.PolicySHA256 == "" || request.ConfigSHA256 == "" || request.BinarySHA256 == "" {
 			t.Fatalf("request=%+v", request)
+		}
+		joinedPolicy := strings.Join(request.PolicyArgs, "\n")
+		if strings.Contains(joinedPolicy, "--sandbox=") || !strings.Contains(joinedPolicy, "--permission-mode=dontAsk") || !strings.Contains(joinedPolicy, "--deny=Edit") {
+			t.Fatalf("lifecycle policy did not inherit the session sandbox while retaining rules: %#v", request.PolicyArgs)
 		}
 		return grok.SessionReceipt{
 			Action: request.Action, Fork: request.Action == grok.SessionFork, LineageBound: true, ProviderAcknowledged: true, CompletionConfirmed: true,

@@ -266,9 +266,12 @@ func runProviderSession(cmd *cobra.Command, action grok.SessionAction, opts prov
 	output.Dispatched = true
 	receipt, runErr := deps.run(runCtx, deps.runner, grok.SessionRequest{
 		Action: action, SessionID: opts.sessionID, Prompt: transmittedPrompt, CWD: cwd,
-		Worktree: cwd, Binary: binary, Model: identity.Model(), ExpectedNonce: nonce,
+		Worktree: cwd, Binary: binary, Model: identity.Model(), RuntimeVersion: profile.RuntimeVersion, ExpectedNonce: nonce,
 		PolicySHA256: output.PolicySHA256, ConfigSHA256: output.ConfigSHA256, BinarySHA256: output.BinarySHA256,
-		PolicyArgs: agent.GrokAutomationACPPolicyArgs(policy.Name),
+		// Grok binds sessions to their original sandbox. The root-owned managed
+		// requirements above remain authoritative; lifecycle invocations retain
+		// every reviewed permission rule but let Grok inherit that bound sandbox.
+		PolicyArgs: agent.GrokAutomationLifecyclePolicyArgs(policy.Name),
 	})
 	runCancel()
 	completedAt := deps.now()
@@ -315,9 +318,11 @@ func finishProviderSession(cmd *cobra.Command, output providerSessionOutput, run
 		return nil
 	}
 	if output.Success {
-		fmt.Fprintf(cmd.OutOrStdout(), "Grok session %s completed with nonce-bound lineage.\n", output.Receipt.Action)
-		fmt.Fprintf(cmd.OutOrStdout(), "Identity: %s\nChild session hash: %s\n", output.IdentitySHA256, output.Receipt.ChildSessionSHA256)
-		return nil
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Grok session %s completed with nonce-bound lineage.\n", output.Receipt.Action); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "Identity: %s\nChild session hash: %s\n", output.IdentitySHA256, output.Receipt.ChildSessionSHA256)
+		return err
 	}
 	code := output.FailureCode
 	if code == "" {

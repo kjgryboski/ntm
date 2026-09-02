@@ -242,6 +242,27 @@ func GrokAutomationACPPolicyArgs(name string) []string {
 	return args
 }
 
+// GrokAutomationLifecyclePolicyArgs returns the explicit permission rules for
+// a resume or fork without forcing a sandbox profile. Grok 1.0.13 binds a
+// session to its original sandbox and refuses a resume that supplies a
+// different profile. The root-owned managed requirements remain the authority
+// for the named policy; omitting only this session-bound selector lets Grok
+// retain its provider-recorded sandbox while preserving every permission rule.
+func GrokAutomationLifecyclePolicyArgs(name string) []string {
+	args := GrokAutomationACPPolicyArgs(name)
+	if len(args) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(args)-1)
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--sandbox=") {
+			continue
+		}
+		result = append(result, arg)
+	}
+	return result
+}
+
 // DefaultGrokAutomationPolicySHA256 is a stable, non-secret authorization
 // digest for receipts. Length-prefix-free ambiguity is avoided with NUL
 // separators because policy names and rules cannot contain control bytes.
