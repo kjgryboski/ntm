@@ -11,13 +11,29 @@ const (
 	EvidenceAuthoritative EvidenceGrade = "authoritative"
 )
 
+// EvidenceAuthorityScope identifies who can substantiate an operation at the
+// declared evidence grade. A provider scope means the provider/runtime emitted
+// the acknowledgement; a local_process_tree scope proves only local process
+// control and must never be read as provider-side cancellation.
+type EvidenceAuthorityScope string
+
+const (
+	EvidenceAuthorityScopeUnavailable      EvidenceAuthorityScope = "unavailable"
+	EvidenceAuthorityScopeProvider         EvidenceAuthorityScope = "provider"
+	EvidenceAuthorityScopeLocalProcessTree EvidenceAuthorityScope = "local_process_tree"
+	EvidenceAuthorityScopeLocalClient      EvidenceAuthorityScope = "local_client"
+)
+
 // CapacityControlScope states where admission/circuit state is coordinated.
 // ProcessLocal must never be presented as a fleet-wide quota or provider
 // reservation.
 type CapacityControlScope string
 
 const (
-	CapacityControlScopeUnavailable  CapacityControlScope = "unavailable"
+	CapacityControlScopeUnavailable CapacityControlScope = "unavailable"
+	// CapacityControlScopeLocalShared means cooperating local NTM processes
+	// share a crash-tolerant lease/circuit store. It is not a fleet service.
+	CapacityControlScopeLocalShared  CapacityControlScope = "local_shared"
 	CapacityControlScopeProcessLocal CapacityControlScope = "process_local"
 )
 
@@ -29,15 +45,18 @@ type OperationCapabilities struct {
 	// tuple (provider, account, model, endpoint, runtime, config hash). It is
 	// intentionally separate from a model probe: a probe can qualify a model
 	// without proving an opaque runtime still honors every configured setting.
-	IdentityEvidence      IdentityEvidenceGrade `json:"identity_evidence"`
-	CapacityControlScope  CapacityControlScope  `json:"capacity_control_scope"`
-	Launch                EvidenceGrade         `json:"launch"`
-	Delivery              EvidenceGrade         `json:"delivery"`
-	Completion            EvidenceGrade         `json:"completion"`
-	Cancellation          EvidenceGrade         `json:"cancellation"`
-	Resume                EvidenceGrade         `json:"resume"`
-	Cleanup               EvidenceGrade         `json:"cleanup"`
-	IdentityProbeRequired bool                  `json:"identity_probe_required"`
+	IdentityEvidence           IdentityEvidenceGrade  `json:"identity_evidence"`
+	CapacityControlScope       CapacityControlScope   `json:"capacity_control_scope"`
+	Launch                     EvidenceGrade          `json:"launch"`
+	Delivery                   EvidenceGrade          `json:"delivery"`
+	Completion                 EvidenceGrade          `json:"completion"`
+	CompletionAuthorityScope   EvidenceAuthorityScope `json:"completion_authority_scope"`
+	Cancellation               EvidenceGrade          `json:"cancellation"`
+	CancellationAuthorityScope EvidenceAuthorityScope `json:"cancellation_authority_scope"`
+	Resume                     EvidenceGrade          `json:"resume"`
+	Cleanup                    EvidenceGrade          `json:"cleanup"`
+	CleanupAuthorityScope      EvidenceAuthorityScope `json:"cleanup_authority_scope"`
+	IdentityProbeRequired      bool                   `json:"identity_probe_required"`
 	// LaunchCapacityControl covers admission of the provider process itself.
 	// RequestCapacityControl and LiveErrorFeedback apply to actual model API
 	// calls; an opaque TUI launch must never be promoted to request control.
@@ -56,10 +75,26 @@ func CapabilityMatrix() map[string]OperationCapabilities {
 		// receipt, so cancellation deliberately remains unavailable here.
 		"xai_acp": {
 			IdentityEvidence:     IdentityEvidenceProfileAttested,
-			CapacityControlScope: CapacityControlScopeProcessLocal,
+			CapacityControlScope: CapacityControlScopeLocalShared,
 			Launch:               EvidenceAuthoritative, Delivery: EvidenceAuthoritative,
-			Completion: EvidenceAuthoritative, Cancellation: EvidenceUnavailable,
-			Resume: EvidenceUnavailable, Cleanup: EvidenceSubmission,
+			Completion: EvidenceAuthoritative, CompletionAuthorityScope: EvidenceAuthorityScopeProvider,
+			Cancellation: EvidenceUnavailable, CancellationAuthorityScope: EvidenceAuthorityScopeUnavailable,
+			Resume: EvidenceUnavailable, Cleanup: EvidenceSubmission, CleanupAuthorityScope: EvidenceAuthorityScopeLocalClient,
+			LaunchCapacityControl: EvidenceAuthoritative, RequestCapacityControl: EvidenceAuthoritative,
+			LiveErrorFeedback: EvidenceUnavailable,
+		},
+		// Native Grok headless sessions return a nonce-bound structured result
+		// and session lineage. Resume/fork is authoritative at that boundary.
+		// Cancellation is provider-unavailable; its local process-tree receipt
+		// must not be mistaken for provider acknowledgement. Cleanup is
+		// authoritative only for that locally observed process tree.
+		"xai_headless_session": {
+			IdentityEvidence:     IdentityEvidenceProfileAttested,
+			CapacityControlScope: CapacityControlScopeLocalShared,
+			Launch:               EvidenceAuthoritative, Delivery: EvidenceAuthoritative,
+			Completion: EvidenceAuthoritative, CompletionAuthorityScope: EvidenceAuthorityScopeProvider,
+			Cancellation: EvidenceAuthoritative, CancellationAuthorityScope: EvidenceAuthorityScopeLocalProcessTree,
+			Resume: EvidenceAuthoritative, Cleanup: EvidenceAuthoritative, CleanupAuthorityScope: EvidenceAuthorityScopeLocalProcessTree,
 			LaunchCapacityControl: EvidenceAuthoritative, RequestCapacityControl: EvidenceAuthoritative,
 			LiveErrorFeedback: EvidenceUnavailable,
 		},
@@ -68,10 +103,11 @@ func CapabilityMatrix() map[string]OperationCapabilities {
 		// receipt.
 		"xai_grok_tui": {
 			IdentityEvidence:     IdentityEvidenceProfileAttested,
-			CapacityControlScope: CapacityControlScopeProcessLocal,
+			CapacityControlScope: CapacityControlScopeLocalShared,
 			Launch:               EvidenceSubmission, Delivery: EvidenceSubmission,
-			Completion: EvidenceUnavailable, Cancellation: EvidenceUnavailable,
-			Resume: EvidenceUnavailable, Cleanup: EvidenceSubmission,
+			Completion: EvidenceUnavailable, CompletionAuthorityScope: EvidenceAuthorityScopeUnavailable,
+			Cancellation: EvidenceUnavailable, CancellationAuthorityScope: EvidenceAuthorityScopeUnavailable,
+			Resume: EvidenceUnavailable, Cleanup: EvidenceSubmission, CleanupAuthorityScope: EvidenceAuthorityScopeLocalClient,
 			LaunchCapacityControl: EvidenceUnavailable, RequestCapacityControl: EvidenceUnavailable,
 			LiveErrorFeedback: EvidenceUnavailable,
 		},
@@ -80,13 +116,34 @@ func CapabilityMatrix() map[string]OperationCapabilities {
 		// alone has no authority to establish that provider identity.
 		"zai_claude_runtime": {
 			IdentityEvidence:     IdentityEvidenceProfileAttested,
-			CapacityControlScope: CapacityControlScopeProcessLocal,
+			CapacityControlScope: CapacityControlScopeLocalShared,
 			Launch:               EvidenceSubmission, Delivery: EvidenceSubmission,
-			Completion: EvidenceUnavailable, Cancellation: EvidenceUnavailable,
-			Resume: EvidenceUnavailable, Cleanup: EvidenceSubmission,
+			Completion: EvidenceUnavailable, CompletionAuthorityScope: EvidenceAuthorityScopeUnavailable,
+			Cancellation: EvidenceUnavailable, CancellationAuthorityScope: EvidenceAuthorityScopeUnavailable,
+			Resume: EvidenceUnavailable, Cleanup: EvidenceSubmission, CleanupAuthorityScope: EvidenceAuthorityScopeLocalClient,
 			IdentityProbeRequired: true,
 			LaunchCapacityControl: EvidenceAuthoritative, RequestCapacityControl: EvidenceUnavailable,
 			LiveErrorFeedback: EvidenceUnavailable,
+		},
+		// Native Z.ai API requests emit structured completion, usage, and error
+		// records. Cancellation and resume remain unavailable until their own
+		// authoritative provider receipts exist; local cleanup is submission-only.
+		"zai_native_api": {
+			IdentityEvidence:           IdentityEvidenceRuntimeVerified,
+			CapacityControlScope:       CapacityControlScopeLocalShared,
+			Launch:                     EvidenceAuthoritative,
+			Delivery:                   EvidenceAuthoritative,
+			Completion:                 EvidenceAuthoritative,
+			CompletionAuthorityScope:   EvidenceAuthorityScopeProvider,
+			Cancellation:               EvidenceUnavailable,
+			CancellationAuthorityScope: EvidenceAuthorityScopeUnavailable,
+			Resume:                     EvidenceUnavailable,
+			Cleanup:                    EvidenceSubmission,
+			CleanupAuthorityScope:      EvidenceAuthorityScopeLocalClient,
+			IdentityProbeRequired:      true,
+			LaunchCapacityControl:      EvidenceAuthoritative,
+			RequestCapacityControl:     EvidenceAuthoritative,
+			LiveErrorFeedback:          EvidenceAuthoritative,
 		},
 	}
 }

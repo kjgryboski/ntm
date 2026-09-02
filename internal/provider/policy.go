@@ -1,8 +1,13 @@
 package provider
 
-// DefaultZAIAutomationPolicyName is the only policy identifier accepted for
-// unattended Z.ai provider profiles. Z.ai panes currently launch through an
-// operator-supplied Claude-compatible runtime, so NTM binds this name to the
+// DefaultZAIAutomationPolicyName is the policy identifier accepted for the
+// unattended Claude-compatible Coding Plan lane. NTM binds this name to the
 // immutable, reviewed config manifest hash and rejects known bypass flags. It
 // does not claim to introspect an opaque wrapper after launch.
 const DefaultZAIAutomationPolicyName = "zai-readonly-ci"
+
+// NativeZAINoToolsPolicyName identifies the separately billed native API lane.
+// The current adapter implements one nonce-bound completion and rejects every
+// provider tool call; this stable name prevents a profile from implying a
+// broader policy than the compiled transport actually supports.
+const NativeZAINoToolsPolicyName = "zai-native-no-tools-v1"

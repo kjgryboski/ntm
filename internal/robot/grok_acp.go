@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -29,6 +31,9 @@ type GrokACPOperationOptions struct {
 	OperationID string
 	Nonce       string
 	Identity    provider.Identity
+	// AutomationPolicy is resolved from the exact provider profile. An empty
+	// value preserves the read-only policy for compatibility.
+	AutomationPolicy string
 }
 
 // GrokACPTokenUsage and GrokACPCost are optional provider metadata. The ACP
@@ -129,6 +134,9 @@ type GrokACPOperationDeps struct {
 	Random    io.Reader
 	Now       func() time.Time
 	Ledger    GrokACPOperationLedger
+	// IsDisposableWorktree proves that a workspace-write request targets a
+	// linked Git worktree rather than the repository's primary checkout.
+	IsDisposableWorktree func(context.Context, string) (bool, error)
 }
 
 // ProviderAdmission is the exact-identity dispatch boundary. It exposes no
@@ -136,9 +144,10 @@ type GrokACPOperationDeps struct {
 // provider, account, model, endpoint, runtime, or config.
 type ProviderAdmission interface {
 	Acquire(provider.Identity) ratelimit.Decision
-	Release(provider.Identity)
+	Release(provider.Identity, ratelimit.Decision)
 	RecordResult(provider.Identity, ratelimit.ErrorClass, time.Duration) ratelimit.Decision
 	RecordSuccess(provider.Identity)
+	CapacityStatus() ratelimit.CapacityStatus
 }
 
 type AdmissionEvidence struct {
@@ -146,8 +155,8 @@ type AdmissionEvidence struct {
 	Reason     ratelimit.ErrorClass `json:"reason,omitempty"`
 	RetryAt    *time.Time           `json:"retry_at,omitempty"`
 	NoFailover bool                 `json:"no_failover"`
-	// CapacityControlScope prevents a receipt from implying a shared fleet
-	// quota. The built-in controller is intentionally process-local.
+	// CapacityControlScope prevents a receipt from implying a fleet-wide quota.
+	// The built-in controller is shared only across local NTM processes.
 	CapacityControlScope provider.CapacityControlScope `json:"capacity_control_scope"`
 }
 
@@ -172,6 +181,9 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 	}
 	if deps.Admission == nil {
 		deps.Admission = ratelimit.DefaultAdmissionController()
+	}
+	if deps.IsDisposableWorktree == nil {
+		deps.IsDisposableWorktree = isLinkedGitWorktree
 	}
 
 	operationID, err := nonEmptyOrGenerated(opts.OperationID, "grok-acp-", deps.Random)
@@ -198,10 +210,18 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 	logicalPromptHash := sha256Hex(strings.TrimSpace(opts.Prompt))
 	transmittedPrompt := bindNonceInstruction(opts.Prompt, nonce)
 	promptHash := sha256Hex(transmittedPrompt)
-	// The public robot operation is permanently bound to the compiled named
-	// policy. Callers cannot expand permissions while presenting its digest.
-	policyArgs := agentpkg.DefaultGrokAutomationACPPolicyArgs()
-	toolDigest := agentpkg.DefaultGrokAutomationPolicySHA256()
+	policyName := strings.TrimSpace(opts.AutomationPolicy)
+	if policyName == "" {
+		policyName = agentpkg.DefaultGrokAutomationPolicyName
+	}
+	if _, ok := agentpkg.GrokAutomationPolicy(policyName); !ok {
+		err := fmt.Errorf("unknown Grok automation policy %q", policyName)
+		return invalidGrokACPOperationOutput(opts, deps.Now(), err), err
+	}
+	// The public robot operation is bound to one compiled named policy. Callers
+	// cannot expand permissions while presenting its digest.
+	policyArgs := agentpkg.GrokAutomationACPPolicyArgs(policyName)
+	toolDigest := agentpkg.GrokAutomationPolicySHA256(policyName)
 	output = &GrokACPOperationOutput{
 		RobotResponse:            NewRobotResponse(true),
 		OperationID:              operationID,
@@ -225,7 +245,7 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 		err := errors.New("a valid xAI provider identity is required for Grok ACP admission")
 		output.RobotResponse = NewErrorResponse(err, ErrCodeInvalidFlag, "Select an exact xAI provider profile")
 		output.State = "admission_rejected"
-		output.Admission = AdmissionEvidence{Reason: ratelimit.ErrorIdentityMismatch, NoFailover: true, CapacityControlScope: provider.CapacityControlScopeProcessLocal}
+		output.Admission = AdmissionEvidence{Reason: ratelimit.ErrorIdentityMismatch, NoFailover: true, CapacityControlScope: provider.CapacityControlScopeUnavailable}
 		return output, err
 	}
 	if requestedModel := strings.TrimSpace(opts.Model); requestedModel != "" && requestedModel != opts.Identity.Model() {
@@ -233,7 +253,28 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 		output.RobotResponse = NewErrorResponse(err, ErrCodeInvalidFlag, "Use the model bound by the exact provider profile")
 		output.State = "identity_rejected"
 		output.FailureCode = grok.ErrIdentityMismatch
-		output.Admission = AdmissionEvidence{Reason: ratelimit.ErrorIdentityMismatch, NoFailover: true, CapacityControlScope: provider.CapacityControlScopeProcessLocal}
+		output.Admission = AdmissionEvidence{Reason: ratelimit.ErrorIdentityMismatch, NoFailover: true, CapacityControlScope: provider.CapacityControlScopeUnavailable}
+		return output, err
+	}
+	if policyName == agentpkg.GrokWorkspaceWritePolicyName {
+		isolated, verifyErr := deps.IsDisposableWorktree(ctx, opts.CWD)
+		if verifyErr != nil || !isolated {
+			err := errors.New("Grok workspace-write policy requires a linked disposable Git worktree")
+			if verifyErr != nil {
+				err = fmt.Errorf("verify disposable Git worktree: %w", verifyErr)
+			}
+			output.RobotResponse = NewErrorResponse(err, ErrCodeInvalidFlag, "Create/select an isolated linked worktree or use the observe policy")
+			output.State = "workspace_policy_rejected"
+			output.Admission = AdmissionEvidence{NoFailover: true, CapacityControlScope: provider.CapacityControlScopeUnavailable}
+			return output, err
+		}
+	}
+	capacityStatus := deps.Admission.CapacityStatus()
+	if capacityStatus.Scope != provider.CapacityControlScopeLocalShared {
+		err := errors.New("Grok ACP requires the cross-process local shared capacity store")
+		output.RobotResponse = NewErrorResponse(err, ErrCodeDependencyMissing, "Restore the exact-identity local shared lease/circuit store before provider dispatch")
+		output.State = "capacity_unavailable"
+		output.Admission = AdmissionEvidence{NoFailover: true, CapacityControlScope: capacityStatus.Scope}
 		return output, err
 	}
 	// The durable operation binds the caller's logical work, not the generated
@@ -271,17 +312,20 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 	}
 	output.ReceiptState = "claimed"
 	decision := deps.Admission.Acquire(opts.Identity)
-	output.Admission = admissionEvidence(decision)
-	if !decision.Allowed {
+	output.Admission = admissionEvidence(decision, deps.Admission)
+	if !decision.Allowed || !decision.NoFailover {
 		err := fmt.Errorf("provider admission denied for identity %s: %s", opts.Identity.Hash(), decision.Reason)
 		output.RobotResponse = NewErrorResponse(err, ErrCodeResourceBusy, "Honor retry_at or remediate the exact provider profile; failover is prohibited")
 		output.State = "admission_denied"
+		if decision.Allowed {
+			deps.Admission.Release(opts.Identity, decision)
+		}
 		if releaseErr := deps.Ledger.ReleaseSendOperation(claimed.OperationID, claimed.SessionName); releaseErr != nil {
 			output.ReceiptState = "release_failed"
 		}
 		return output, err
 	}
-	defer deps.Admission.Release(opts.Identity)
+	defer deps.Admission.Release(opts.Identity, decision)
 	dispatched := true
 	defer func() {
 		if !dispatched {
@@ -351,8 +395,43 @@ func grokModelIdentityEvidenceConfirmed(evidence string) bool {
 	}
 }
 
-func admissionEvidence(decision ratelimit.Decision) AdmissionEvidence {
-	return AdmissionEvidence{Allowed: decision.Allowed, Reason: decision.Reason, RetryAt: decision.RetryAt, NoFailover: decision.NoFailover, CapacityControlScope: provider.CapacityControlScopeProcessLocal}
+func admissionEvidence(decision ratelimit.Decision, admission ProviderAdmission) AdmissionEvidence {
+	scope := admission.CapacityStatus().Scope
+	return AdmissionEvidence{Allowed: decision.Allowed, Reason: decision.Reason, RetryAt: decision.RetryAt, NoFailover: decision.NoFailover, CapacityControlScope: scope}
+}
+
+func isLinkedGitWorktree(ctx context.Context, cwd string) (bool, error) {
+	if ctx == nil || strings.TrimSpace(cwd) == "" {
+		return false, errors.New("context and cwd are required")
+	}
+	gitDir, err := gitPathForWorktree(ctx, cwd, "--absolute-git-dir")
+	if err != nil {
+		return false, err
+	}
+	commonDir, err := gitPathForWorktree(ctx, cwd, "--git-common-dir")
+	if err != nil {
+		return false, err
+	}
+	if !filepath.IsAbs(commonDir) {
+		commonDir, err = filepath.Abs(filepath.Join(cwd, commonDir))
+		if err != nil {
+			return false, err
+		}
+	}
+	return filepath.Clean(gitDir) != filepath.Clean(commonDir), nil
+}
+
+func gitPathForWorktree(ctx context.Context, cwd, flag string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", cwd, "rev-parse", flag)
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	value := strings.TrimSpace(string(output))
+	if value == "" || strings.ContainsAny(value, "\x00\r\n") {
+		return "", errors.New("git returned an invalid worktree path")
+	}
+	return value, nil
 }
 
 func classifyGrokAdmissionError(err error) (ratelimit.ErrorClass, bool) {

@@ -77,12 +77,17 @@ func claimGrokACPOperation(ledger GrokACPOperationLedger, operationID, bindingHa
 }
 
 func applyStoredGrokACPOutcome(output *GrokACPOperationOutput, stored *state.SendOperation) error {
-	if stored == nil || stored.Status != state.SendOperationCompleted || strings.TrimSpace(stored.OutcomeJSON) == "" {
+	if output == nil || stored == nil || stored.Status != state.SendOperationCompleted || strings.TrimSpace(stored.OutcomeJSON) == "" {
 		return errors.New("durable Grok ACP outcome is unavailable")
 	}
 	var replay GrokACPOperationOutput
 	if err := json.Unmarshal([]byte(stored.OutcomeJSON), &replay); err != nil {
 		return fmt.Errorf("decode durable Grok ACP outcome: %w", err)
+	}
+	if replay.OperationID != output.OperationID || replay.BindingSHA256 != output.BindingSHA256 || replay.BindingSHA256 != stored.BindingHash ||
+		replay.Provider != grokACPProvider || replay.Transport != grokACPTransport || replay.Target != grokACPTarget ||
+		replay.ProviderIdentitySHA256 != output.ProviderIdentitySHA256 || replay.ToolDigest != output.ToolDigest || replay.ReceiptState != "completed" {
+		return errors.New("durable Grok ACP outcome does not match its operation binding")
 	}
 	*output = replay
 	output.Replayed = true
@@ -163,6 +168,9 @@ func GetGrokACPOperationReceipt(operationID string, ledger GrokACPOperationLedge
 	var output GrokACPOperationOutput
 	if err := json.Unmarshal([]byte(stored.OutcomeJSON), &output); err != nil {
 		return nil, fmt.Errorf("decode durable Grok ACP receipt: %w", err)
+	}
+	if output.OperationID != operationID || output.BindingSHA256 != stored.BindingHash || output.Provider != grokACPProvider || output.Transport != grokACPTransport || output.Target != grokACPTarget || output.ReceiptState != "completed" {
+		return nil, errors.New("durable Grok ACP receipt does not match its operation binding")
 	}
 	output.ReceiptState = "queried"
 	output.Replayed = false

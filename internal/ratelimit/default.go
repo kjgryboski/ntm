@@ -1,6 +1,10 @@
 package ratelimit
 
-import "sync"
+import (
+	"os"
+	"path/filepath"
+	"sync"
+)
 
 var (
 	defaultAdmissionOnce sync.Once
@@ -13,11 +17,27 @@ var (
 // backoff, and circuit state.
 func DefaultAdmissionController() *AdmissionController {
 	defaultAdmissionOnce.Do(func() {
-		controller, err := NewAdmissionController(DefaultAdmissionConfig(), nil, nil)
+		storePath := defaultSharedAdmissionStorePath()
+		controller, err := NewSharedAdmissionController(DefaultAdmissionConfig(), storePath, nil, nil)
 		if err != nil {
-			panic(err)
+			sharedErr := err
+			// The fallback remains visible through CapacityStatus. Do not panic:
+			// NTM can still operate safely with an explicit local-only receipt.
+			controller, err = NewAdmissionController(DefaultAdmissionConfig(), nil, nil)
+			if err != nil {
+				panic(err)
+			}
+			controller.fallbackReason = "shared admission store unavailable: " + sharedErr.Error()
 		}
 		defaultAdmission = controller
 	})
 	return defaultAdmission
+}
+
+func defaultSharedAdmissionStorePath() string {
+	base, err := os.UserConfigDir()
+	if err != nil || base == "" {
+		return ""
+	}
+	return filepath.Join(base, "ntm", "provider-capacity.json")
 }

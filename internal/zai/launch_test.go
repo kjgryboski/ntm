@@ -12,7 +12,7 @@ func TestRestrictedLaunchCommandIsNTMCompiledAndReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"if [ -z", "NTM_ZAI_AUTH_REQUIRED", "exec env -i", "ANTHROPIC_AUTH_TOKEN=\"${ZAI_API_KEY:-${ANTHROPIC_AUTH_TOKEN:-}}\"", "ANTHROPIC_BASE_URL='https://api.z.ai/api/anthropic'", "--model 'glm-5.3-flash'", "--restricted", "--safe-mode", "--strict-mcp-config", "--disable-slash-commands", "--no-chrome", "--permission-mode dontAsk", "--tools 'Read,Glob,Grep,WebSearch'", "--allowedTools 'Read,Glob,Grep,WebSearch'", "--disallowedTools 'Bash,Edit,Write,NotebookEdit'"} {
+	for _, want := range []string{"if [ -z", "NTM_ZAI_AUTH_REQUIRED", "exec env -i", "ANTHROPIC_AUTH_TOKEN=\"${ZAI_API_KEY:-}\"", "ANTHROPIC_BASE_URL='https://api.z.ai/api/anthropic'", "--model 'glm-5.3-flash'", "--restricted", "--safe-mode", "--strict-mcp-config", "--disable-slash-commands", "--no-chrome", "--permission-mode dontAsk", "--tools 'Read,Glob,Grep,WebSearch'", "--allowedTools 'Read,Glob,Grep,WebSearch'", "--disallowedTools 'Bash,Edit,Write,NotebookEdit'"} {
 		if !strings.Contains(cmd, want) {
 			t.Fatalf("command %q missing %q", cmd, want)
 		}
@@ -133,11 +133,11 @@ func TestMinimalEnvironmentScrubsUnrelatedCredentials(t *testing.T) {
 	}
 }
 
-func TestCanonicalAuthRequiresExplicitZAIOrAnthropicToken(t *testing.T) {
-	if got := canonicalAuth([]string{"XAI_API_KEY=no", "GH_TOKEN=no"}); got != "" {
+func TestCanonicalAuthRequiresExplicitZAIKey(t *testing.T) {
+	if got := canonicalAuth([]string{"ANTHROPIC_AUTH_TOKEN=generic-must-not-forward", "XAI_API_KEY=no", "GH_TOKEN=no"}); got != "" {
 		t.Fatalf("unexpected auth=%q", got)
 	}
 	if got := canonicalAuth([]string{"ANTHROPIC_AUTH_TOKEN=anthropic", "ZAI_API_KEY=zai"}); got != "zai" {
-		t.Fatalf("auth precedence=%q", got)
+		t.Fatalf("explicit Z.ai auth=%q", got)
 	}
 }

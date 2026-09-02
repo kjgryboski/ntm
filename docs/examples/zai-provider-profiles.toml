@@ -1,0 +1,23 @@
+# Examples only: replace every placeholder after independently reviewing the
+# exact account entitlement and model availability. Never place a credential in
+# this file.
+
+[provider_profiles.zai-native-no-tools]
+provider = "zai"
+account_alias = "YOUR_API_ACCOUNT_ALIAS"
+model = "YOUR_ENTITLED_NATIVE_MODEL"
+endpoint = "https://api.z.ai/api/paas/v4/chat/completions"
+runtime = "zai-api"
+runtime_version = "zai-native-http-v1"
+credential_class = "api_key"
+billing_class = "api_usage"
+entitlement = "native_api"
+config_sha256 = "YOUR_64_CHARACTER_LOWERCASE_REDACTED_CONFIG_SHA256"
+command = ""
+automation_policy = "zai-native-no-tools-v1"
+exact_target_only = true
+probe_required = true
+
+# The native lane uses only ZAI_NATIVE_API_KEY. It is not eligible for the
+# Claude-compatible nine-check coding qualification and has no provider-side
+# cancellation/resume proof.

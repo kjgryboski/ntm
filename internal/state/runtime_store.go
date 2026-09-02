@@ -3254,7 +3254,7 @@ func (s *Store) CompleteSendOperation(operationID, sessionName, outcomeJSON stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	_, err := s.db.Exec(`
+	result, err := s.db.Exec(`
 		UPDATE send_operations
 		SET status = ?, outcome_json = ?, completed_at = ?
 		WHERE operation_id = ? AND session_name = ? AND status = ?`,
@@ -3263,6 +3263,13 @@ func (s *Store) CompleteSendOperation(operationID, sessionName, outcomeJSON stri
 	)
 	if err != nil {
 		return fmt.Errorf("complete send operation: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("complete send operation rows affected: %w", err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("complete send operation: claimed in-progress operation was not found")
 	}
 	return nil
 }

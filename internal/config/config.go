@@ -762,7 +762,17 @@ type ProviderProfileConfig struct {
 	Model        string `toml:"model"`
 	Endpoint     string `toml:"endpoint"`
 	Runtime      string `toml:"runtime"`
-	ConfigSHA256 string `toml:"config_sha256"`
+	// RuntimeVersion is an optional, non-secret exact CLI version token for
+	// drift detection. It is configuration evidence, not
+	// provider identity on its own; ConfigSHA256 binds the reviewed manifest.
+	RuntimeVersion string `toml:"runtime_version"`
+	// CredentialClass, BillingClass, and Entitlement distinguish the
+	// commercial authorization held by a non-secret credential reference.
+	// They are labels only; values such as API keys must never appear here.
+	CredentialClass string `toml:"credential_class"`
+	BillingClass    string `toml:"billing_class"`
+	Entitlement     string `toml:"entitlement"`
+	ConfigSHA256    string `toml:"config_sha256"`
 	// Command is exactly one executable reference (for example "claude" or an
 	// absolute path). NTM compiles every Z.ai endpoint/model/policy argument;
 	// profile-owned shell fragments are never executed.
@@ -787,7 +797,11 @@ func init() {
 // Identity validates and converts the complete immutable provider tuple. The
 // returned value contains only normalized, non-secret identity material.
 func (p ProviderProfileConfig) Identity() (provider.Identity, error) {
-	return provider.NewIdentity(p.Provider, p.AccountAlias, p.Model, p.Endpoint, p.Runtime, p.ConfigSHA256)
+	if p.CredentialClass == "" && p.BillingClass == "" && p.Entitlement == "" {
+		return provider.NewIdentity(p.Provider, p.AccountAlias, p.Model, p.Endpoint, p.Runtime, p.ConfigSHA256)
+	}
+	return provider.NewIdentityWithAuthorization(p.Provider, p.AccountAlias, p.Model, p.Endpoint, p.Runtime,
+		p.CredentialClass, p.BillingClass, p.Entitlement, p.ConfigSHA256)
 }
 
 // ValidateProviderProfiles validates every profile independently so callers
@@ -816,37 +830,51 @@ func validateProviderProfile(name string, profile ProviderProfileConfig) []error
 	if _, err := profile.Identity(); err != nil {
 		errs = append(errs, fmt.Errorf("provider_profiles.%s identity: %w", target, err))
 	}
-	if strings.TrimSpace(profile.Command) == "" || containsControlCharacter(profile.Command) {
+	providerName := strings.ToLower(strings.TrimSpace(profile.Provider))
+	runtimeName := strings.ToLower(strings.TrimSpace(profile.Runtime))
+	if providerName == "zai" && strings.TrimSpace(profile.Entitlement) == provider.EntitlementNativeAPI {
+		if profile.Command != "" {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s native_api transport must leave command empty; NTM owns the adapter", target))
+		}
+	} else if strings.TrimSpace(profile.Command) == "" || containsControlCharacter(profile.Command) {
 		errs = append(errs, fmt.Errorf("provider_profiles.%s command must be non-empty and contain no control characters", target))
 	}
 	if strings.TrimSpace(profile.AutomationPolicy) == "" || containsControlCharacter(profile.AutomationPolicy) {
 		errs = append(errs, fmt.Errorf("provider_profiles.%s automation_policy must be non-empty and contain no control characters", target))
 	}
-	providerName := strings.ToLower(strings.TrimSpace(profile.Provider))
-	runtimeName := strings.ToLower(strings.TrimSpace(profile.Runtime))
+	if profile.RuntimeVersion != "" && (profile.RuntimeVersion != strings.TrimSpace(profile.RuntimeVersion) || containsControlCharacter(profile.RuntimeVersion)) {
+		errs = append(errs, fmt.Errorf("provider_profiles.%s runtime_version must be trimmed and contain no control characters", target))
+	}
 	if providerName == "xai" && runtimeName == "grok" {
 		if err := validateProviderExecutable(profile.Command); err != nil {
 			errs = append(errs, fmt.Errorf("provider_profiles.%s Grok ACP command: %w", target, err))
 		}
-		if strings.TrimSpace(profile.AutomationPolicy) != agent.DefaultGrokAutomationPolicyName {
-			errs = append(errs, fmt.Errorf("provider_profiles.%s Grok ACP profiles must use automation_policy = %q", target, agent.DefaultGrokAutomationPolicyName))
+		if _, ok := agent.GrokAutomationPolicy(strings.TrimSpace(profile.AutomationPolicy)); !ok {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Grok ACP profiles must use automation_policy = %q or %q", target, agent.DefaultGrokAutomationPolicyName, agent.GrokWorkspaceWritePolicyName))
 		}
 		if !profile.ExactTargetOnly {
 			errs = append(errs, fmt.Errorf("provider_profiles.%s Grok ACP profiles must set exact_target_only = true", target))
 		}
 	}
 	if providerName == "zai" {
+		if err := validateZAIAuthorization(profile); err != nil {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai authorization: %w", target, err))
+		}
 		identity, identityErr := profile.Identity()
-		if identityErr == nil && identity.Endpoint() != "https://api.z.ai/api/anthropic" {
+		if identityErr == nil && profile.Entitlement == provider.EntitlementClaudeCompat && identity.Endpoint() != "https://api.z.ai/api/anthropic" {
 			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai endpoint must be the official Claude-compatible endpoint https://api.z.ai/api/anthropic", target))
 		}
-		if identityErr == nil && identity.Runtime() != "claude-code" {
+		if identityErr == nil && profile.Entitlement == provider.EntitlementClaudeCompat && identity.Runtime() != "claude-code" {
 			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai runtime must be claude-code", target))
 		}
-		if strings.TrimSpace(profile.AutomationPolicy) != provider.DefaultZAIAutomationPolicyName {
+		if profile.Entitlement == provider.EntitlementClaudeCompat && strings.TrimSpace(profile.AutomationPolicy) != provider.DefaultZAIAutomationPolicyName {
 			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai profiles must use automation_policy = %q", target, provider.DefaultZAIAutomationPolicyName))
 		}
-		if err := zai.ValidateExecutable(profile.Command); err != nil {
+		if profile.Entitlement == provider.EntitlementNativeAPI && strings.TrimSpace(profile.AutomationPolicy) != provider.NativeZAINoToolsPolicyName {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s native Z.ai profiles must use automation_policy = %q", target, provider.NativeZAINoToolsPolicyName))
+		}
+		if profile.Entitlement == provider.EntitlementClaudeCompat && zai.ValidateExecutable(profile.Command) != nil {
+			err := zai.ValidateExecutable(profile.Command)
 			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai command: %w", target, err))
 		}
 		if !profile.ExactTargetOnly {
@@ -860,6 +888,31 @@ func validateProviderProfile(name string, profile ProviderProfileConfig) []error
 		// headless probe against this exact endpoint/model before tmux mutates.
 	}
 	return errs
+}
+
+func validateZAIAuthorization(profile ProviderProfileConfig) error {
+	credentialClass := strings.TrimSpace(profile.CredentialClass)
+	billingClass := strings.TrimSpace(profile.BillingClass)
+	entitlement := strings.TrimSpace(profile.Entitlement)
+	switch entitlement {
+	case provider.EntitlementClaudeCompat:
+		if credentialClass != provider.CredentialClassCodingPlan || billingClass != provider.BillingClassCodingPlan {
+			return fmt.Errorf("claude_compatible transport requires credential_class = %q and billing_class = %q", provider.CredentialClassCodingPlan, provider.BillingClassCodingPlan)
+		}
+	case provider.EntitlementNativeAPI:
+		if credentialClass != provider.CredentialClassAPIKey || billingClass != provider.BillingClassAPIUsage {
+			return fmt.Errorf("native_api transport requires credential_class = %q and billing_class = %q", provider.CredentialClassAPIKey, provider.BillingClassAPIUsage)
+		}
+		if strings.TrimSpace(profile.Runtime) != "zai-api" {
+			return fmt.Errorf("native_api transport requires runtime = \"zai-api\"")
+		}
+		if strings.TrimSpace(profile.Endpoint) != zai.NativeChatCompletionsEndpoint {
+			return fmt.Errorf("native_api transport requires endpoint = %q", zai.NativeChatCompletionsEndpoint)
+		}
+	default:
+		return fmt.Errorf("entitlement must be %q or %q", provider.EntitlementClaudeCompat, provider.EntitlementNativeAPI)
+	}
+	return nil
 }
 
 // validateProviderExecutable keeps the native ACP adapter on execve semantics:
@@ -3847,8 +3900,14 @@ func Print(cfg *Config, w io.Writer) error {
 			fmt.Fprintf(w, "model = %q\n", profile.Model)
 			fmt.Fprintf(w, "endpoint = %q\n", profile.Endpoint)
 			fmt.Fprintf(w, "runtime = %q\n", profile.Runtime)
+			fmt.Fprintf(w, "runtime_version = %q\n", profile.RuntimeVersion)
+			fmt.Fprintf(w, "credential_class = %q\n", profile.CredentialClass)
+			fmt.Fprintf(w, "billing_class = %q\n", profile.BillingClass)
+			fmt.Fprintf(w, "entitlement = %q\n", profile.Entitlement)
 			fmt.Fprintf(w, "config_sha256 = %q\n", profile.ConfigSHA256)
-			fmt.Fprintf(w, "command = %q\n", profile.Command)
+			if !(profile.Provider == "zai" && profile.Entitlement == provider.EntitlementNativeAPI) {
+				fmt.Fprintf(w, "command = %q\n", profile.Command)
+			}
 			fmt.Fprintf(w, "automation_policy = %q\n", profile.AutomationPolicy)
 			fmt.Fprintf(w, "exact_target_only = %t\n", profile.ExactTargetOnly)
 			fmt.Fprintf(w, "probe_required = %t\n", profile.ProbeRequired)

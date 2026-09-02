@@ -59,7 +59,7 @@ func TestRunGrokACPOperationBindsNonceAndEmitsSafeReceipt(t *testing.T) {
 	if output.Provider != "xai" || output.Transport != "acp_stdio" || output.Target != "stdio" || output.ProviderSessionID != "grok-provider-session" {
 		t.Fatalf("provider receipt = %+v", output)
 	}
-	if output.ProviderIdentityEvidence != provider.IdentityEvidenceProfileAttested || output.Admission.CapacityControlScope != provider.CapacityControlScopeProcessLocal {
+	if output.ProviderIdentityEvidence != provider.IdentityEvidenceProfileAttested || output.Admission.CapacityControlScope != provider.CapacityControlScopeLocalShared {
 		t.Fatalf("identity/capacity evidence = %+v", output)
 	}
 	if output.TokenUsage == nil || output.TokenUsage.Total == nil || *output.TokenUsage.Total != 33 || output.Cost == nil || output.Cost.Micro != 42 || output.ExitCode == nil || *output.ExitCode != 0 || output.CleanupState != "reaped" {
@@ -82,6 +82,44 @@ func TestRunGrokACPOperationBindsNonceAndEmitsSafeReceipt(t *testing.T) {
 		if strings.Contains(serialized, forbidden) {
 			t.Fatalf("safe receipt leaked %q: %s", forbidden, serialized)
 		}
+	}
+}
+
+func TestRunGrokACPOperationBindsWorkspacePolicyInDisposableWorktree(t *testing.T) {
+	engine := &recordingGrokACPEngine{result: grok.Result{
+		Success: true, State: grok.StateCompleted, StopReason: "end_turn",
+		CompletionConfirmed: true, AcknowledgementVerified: true,
+		Model: "grok-code", ModelEvidence: "completion_metadata",
+	}}
+	verified := 0
+	output, err := RunGrokACPOperation(t.Context(), GrokACPOperationOptions{
+		Prompt: "make the bounded edit", CWD: "/linked/worktree", OperationID: "op-workspace",
+		Nonce: testGrokACPNonce, Identity: testGrokACPIdentity(t),
+		AutomationPolicy: agentpkg.GrokWorkspaceWritePolicyName,
+	}, GrokACPOperationDeps{
+		Engine: engine, Admission: allowingAdmission{}, Ledger: testGrokACPLedger(t),
+		IsDisposableWorktree: func(context.Context, string) (bool, error) { verified++; return true, nil },
+	})
+	if err != nil || verified != 1 || engine.calls != 1 {
+		t.Fatalf("output=%+v err=%v verified=%d calls=%d", output, err, verified, engine.calls)
+	}
+	if output.ToolDigest != agentpkg.GrokAutomationPolicySHA256(agentpkg.GrokWorkspaceWritePolicyName) || !slices.Equal(engine.request.AutomationPolicyArgs, agentpkg.GrokAutomationACPPolicyArgs(agentpkg.GrokWorkspaceWritePolicyName)) {
+		t.Fatalf("workspace policy binding output=%+v request=%+v", output, engine.request)
+	}
+}
+
+func TestRunGrokACPOperationRejectsWorkspacePolicyOutsideDisposableWorktree(t *testing.T) {
+	engine := &recordingGrokACPEngine{}
+	output, err := RunGrokACPOperation(t.Context(), GrokACPOperationOptions{
+		Prompt: "do not dispatch", CWD: "/primary/checkout", OperationID: "op-primary",
+		Nonce: testGrokACPNonce, Identity: testGrokACPIdentity(t),
+		AutomationPolicy: agentpkg.GrokWorkspaceWritePolicyName,
+	}, GrokACPOperationDeps{
+		Engine: engine, Admission: allowingAdmission{}, Ledger: testGrokACPLedger(t),
+		IsDisposableWorktree: func(context.Context, string) (bool, error) { return false, nil },
+	})
+	if err == nil || engine.calls != 0 || output.State != "workspace_policy_rejected" || output.Admission.CapacityControlScope != provider.CapacityControlScopeUnavailable {
+		t.Fatalf("output=%+v err=%v calls=%d", output, err, engine.calls)
 	}
 }
 
@@ -286,6 +324,33 @@ func TestRunGrokACPOperationDurablyReplaysWithoutRedispatch(t *testing.T) {
 	}
 }
 
+func TestApplyStoredGrokACPOutcomeRejectsReceiptBindingMismatch(t *testing.T) {
+	expected := &GrokACPOperationOutput{
+		OperationID: "op-bound", BindingSHA256: sha256String("binding"), ProviderIdentitySHA256: sha256String("identity"),
+		Provider: grokACPProvider, Transport: grokACPTransport, Target: grokACPTarget, ToolDigest: sha256String("policy"),
+	}
+	for name, mutate := range map[string]func(*GrokACPOperationOutput){
+		"operation": func(value *GrokACPOperationOutput) { value.OperationID = "different" },
+		"identity":  func(value *GrokACPOperationOutput) { value.ProviderIdentitySHA256 = sha256String("different") },
+		"policy":    func(value *GrokACPOperationOutput) { value.ToolDigest = sha256String("different") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			recorded := *expected
+			recorded.ReceiptState = "completed"
+			mutate(&recorded)
+			data, err := json.Marshal(recorded)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored := &state.SendOperation{Status: state.SendOperationCompleted, BindingHash: expected.BindingSHA256, OutcomeJSON: string(data)}
+			copy := *expected
+			if err := applyStoredGrokACPOutcome(&copy, stored); err == nil {
+				t.Fatalf("mismatched %s receipt was accepted: %+v", name, recorded)
+			}
+		})
+	}
+}
+
 func TestRunGrokACPOperationReplaysWhenNonceIsNormallyGenerated(t *testing.T) {
 	ledger := testGrokACPLedger(t)
 	engine := &recordingGrokACPEngine{result: grok.Result{
@@ -367,6 +432,31 @@ func TestRunGrokACPOperationRequiresDurableLedgerAndExactRequestedModel(t *testi
 	}
 }
 
+func TestRunGrokACPOperationRejectsProcessLocalCapacityBeforeDispatch(t *testing.T) {
+	engine := &recordingGrokACPEngine{}
+	output, err := RunGrokACPOperation(t.Context(), GrokACPOperationOptions{
+		Prompt: "inspect", CWD: "/repo", OperationID: "op-local-capacity", Nonce: testGrokACPNonce, Identity: testGrokACPIdentity(t),
+	}, GrokACPOperationDeps{
+		Engine:    engine,
+		Admission: allowingAdmission{scope: provider.CapacityControlScopeProcessLocal},
+		Ledger:    testGrokACPLedger(t),
+	})
+	if err == nil || output.State != "capacity_unavailable" || output.Admission.CapacityControlScope != provider.CapacityControlScopeProcessLocal || engine.calls != 0 {
+		t.Fatalf("process-local capacity output=%+v err=%v engine_calls=%d", output, err, engine.calls)
+	}
+}
+
+func TestRunGrokACPOperationRejectsAdmissionThatPermitsFailover(t *testing.T) {
+	engine := &recordingGrokACPEngine{}
+	admission := &failoverCapableAdmission{}
+	output, err := RunGrokACPOperation(t.Context(), GrokACPOperationOptions{
+		Prompt: "inspect", CWD: "/repo", OperationID: "op-no-failover", Nonce: testGrokACPNonce, Identity: testGrokACPIdentity(t),
+	}, GrokACPOperationDeps{Engine: engine, Admission: admission, Ledger: testGrokACPLedger(t)})
+	if err == nil || output.State != "admission_denied" || engine.calls != 0 || admission.releases != 1 {
+		t.Fatalf("output=%+v err=%v engine_calls=%d releases=%d", output, err, engine.calls, admission.releases)
+	}
+}
+
 type recordingGrokACPEngine struct {
 	request grok.Request
 	result  grok.Result
@@ -380,16 +470,23 @@ func (e *recordingGrokACPEngine) Run(_ context.Context, req grok.Request) (grok.
 	return e.result, e.err
 }
 
-type allowingAdmission struct{}
+type allowingAdmission struct{ scope provider.CapacityControlScope }
 
 func (allowingAdmission) Acquire(provider.Identity) ratelimit.Decision {
 	return ratelimit.Decision{Allowed: true, NoFailover: true}
 }
-func (allowingAdmission) Release(provider.Identity) {}
+func (allowingAdmission) Release(provider.Identity, ratelimit.Decision) {}
 func (allowingAdmission) RecordResult(provider.Identity, ratelimit.ErrorClass, time.Duration) ratelimit.Decision {
 	return ratelimit.Decision{NoFailover: true}
 }
 func (allowingAdmission) RecordSuccess(provider.Identity) {}
+func (a allowingAdmission) CapacityStatus() ratelimit.CapacityStatus {
+	scope := a.scope
+	if scope == "" {
+		scope = provider.CapacityControlScopeLocalShared
+	}
+	return ratelimit.CapacityStatus{Scope: scope}
+}
 
 type recordingAdmission struct {
 	resultCalls  int
@@ -400,22 +497,42 @@ type recordingAdmission struct {
 func (*recordingAdmission) Acquire(provider.Identity) ratelimit.Decision {
 	return ratelimit.Decision{Allowed: true, NoFailover: true}
 }
-func (*recordingAdmission) Release(provider.Identity) {}
+func (*recordingAdmission) Release(provider.Identity, ratelimit.Decision) {}
 func (a *recordingAdmission) RecordResult(_ provider.Identity, class ratelimit.ErrorClass, _ time.Duration) ratelimit.Decision {
 	a.resultCalls++
 	a.lastClass = class
 	return ratelimit.Decision{Reason: class, NoFailover: true}
 }
 func (a *recordingAdmission) RecordSuccess(provider.Identity) { a.successCalls++ }
+func (*recordingAdmission) CapacityStatus() ratelimit.CapacityStatus {
+	return ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}
+}
 
 type denyingAdmission struct{ decision ratelimit.Decision }
 
 func (d denyingAdmission) Acquire(provider.Identity) ratelimit.Decision { return d.decision }
-func (denyingAdmission) Release(provider.Identity)                      {}
+func (denyingAdmission) Release(provider.Identity, ratelimit.Decision)  {}
 func (d denyingAdmission) RecordResult(provider.Identity, ratelimit.ErrorClass, time.Duration) ratelimit.Decision {
 	return d.decision
 }
 func (denyingAdmission) RecordSuccess(provider.Identity) {}
+func (denyingAdmission) CapacityStatus() ratelimit.CapacityStatus {
+	return ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}
+}
+
+type failoverCapableAdmission struct{ releases int }
+
+func (*failoverCapableAdmission) Acquire(provider.Identity) ratelimit.Decision {
+	return ratelimit.Decision{Allowed: true, NoFailover: false}
+}
+func (a *failoverCapableAdmission) Release(provider.Identity, ratelimit.Decision) { a.releases++ }
+func (*failoverCapableAdmission) RecordResult(provider.Identity, ratelimit.ErrorClass, time.Duration) ratelimit.Decision {
+	return ratelimit.Decision{}
+}
+func (*failoverCapableAdmission) RecordSuccess(provider.Identity) {}
+func (*failoverCapableAdmission) CapacityStatus() ratelimit.CapacityStatus {
+	return ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}
+}
 
 func testGrokACPIdentity(t *testing.T) provider.Identity {
 	t.Helper()

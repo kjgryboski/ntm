@@ -35,19 +35,12 @@ func TestLiveACPReadOnlyRoundTrip(t *testing.T) {
 	defer cancel()
 
 	result, err := Run(ctx, OSRunner{}, Request{
-		Prompt:        "Do not call any tools. Reply with this exact token and nothing else on one line: " + nonce,
-		ExpectedNonce: nonce,
-		CWD:           cwd,
-		Binary:        "grok",
-		Model:         model,
-		AutomationPolicyArgs: []string{
-			"--sandbox=read-only",
-			"--permission-mode=dontAsk",
-			"--allow=Read",
-			"--deny=Bash(*)",
-			"--deny=Edit(*)",
-			"--deny=MCPTool(*)",
-		},
+		Prompt:                  "Do not call any tools. Reply with this exact token and nothing else on one line: " + nonce,
+		ExpectedNonce:           nonce,
+		CWD:                     cwd,
+		Binary:                  "grok",
+		Model:                   model,
+		AutomationPolicyArgs:    defaultReadOnlyAutomationPolicyArgs(),
 		PostResponseQuietWindow: 500 * time.Millisecond,
 	})
 	if err != nil {

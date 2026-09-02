@@ -77,11 +77,11 @@ func PrintProviderConformance(ctx context.Context, cfg *config.Config, profileTa
 
 func validateConformanceTransportIdentity(transport string, identity provider.Identity) error {
 	switch transport {
-	case "xai_acp", "xai_grok_tui":
+	case "xai_acp", "xai_headless_session", "xai_grok_tui":
 		if identity.Provider() != "xai" {
 			return fmt.Errorf("transport %q requires an xAI provider identity", transport)
 		}
-	case "zai_claude_runtime":
+	case "zai_claude_runtime", "zai_native_api":
 		if identity.Provider() != "zai" {
 			return fmt.Errorf("transport %q requires a Z.ai provider identity", transport)
 		}
@@ -104,18 +104,22 @@ func (r syntheticProviderRuntime) Launch(_ context.Context, identity provider.Id
 }
 
 func (r syntheticProviderRuntime) Deliver(_ context.Context, _ string, nonce string) (provider.DeliveryObservation, error) {
-	return provider.DeliveryObservation{Submitted: true, AcknowledgedNonce: nonce, CompletionAuthoritative: r.transport == "xai_acp"}, nil
+	completion := r.transport == "xai_acp" || r.transport == "xai_headless_session" || r.transport == "zai_native_api"
+	return provider.DeliveryObservation{Submitted: true, AcknowledgedNonce: nonce, CompletionAuthoritative: completion}, nil
 }
 
-func (syntheticProviderRuntime) Cancel(context.Context, string) (provider.CancelObservation, error) {
-	return provider.CancelObservation{Attempted: true, Authoritative: false}, nil
+func (r syntheticProviderRuntime) Cancel(context.Context, string) (provider.CancelObservation, error) {
+	return provider.CancelObservation{Attempted: true, Authoritative: r.transport == "xai_headless_session"}, nil
 }
 
 func (syntheticProviderRuntime) Recover(context.Context, string) (provider.RecoveryObservation, error) {
 	return provider.RecoveryObservation{OutcomeUnknown: true, AutomaticReplayBlocked: true}, nil
 }
 
-func (syntheticProviderRuntime) Resume(context.Context, string) (provider.ResumeObservation, error) {
+func (r syntheticProviderRuntime) Resume(context.Context, string) (provider.ResumeObservation, error) {
+	if r.transport == "xai_headless_session" {
+		return provider.ResumeObservation{Resumed: true, SameSessionID: true}, nil
+	}
 	return provider.ResumeObservation{}, nil
 }
 

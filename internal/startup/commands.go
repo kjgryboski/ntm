@@ -48,6 +48,7 @@ var CommandClassification = map[string]CommandRequirement{
 	"personas": RequireConfig,
 	"template": RequireConfig,
 	"scrub":    RequireConfig,
+	"provider": RequireConfig,
 
 	// Full startup commands
 	"spawn":           RequireFullStartup,

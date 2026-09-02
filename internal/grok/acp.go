@@ -16,9 +16,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
+
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 )
 
 const (
@@ -170,18 +173,11 @@ type Request struct {
 	AutomationPolicyArgs []string
 }
 
-// DefaultReadOnlyAutomationPolicyArgs is the named ACP policy used when an
-// adapter has not supplied a narrower profile. Deny wins over allow in Grok,
-// so filesystem writes, shell execution, and MCP tools stay unavailable.
-var DefaultReadOnlyAutomationPolicyArgs = []string{
-	"--sandbox=read-only",
-	"--permission-mode=dontAsk",
-	"--allow=Read",
-	"--allow=Grep",
-	"--allow=WebSearch",
-	"--deny=Bash(*)",
-	"--deny=Edit(*)",
-	"--deny=MCPTool(*)",
+// defaultReadOnlyAutomationPolicyArgs returns a fresh copy of the compiled
+// observe policy. Keeping one policy authority avoids a weaker adapter-local
+// default silently omitting the credential-path denials in the named policy.
+func defaultReadOnlyAutomationPolicyArgs() []string {
+	return agentpkg.GrokAutomationACPPolicyArgs(agentpkg.DefaultGrokAutomationPolicyName)
 }
 
 // StderrDigest is safe diagnostic evidence. It contains no stderr body.
@@ -271,7 +267,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 		req.Binary = "grok"
 	}
 	if len(req.AutomationPolicyArgs) == 0 {
-		req.AutomationPolicyArgs = append([]string(nil), DefaultReadOnlyAutomationPolicyArgs...)
+		req.AutomationPolicyArgs = defaultReadOnlyAutomationPolicyArgs()
 	}
 	if err := validateAutomationPolicyArgs(req.AutomationPolicyArgs); err != nil {
 		return finishFailure(result, ErrInvalidRequest, err)
@@ -470,32 +466,15 @@ func drainPostResponseUpdates(ctx context.Context, events <-chan rpcEvent, updat
 }
 
 func validateAutomationPolicyArgs(args []string) error {
-	hasReadOnlySandbox := false
-	hasDontAsk := false
-	for _, arg := range args {
-		arg = strings.TrimSpace(arg)
-		if arg == "--sandbox=read-only" {
-			hasReadOnlySandbox = true
-			continue
-		}
-		if arg == "--permission-mode=dontAsk" {
-			hasDontAsk = true
-			continue
-		}
-		if !strings.HasPrefix(arg, "--allow=") && !strings.HasPrefix(arg, "--deny=") {
-			return fmt.Errorf("automation policy argument %q is not a named --allow= or --deny= rule", arg)
-		}
-		if strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(arg, "--allow="), "--deny=")) == "" {
-			return fmt.Errorf("automation policy argument %q has an empty rule", arg)
+	for _, policyName := range []string{
+		agentpkg.DefaultGrokAutomationPolicyName,
+		agentpkg.GrokWorkspaceWritePolicyName,
+	} {
+		if slices.Equal(args, agentpkg.GrokAutomationACPPolicyArgs(policyName)) {
+			return nil
 		}
 	}
-	if !hasReadOnlySandbox {
-		return errors.New("automation policy must select --sandbox=read-only")
-	}
-	if !hasDontAsk {
-		return errors.New("automation policy must select --permission-mode=dontAsk")
-	}
-	return nil
+	return errors.New("automation policy arguments must exactly match a compiled NTM Grok policy")
 }
 
 func exitCodeFromError(err error) (int, bool) {

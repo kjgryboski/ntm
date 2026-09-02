@@ -1,6 +1,9 @@
 package ratelimit
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -85,7 +88,7 @@ func TestAdmissionHalfOpenAllowsOnlyOneProbeAcrossAvailableCapacity(t *testing.T
 	if second.Allowed || second.Reason != ErrorOverloaded || second.RetryAt == nil || !second.NoFailover {
 		t.Fatalf("second half-open probe = %+v, want temporary no-failover denial", second)
 	}
-	c.Release(id)
+	c.Release(id, first)
 	c.RecordSuccess(id)
 	if afterSuccess := c.Acquire(id); !afterSuccess.Allowed {
 		t.Fatalf("closed circuit acquire = %+v, want allowed", afterSuccess)
@@ -102,7 +105,7 @@ func TestAdmissionRejectsZeroIdentityWithoutCreatingSharedScope(t *testing.T) {
 	if got := c.RecordResult(zero, ErrorRateLimited, time.Second); got.Allowed || got.Reason != ErrorIdentityMismatch || !got.NoFailover {
 		t.Fatalf("zero identity result = %+v, want identity mismatch denial", got)
 	}
-	c.Release(zero)
+	c.Release(zero, Decision{})
 	c.RecordSuccess(zero)
 	if len(c.states) != 0 {
 		t.Fatalf("zero identity created capacity state: %+v", c.states)
@@ -185,5 +188,232 @@ func TestAdmissionPermanentClassificationPersistsUntilExplicitReset(t *testing.T
 	c.Reset(id)
 	if afterReset := c.Acquire(id); !afterReset.Allowed || !afterReset.NoFailover {
 		t.Fatalf("explicit reset did not reopen identity: %+v", afterReset)
+	}
+}
+
+func TestSharedAdmissionCoordinatesAcrossControllersAndReportsScope(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultAdmissionConfig()
+	cfg.MaxConcurrent, cfg.TokenCapacity, cfg.TokensPerSecond = 1, 1, 1
+	path := filepath.Join(t.TempDir(), "provider-capacity.json")
+	one, err := NewSharedAdmissionController(cfg, path, func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := NewSharedAdmissionController(cfg, path, func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := admissionIdentity(t, "kevin", "glm-5.3-flash")
+	first := one.Acquire(id)
+	if !first.Allowed {
+		t.Fatalf("first acquire = %+v", first)
+	}
+	if got := two.Acquire(id); got.Allowed {
+		t.Fatalf("second controller bypassed shared lease: %+v", got)
+	}
+	if got := one.CapacityStatus(); got.Scope != provider.CapacityControlScopeLocalShared || got.SharedStorePath != path || got.FallbackReason != "" {
+		t.Fatalf("shared capacity status = %+v", got)
+	}
+	snapshot := two.Snapshot(id)
+	if snapshot.Scope != provider.CapacityControlScopeLocalShared || snapshot.Running != 1 || snapshot.IdentityHash != id.Hash() || snapshot.NextRetry != nil || snapshot.CircuitOpenUntil != nil {
+		t.Fatalf("shared admission snapshot = %+v", snapshot)
+	}
+	one.Release(id, first)
+	now = now.Add(time.Second)
+	if got := two.Acquire(id); !got.Allowed {
+		t.Fatalf("released shared lease = %+v", got)
+	}
+}
+
+func TestSharedAdmissionReclaimsLeaseFromDeadOwner(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultAdmissionConfig()
+	cfg.MaxConcurrent, cfg.TokenCapacity, cfg.TokensPerSecond = 1, 2, 1
+	path := filepath.Join(t.TempDir(), "provider-capacity.json")
+	one, err := NewSharedAdmissionController(cfg, path, func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := NewSharedAdmissionController(cfg, path, func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Model a process that died after acquiring and before Release. Both
+	// controllers share this deterministic process observer in the test.
+	one.shared.processExists = func(int32) (bool, error) { return false, nil }
+	two.shared.processExists = one.shared.processExists
+	id := admissionIdentity(t, "kevin", "glm-5.3-flash")
+	first := one.Acquire(id)
+	if !first.Allowed {
+		t.Fatalf("first acquire = %+v", first)
+	}
+	if got := two.Acquire(id); !got.Allowed {
+		t.Fatalf("dead-owner lease was not reclaimed: %+v", got)
+	}
+	// The new lease belongs to the surviving controller; restore a live PID
+	// observation before taking a snapshot.
+	one.shared.processExists = func(int32) (bool, error) { return true, nil }
+	two.shared.processExists = one.shared.processExists
+	if snapshot := two.Snapshot(id); snapshot.Running != 1 {
+		t.Fatalf("snapshot running = %d, want only second active lease", snapshot.Running)
+	}
+}
+
+func TestSharedAdmissionReclaimsExpiredLeaseWhenPIDCannotBeInspected(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultAdmissionConfig()
+	cfg.MaxConcurrent, cfg.TokenCapacity, cfg.TokensPerSecond, cfg.LeaseTTL = 1, 2, 1, time.Second
+	path := filepath.Join(t.TempDir(), "provider-capacity.json")
+	one, err := NewSharedAdmissionController(cfg, path, func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := NewSharedAdmissionController(cfg, path, func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	one.shared.processExists = func(int32) (bool, error) { return true, os.ErrPermission }
+	two.shared.processExists = one.shared.processExists
+	id := admissionIdentity(t, "kevin", "glm-5.3-flash")
+	first := one.Acquire(id)
+	if !first.Allowed {
+		t.Fatalf("first acquire = %+v", first)
+	}
+	now = now.Add(2 * time.Second)
+	if got := two.Acquire(id); !got.Allowed {
+		t.Fatalf("expired lease was not reclaimed: %+v", got)
+	}
+}
+
+func TestSharedAdmissionOutOfOrderReleaseKeepsTheOtherExactLease(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultAdmissionConfig()
+	cfg.MaxConcurrent, cfg.TokenCapacity, cfg.TokensPerSecond = 2, 3, 1
+	controller, err := NewSharedAdmissionController(cfg, filepath.Join(t.TempDir(), "provider-capacity.json"), func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.shared.processExists = func(int32) (bool, error) { return true, nil }
+	id := admissionIdentity(t, "kevin", "glm-5.3-flash")
+	first, second := controller.Acquire(id), controller.Acquire(id)
+	if !first.Allowed || !second.Allowed || first.leaseID == "" || second.leaseID == "" || first.leaseID == second.leaseID {
+		t.Fatalf("concurrent decisions first=%+v second=%+v", first, second)
+	}
+	controller.Release(id, first)
+	if snapshot := controller.Snapshot(id); snapshot.Running != 1 {
+		t.Fatalf("out-of-order first release running=%d, want second lease retained", snapshot.Running)
+	}
+	// Releasing the same capability twice must not affect the other operation.
+	controller.Release(id, first)
+	if snapshot := controller.Snapshot(id); snapshot.Running != 1 {
+		t.Fatalf("stale duplicate release running=%d, want second lease retained", snapshot.Running)
+	}
+	controller.Release(id, second)
+	if snapshot := controller.Snapshot(id); snapshot.Running != 0 {
+		t.Fatalf("final exact release running=%d, want zero", snapshot.Running)
+	}
+}
+
+func TestSharedAdmissionRenewedLeaseRemainsCountedPastOriginalTTL(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultAdmissionConfig()
+	cfg.MaxConcurrent, cfg.TokenCapacity, cfg.TokensPerSecond, cfg.LeaseTTL = 1, 2, 1, time.Second
+	path := filepath.Join(t.TempDir(), "provider-capacity.json")
+	one, err := NewSharedAdmissionController(cfg, path, func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := NewSharedAdmissionController(cfg, path, func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both controllers are live for the duration of this fake-clock test.
+	one.shared.processExists = func(int32) (bool, error) { return true, nil }
+	two.shared.processExists = one.shared.processExists
+	id := admissionIdentity(t, "kevin", "glm-5.3-flash")
+	first := one.Acquire(id)
+	if !first.Allowed {
+		t.Fatalf("first acquire = %+v", first)
+	}
+	scope := id.CapacityScope()
+	if first.leaseID == "" {
+		t.Fatal("allowed decision omitted its opaque lease capability")
+	}
+	// Renew before expiry, then advance beyond the original TTL. The second
+	// controller must still see the active lease and deny oversubscription.
+	now = now.Add(500 * time.Millisecond)
+	one.renewLease(scope, first.leaseID)
+	now = now.Add(600 * time.Millisecond)
+	if got := two.Acquire(id); got.Allowed {
+		t.Fatalf("renewed lease expired at original deadline: %+v", got)
+	}
+	one.Release(id, first)
+	now = now.Add(time.Second)
+	if got := two.Acquire(id); !got.Allowed {
+		t.Fatalf("released renewed lease remained counted: %+v", got)
+	}
+}
+
+func TestSharedAdmissionReclaimsStaleMkdirLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "provider-capacity.json")
+	store, err := NewLocalSharedStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.lockStaleAfter = time.Millisecond
+	store.processExists = func(int32) (bool, error) { return false, nil }
+	lockPath := path + ".lock"
+	if err := os.Mkdir(lockPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := json.Marshal(admissionLockMetadata{OwnerPID: 999999, OwnerID: "dead-owner", CreatedAt: time.Now().UTC().Add(-time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lockPath, "owner.json"), metadata, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := store.lock()
+	if err != nil {
+		t.Fatalf("stale lock was not reclaimed: %v", err)
+	}
+	unlock()
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("released lock still exists: %v", err)
+	}
+}
+
+func TestSharedAdmissionUnrecoverableLockFailsAcquisitionClosed(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "provider-capacity.json")
+	controller, err := NewSharedAdmissionController(DefaultAdmissionConfig(), path, func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.shared.lockTimeout = time.Millisecond
+	if status := controller.CapacityStatus(); status.Scope != provider.CapacityControlScopeLocalShared {
+		t.Fatalf("initial capacity scope = %+v", status)
+	}
+	// Missing metadata is intentionally not reclaimed: a live legacy writer
+	// cannot be distinguished safely. The controller must expose the degraded
+	// scope but must not dispatch using process-local capacity.
+	if err := os.Mkdir(path+".lock", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	id := admissionIdentity(t, "kevin", "glm-5.3-flash")
+	if got := controller.Acquire(id); got.Allowed || !got.NoFailover || got.Reason != ErrorUnknown {
+		t.Fatalf("shared-store failure admission = %+v", got)
+	}
+	status := controller.CapacityStatus()
+	if status.Scope != provider.CapacityControlScopeProcessLocal || status.FallbackReason == "" {
+		t.Fatalf("unrecoverable lock fallback was not visible: %+v", status)
+	}
+	if len(controller.states) != 0 {
+		t.Fatalf("shared acquisition failure mutated process-local state: %+v", controller.states)
+	}
+	snapshot := controller.Snapshot(id)
+	if snapshot.Running != 0 || snapshot.Tokens != 0 {
+		t.Fatalf("shared acquisition failure spent local capacity: %+v", snapshot)
 	}
 }

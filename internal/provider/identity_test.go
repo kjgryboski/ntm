@@ -63,3 +63,20 @@ func TestZeroIdentityIsInvalidAndHasNoCapacityScope(t *testing.T) {
 		t.Fatalf("zero identity evidence = %q, want unverified", got)
 	}
 }
+
+func TestIdentityAuthorizationClassesAreImmutableCapacityInputs(t *testing.T) {
+	codingPlan, err := NewIdentityWithAuthorization("zai", "kevin", "glm-5.3-flash", "https://api.z.ai/api/anthropic", "claude-code", CredentialClassCodingPlan, BillingClassCodingPlan, EntitlementClaudeCompat, testConfigHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	native, err := NewIdentityWithAuthorization("zai", "kevin", "glm-5.3-flash", "https://api.z.ai/api/anthropic", "claude-code", CredentialClassAPIKey, BillingClassAPIUsage, EntitlementNativeAPI, testConfigHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if codingPlan.Hash() == native.Hash() || codingPlan.CapacityScope() == native.CapacityScope() {
+		t.Fatalf("authorization classes must partition capacity: %q %q", codingPlan.Hash(), native.Hash())
+	}
+	if got := codingPlan.Entitlement(); got != EntitlementClaudeCompat {
+		t.Fatalf("entitlement = %q", got)
+	}
+}

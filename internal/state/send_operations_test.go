@@ -67,9 +67,10 @@ func TestClaimSendOperationLifecycle(t *testing.T) {
 		t.Error("completed record missing completed_at")
 	}
 
-	// Completing again is a no-op (status guard), preserving the original outcome.
-	if err := store.CompleteSendOperation("op-1", "proj", `{"success":false}`, time.Now()); err != nil {
-		t.Fatalf("re-complete error = %v", err)
+	// A second completion is rejected: callers must never mistake a missing
+	// in-progress claim for a freshly persisted durable receipt.
+	if err := store.CompleteSendOperation("op-1", "proj", `{"success":false}`, time.Now()); err == nil {
+		t.Fatal("re-complete unexpectedly succeeded")
 	}
 	got2, _ := store.GetSendOperation("op-1", "proj")
 	if got2.OutcomeJSON != `{"success":true}` {

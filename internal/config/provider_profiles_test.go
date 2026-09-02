@@ -9,6 +9,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
+	"github.com/Dicklesworthstone/ntm/internal/zai"
 )
 
 const providerProfileTestHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -20,6 +21,9 @@ func validZAIProviderProfile() ProviderProfileConfig {
 		Model:                   "glm-5.3-flash",
 		Endpoint:                "https://api.z.ai/api/anthropic",
 		Runtime:                 "claude-code",
+		CredentialClass:         provider.CredentialClassCodingPlan,
+		BillingClass:            provider.BillingClassCodingPlan,
+		Entitlement:             provider.EntitlementClaudeCompat,
 		ConfigSHA256:            providerProfileTestHash,
 		Command:                 "claude",
 		AutomationPolicy:        provider.DefaultZAIAutomationPolicyName,
@@ -27,6 +31,38 @@ func validZAIProviderProfile() ProviderProfileConfig {
 		ProbeRequired:           true,
 		ModelProbeState:         "qualified",
 		ModelProbeReceiptSHA256: providerProfileTestHash,
+	}
+}
+
+func TestValidateProviderProfilesEnforcesZAITransportEntitlement(t *testing.T) {
+	profile := validZAIProviderProfile()
+	profile.CredentialClass = provider.CredentialClassAPIKey
+	joined := errorsString(ValidateProviderProfiles(map[string]ProviderProfileConfig{"zai-coding-plan": profile}))
+	if !strings.Contains(joined, "claude_compatible transport requires") {
+		t.Fatalf("coding plan authorization error = %q", joined)
+	}
+
+	profile = validZAIProviderProfile()
+	profile.CredentialClass = provider.CredentialClassAPIKey
+	profile.BillingClass = provider.BillingClassAPIUsage
+	profile.Entitlement = provider.EntitlementNativeAPI
+	profile.Runtime = "zai-api"
+	profile.Endpoint = zai.NativeChatCompletionsEndpoint
+	profile.AutomationPolicy = provider.NativeZAINoToolsPolicyName
+	profile.Command = ""
+	if errs := ValidateProviderProfiles(map[string]ProviderProfileConfig{"zai-native-api": profile}); len(errs) != 0 {
+		t.Fatalf("native API profile errors = %v", errs)
+	}
+	profile.Command = "zai-api"
+	joined = errorsString(ValidateProviderProfiles(map[string]ProviderProfileConfig{"zai-native-api": profile}))
+	if !strings.Contains(joined, "must leave command empty") {
+		t.Fatalf("native API command error = %q", joined)
+	}
+	profile.Command = ""
+	profile.AutomationPolicy = "native-bypass"
+	joined = errorsString(ValidateProviderProfiles(map[string]ProviderProfileConfig{"zai-native-api": profile}))
+	if !strings.Contains(joined, provider.NativeZAINoToolsPolicyName) {
+		t.Fatalf("native API policy error = %q", joined)
 	}
 }
 
@@ -125,6 +161,27 @@ func TestPrintProviderProfilesRoundTripsWithoutCredentials(t *testing.T) {
 	}
 	if _, err := decodedProfile.Identity(); err != nil {
 		t.Fatalf("decoded profile Identity() error: %v", err)
+	}
+}
+
+func TestPrintNativeZAIProfileOmitsExternalCommand(t *testing.T) {
+	profile := validZAIProviderProfile()
+	profile.CredentialClass = provider.CredentialClassAPIKey
+	profile.BillingClass = provider.BillingClassAPIUsage
+	profile.Entitlement = provider.EntitlementNativeAPI
+	profile.Runtime = "zai-api"
+	profile.Endpoint = zai.NativeChatCompletionsEndpoint
+	profile.AutomationPolicy, profile.Command = provider.NativeZAINoToolsPolicyName, ""
+	cfg := Default()
+	cfg.ProviderProfiles = map[string]ProviderProfileConfig{"zai-native-api": profile}
+	var buf bytes.Buffer
+	if err := Print(cfg, &buf); err != nil {
+		t.Fatal(err)
+	}
+	providerSection := buf.String()[strings.Index(buf.String(), `[provider_profiles."zai-native-api"]`):]
+	providerSection = providerSection[:strings.Index(providerSection, "\n[tmux]")]
+	if strings.Contains(providerSection, "command =") {
+		t.Fatalf("native API print must not imply an external command: %s", providerSection)
 	}
 }
 

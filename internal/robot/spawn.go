@@ -483,6 +483,9 @@ func resolveZAISpawnProfile(opts SpawnOptions, cfg *config.Config) (config.Provi
 	if identity.Provider() != "zai" {
 		return config.ProviderProfileConfig{}, provider.Identity{}, fmt.Errorf("provider profile %q is %q, but --spawn-zai only accepts provider = \"zai\"", opts.ZAIProviderProfile, identity.Provider())
 	}
+	if identity.Entitlement() != provider.EntitlementClaudeCompat || identity.Runtime() != "claude-code" {
+		return config.ProviderProfileConfig{}, provider.Identity{}, fmt.Errorf("provider profile %q is not the Z.ai Claude-compatible Coding Plan pane lane", opts.ZAIProviderProfile)
+	}
 	if !profile.ExactTargetOnly {
 		return config.ProviderProfileConfig{}, provider.Identity{}, fmt.Errorf("provider profile %q must require exact targeting", opts.ZAIProviderProfile)
 	}
@@ -829,10 +832,17 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 	if providerAdmission == nil {
 		providerAdmission = ratelimit.DefaultAdmissionController()
 	}
+	providerCapacityStatus := providerAdmission.CapacityStatus()
+	if opts.ZAICount > 0 && !opts.DryRun && providerCapacityStatus.Scope != provider.CapacityControlScopeLocalShared {
+		output.Error = "Z.ai launch requires the cross-process local shared capacity store"
+		output.RobotResponse = NewErrorResponse(errors.New(output.Error), ErrCodeDependencyMissing, "Restore the exact-identity local shared lease/circuit store; no probe or tmux mutation occurred")
+		return output, nil
+	}
 	zaiProbeAdmissionHeld := false
+	var zaiProbeDecision ratelimit.Decision
 	defer func() {
 		if zaiProbeAdmissionHeld {
-			providerAdmission.Release(zaiIdentity)
+			providerAdmission.Release(zaiIdentity, zaiProbeDecision)
 		}
 	}()
 	// A profile is a declaration, not a live provider observation. Production
@@ -840,15 +850,16 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 	// be created. Dry-run intentionally remains configuration-only.
 	if opts.ZAICount > 0 && !opts.DryRun {
 		decision := providerAdmission.Acquire(zaiIdentity)
-		if !decision.Allowed {
+		if !decision.Allowed || !decision.NoFailover {
 			output.Error = "provider admission denied; Z.ai probe was not called"
 			output.RobotResponse = NewErrorResponse(errors.New(output.Error), ErrCodeResourceBusy, "Wait for the exact Z.ai identity capacity window; no probe or tmux mutation occurred")
 			return output, nil
 		}
 		zaiProbeAdmissionHeld = true
+		zaiProbeDecision = decision
 		receipt, probeErr := deps.ProbeZAI(ctx, zaiProfile, zaiIdentity)
 		if probeErr != nil || !receipt.ModelSessionEvidence || receipt.Model != zaiIdentity.Model() || receipt.NonceSHA256 == "" || receipt.OutputSHA256 == "" || receipt.SessionIDSHA256 == "" {
-			providerAdmission.Release(zaiIdentity)
+			providerAdmission.Release(zaiIdentity, decision)
 			zaiProbeAdmissionHeld = false
 			if receipt.ProviderErrorClass != "" && receipt.ProviderErrorClass != provider.ErrorUnknown {
 				providerAdmission.RecordResult(zaiIdentity, receipt.ProviderErrorClass, 0)
@@ -1223,6 +1234,7 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 			return output, nil
 		}
 		pane := panes[startIdx+i]
+		var zaiLaunchDecision ratelimit.Decision
 		if request.agentType == "zai" {
 			decision := ratelimit.Decision{Allowed: true, NoFailover: true}
 			if zaiProbeAdmissionHeld {
@@ -1230,17 +1242,19 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 				// operation. Keeping this slot avoids double-spending a one-token
 				// default bucket between preflight and the launch it authorizes.
 				zaiProbeAdmissionHeld = false
+				decision = zaiProbeDecision
 			} else {
 				decision = providerAdmission.Acquire(request.providerIdentity)
 			}
+			zaiLaunchDecision = decision
 			admission := &AdmissionEvidence{
 				Allowed:              decision.Allowed,
 				Reason:               decision.Reason,
 				RetryAt:              decision.RetryAt,
 				NoFailover:           decision.NoFailover,
-				CapacityControlScope: provider.CapacityControlScopeProcessLocal,
+				CapacityControlScope: providerCapacityStatus.Scope,
 			}
-			if !decision.Allowed {
+			if !decision.Allowed || !decision.NoFailover {
 				agent := SpawnedAgent{
 					Pane:                     pane.Ref().Physical(),
 					Type:                     "zai",
@@ -1280,8 +1294,8 @@ func GetSpawn(ctx context.Context, opts SpawnOptions, cfg *config.Config) (*Spaw
 		agent.ModelProbeState = request.modelProbeState
 		agent.ModelProbeReceiptHash = request.modelProbeReceiptHash
 		if request.agentType == "zai" {
-			providerAdmission.Release(request.providerIdentity)
-			agent.Admission = &AdmissionEvidence{Allowed: true, NoFailover: true, CapacityControlScope: provider.CapacityControlScopeProcessLocal}
+			providerAdmission.Release(request.providerIdentity, zaiLaunchDecision)
+			agent.Admission = &AdmissionEvidence{Allowed: true, NoFailover: true, CapacityControlScope: providerCapacityStatus.Scope}
 			if launchErr != nil {
 				// LaunchAgent may report an error after tmux accepted some or all
 				// keystrokes. Treat every Z.ai launch error as outcome-unknown and

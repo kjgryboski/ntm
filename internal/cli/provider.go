@@ -1,0 +1,1267 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/grok"
+	"github.com/Dicklesworthstone/ntm/internal/provider"
+	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
+	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
+	"github.com/Dicklesworthstone/ntm/internal/zai"
+)
+
+const (
+	providerDoctorSchema      = "ntm.provider-doctor.v1"
+	providerReadinessGo       = "GO"
+	providerReadinessGoScoped = "GO_SCOPED"
+	providerReadinessNoGo     = "NO_GO"
+)
+
+type providerCommandOptions struct {
+	profile          string
+	online           bool
+	timeout          time.Duration
+	qualificationAge time.Duration
+	qualificationDir string
+}
+
+type providerQualificationOptions struct {
+	profile          string
+	live             bool
+	timeout          time.Duration
+	suiteTimeout     time.Duration
+	qualificationDir string
+}
+
+type providerDoctorStatus string
+
+const (
+	providerDoctorPass        providerDoctorStatus = "pass"
+	providerDoctorWarn        providerDoctorStatus = "warn"
+	providerDoctorFail        providerDoctorStatus = "fail"
+	providerDoctorUnavailable providerDoctorStatus = "unavailable"
+)
+
+type providerDoctorCheck struct {
+	ID          string               `json:"id"`
+	Status      providerDoctorStatus `json:"status"`
+	Provenance  string               `json:"provenance"`
+	Summary     string               `json:"summary"`
+	Evidence    string               `json:"evidence,omitempty"`
+	Remediation string               `json:"remediation,omitempty"`
+}
+
+type providerDoctorIdentity struct {
+	SHA256          string                         `json:"sha256"`
+	Provider        string                         `json:"provider"`
+	Model           string                         `json:"model"`
+	Runtime         string                         `json:"runtime"`
+	CredentialClass string                         `json:"credential_class"`
+	BillingClass    string                         `json:"billing_class"`
+	Entitlement     string                         `json:"entitlement"`
+	Evidence        provider.IdentityEvidenceGrade `json:"evidence"`
+}
+
+type providerDoctorPolicy struct {
+	Name                      string `json:"name"`
+	SHA256                    string `json:"sha256"`
+	Sandbox                   string `json:"sandbox,omitempty"`
+	PermissionMode            string `json:"permission_mode,omitempty"`
+	ManagedRequirementsSHA256 string `json:"managed_requirements_sha256,omitempty"`
+	ManagedRequirementsState  string `json:"managed_requirements_state"`
+	RuntimeInspectionState    string `json:"runtime_inspection_state"`
+	RuntimeInspectionSHA256   string `json:"runtime_inspection_sha256,omitempty"`
+	BypassLockAuthoritative   bool   `json:"bypass_lock_authoritative"`
+}
+
+type providerGrokInspection struct {
+	GrokVersion         string
+	PermissionsLoaded   bool
+	ManagedSettingsPath string
+	SHA256              string
+}
+
+type providerCappedOutput struct {
+	bytes.Buffer
+	limit    int
+	exceeded bool
+}
+
+func (w *providerCappedOutput) Write(value []byte) (int, error) {
+	original := len(value)
+	remaining := w.limit - w.Buffer.Len()
+	if remaining > 0 {
+		if remaining < len(value) {
+			_, _ = w.Buffer.Write(value[:remaining])
+		} else {
+			_, _ = w.Buffer.Write(value)
+		}
+	}
+	if original > remaining {
+		w.exceeded = true
+	}
+	return original, nil
+}
+
+type providerDoctorRuntime struct {
+	Installed       bool   `json:"installed"`
+	Version         string `json:"version,omitempty"`
+	ExpectedVersion string `json:"expected_version,omitempty"`
+	Drift           string `json:"drift"`
+}
+
+type providerDoctorQualification struct {
+	State         string    `json:"state"`
+	Passed        bool      `json:"passed"`
+	PolicySHA256  string    `json:"policy_sha256,omitempty"`
+	CompletedAt   time.Time `json:"completed_at,omitempty"`
+	AgeSeconds    int64     `json:"age_seconds,omitempty"`
+	ReceiptSHA256 string    `json:"receipt_sha256,omitempty"`
+	ChecksPassed  int       `json:"checks_passed"`
+	ChecksTotal   int       `json:"checks_total"`
+}
+
+type providerQualificationRunOutput struct {
+	SchemaVersion  string                        `json:"schema_version"`
+	Profile        string                        `json:"profile"`
+	Transport      string                        `json:"transport"`
+	IdentitySHA256 string                        `json:"identity_sha256"`
+	RuntimeVersion string                        `json:"runtime_version"`
+	PolicySHA256   string                        `json:"policy_sha256"`
+	ReceiptPath    string                        `json:"receipt_path"`
+	Receipt        providerqualification.Receipt `json:"receipt"`
+}
+
+type providerDoctorCapacity struct {
+	Scope               provider.CapacityControlScope `json:"scope"`
+	StoreSHA256         string                        `json:"store_sha256,omitempty"`
+	FallbackReason      string                        `json:"fallback_reason,omitempty"`
+	CircuitState        string                        `json:"circuit_state"`
+	Running             int                           `json:"running"`
+	Tokens              float64                       `json:"tokens"`
+	ConsecutiveFailures int                           `json:"consecutive_failures"`
+	NextRetry           *time.Time                    `json:"next_retry,omitempty"`
+	CircuitOpenUntil    *time.Time                    `json:"circuit_open_until,omitempty"`
+	TerminalReason      provider.ErrorClass           `json:"terminal_reason,omitempty"`
+	HalfOpenInFlight    bool                          `json:"half_open_in_flight"`
+}
+
+type providerDoctorReport struct {
+	SchemaVersion string                         `json:"schema_version"`
+	GeneratedAt   time.Time                      `json:"generated_at"`
+	DurationMS    int64                          `json:"duration_ms"`
+	Mode          string                         `json:"mode"`
+	Profile       string                         `json:"profile"`
+	Transport     string                         `json:"transport"`
+	Readiness     string                         `json:"readiness"`
+	Identity      providerDoctorIdentity         `json:"identity"`
+	Policy        providerDoctorPolicy           `json:"policy"`
+	Runtime       providerDoctorRuntime          `json:"runtime"`
+	Qualification providerDoctorQualification    `json:"qualification"`
+	Capacity      providerDoctorCapacity         `json:"capacity"`
+	Capabilities  provider.OperationCapabilities `json:"capabilities"`
+	Checks        []providerDoctorCheck          `json:"checks"`
+}
+
+type providerDoctorLiveEvidence struct {
+	ModelVerified bool
+	AuthVerified  bool
+	SHA256        string
+}
+
+type providerDoctorAdmission interface {
+	Acquire(provider.Identity) ratelimit.Decision
+	Release(provider.Identity, ratelimit.Decision)
+	RecordSuccess(provider.Identity)
+	CapacityStatus() ratelimit.CapacityStatus
+}
+
+type providerDoctorDependencies struct {
+	now       func() time.Time
+	lookPath  func(string) (string, error)
+	version   func(context.Context, string) (string, error)
+	lookupEnv func(string) (string, bool)
+	readFile  func(string) ([]byte, error)
+	stat      func(string) (os.FileInfo, error)
+	rootOwned func(os.FileInfo) bool
+	// readRequirements securely binds content and metadata to the same open
+	// file descriptor. Production sets it; unit tests may inject the older
+	// readFile/stat pair to exercise report assembly without privileged files.
+	readRequirements   func(string) ([]byte, os.FileInfo, error)
+	inspectGrok        func(context.Context, string, string) (providerGrokInspection, error)
+	onlineProbe        func(context.Context, config.ProviderProfileConfig, provider.Identity) (providerDoctorLiveEvidence, error)
+	qualificationStore func(string, string) (providerqualification.Receipt, string, error)
+	capacityStatus     func() ratelimit.CapacityStatus
+	capacitySnapshot   func(provider.Identity) ratelimit.AdmissionSnapshot
+	admission          providerDoctorAdmission
+}
+
+type providerQualificationDependencies struct {
+	loadConfig func() *config.Config
+	lookPath   func(string) (string, error)
+	version    func(context.Context, string) (string, error)
+	lookupEnv  func(string) (string, bool)
+	run        func(context.Context, providerqualification.Options) providerqualification.Receipt
+	store      func(string, providerqualification.Receipt) (string, error)
+	admission  providerDoctorAdmission
+}
+
+func defaultProviderDoctorDependencies() providerDoctorDependencies {
+	admission := ratelimit.DefaultAdmissionController()
+	return providerDoctorDependencies{
+		now:                time.Now,
+		lookPath:           exec.LookPath,
+		version:            providerRuntimeVersion,
+		lookupEnv:          os.LookupEnv,
+		readFile:           os.ReadFile,
+		stat:               os.Stat,
+		rootOwned:          providerRequirementsRootOwned,
+		readRequirements:   providerRequirementsReadForDoctor,
+		inspectGrok:        providerRuntimeInspectGrok,
+		onlineProbe:        runProviderDoctorOnlineProbe,
+		qualificationStore: providerqualification.LoadLatest,
+		capacityStatus: func() ratelimit.CapacityStatus {
+			return admission.CapacityStatus()
+		},
+		capacitySnapshot: func(identity provider.Identity) ratelimit.AdmissionSnapshot {
+			return admission.Snapshot(identity)
+		},
+		admission: admission,
+	}
+}
+
+var providerDoctorDeps = defaultProviderDoctorDependencies()
+
+var providerQualificationDeps = providerQualificationDependencies{
+	loadConfig: loadSelectedConfigOrDefault,
+	lookPath:   exec.LookPath,
+	version:    providerRuntimeVersion,
+	lookupEnv:  os.LookupEnv,
+	run:        providerqualification.Run,
+	store:      providerqualification.Store,
+	admission:  ratelimit.DefaultAdmissionController(),
+}
+
+func newProviderCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "provider",
+		Short: "Inspect and qualify exact AI provider lanes",
+	}
+	cmd.AddCommand(newProviderDoctorCmd(), newProviderQualifyCmd(), newProviderSessionCmd(), newProviderNativeRunCmd(), newProviderCapabilitiesCmd(), newProviderPolicyCmd())
+	return cmd
+}
+
+func newProviderQualifyCmd() *cobra.Command {
+	opts := providerQualificationOptions{timeout: 90 * time.Second, suiteTimeout: 12 * time.Minute}
+	cmd := &cobra.Command{
+		Use:   "qualify",
+		Short: "Run the live Z.ai Coding Plan qualification suite",
+		Long: `Run all mandatory checks against one exact Z.ai Claude-compatible Coding Plan profile.
+
+This command is intentionally live-only and retains its disposable repository.
+It never accepts a native Z.ai API credential for this compatibility lane.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runProviderQualification(cmd, opts, providerQualificationDeps)
+		},
+	}
+	cmd.Flags().StringVar(&opts.profile, "profile", "", "Exact configured Z.ai provider profile (required)")
+	cmd.Flags().BoolVar(&opts.live, "live", false, "Explicitly authorize real provider calls in a disposable repository")
+	cmd.Flags().DurationVar(&opts.timeout, "timeout", opts.timeout, "Timeout for each provider scenario")
+	cmd.Flags().DurationVar(&opts.suiteTimeout, "suite-timeout", opts.suiteTimeout, "Overall qualification timeout")
+	cmd.Flags().StringVar(&opts.qualificationDir, "qualification-store", "", "Override qualification receipt directory")
+	return cmd
+}
+
+func runProviderQualification(cmd *cobra.Command, opts providerQualificationOptions, deps providerQualificationDependencies) error {
+	if strings.TrimSpace(opts.profile) == "" {
+		return errors.New("provider qualification requires an exact --profile")
+	}
+	if !opts.live {
+		return errors.New("provider qualification makes real provider calls; pass --live to authorize it")
+	}
+	if opts.timeout <= 0 || opts.suiteTimeout <= 0 {
+		return errors.New("provider qualification timeouts must be positive")
+	}
+	if deps.loadConfig == nil || deps.lookPath == nil || deps.version == nil || deps.lookupEnv == nil || deps.run == nil || deps.store == nil || deps.admission == nil {
+		return errors.New("provider qualification dependencies are incomplete")
+	}
+
+	cfg := deps.loadConfig()
+	if cfg == nil {
+		return errors.New("provider qualification requires loaded configuration")
+	}
+	profile, err := cfg.ProviderProfile(opts.profile)
+	if err != nil {
+		return err
+	}
+	identity, err := profile.Identity()
+	if err != nil {
+		return err
+	}
+	transport, err := providerTransportForIdentity(identity)
+	if err != nil {
+		return err
+	}
+	if transport != "zai_claude_runtime" {
+		return errors.New("the live qualification suite accepts only the Z.ai Claude-compatible Coding Plan lane")
+	}
+	credential, credentialPresent := deps.lookupEnv("ZAI_API_KEY")
+	credentialPresent = credentialPresent && strings.TrimSpace(credential) != ""
+	if !credentialPresent {
+		return errors.New("no deliberately scoped Z.ai Coding Plan credential is present")
+	}
+	binary, err := deps.lookPath(profile.Command)
+	if err != nil {
+		return fmt.Errorf("locate configured Z.ai runtime: %w", err)
+	}
+	commandCtx := providerCommandContext(cmd)
+	versionCtx, versionCancel := context.WithTimeout(commandCtx, 5*time.Second)
+	runtimeVersion, err := deps.version(versionCtx, binary)
+	versionCancel()
+	if err != nil {
+		return fmt.Errorf("read configured Z.ai runtime version: %w", err)
+	}
+	if strings.TrimSpace(profile.RuntimeVersion) == "" {
+		return errors.New("provider qualification requires a reviewed runtime_version pin")
+	}
+	if !versionMatches(runtimeVersion, profile.RuntimeVersion) {
+		return fmt.Errorf("provider runtime drift detected: installed version does not match pin %q", profile.RuntimeVersion)
+	}
+	policySHA := providerqualification.QualificationPolicySHA256()
+	if policySHA == "" {
+		return errors.New("compiled Z.ai qualification policy could not be hashed")
+	}
+	if deps.admission.CapacityStatus().Scope != provider.CapacityControlScopeLocalShared {
+		return errors.New("provider qualification requires the cross-process local shared capacity store")
+	}
+	decision := deps.admission.Acquire(identity)
+	if !decision.Allowed || !decision.NoFailover {
+		if decision.Allowed {
+			deps.admission.Release(identity, decision)
+		}
+		return errors.New("provider qualification admission was denied for the exact Z.ai identity; failover is prohibited")
+	}
+	defer deps.admission.Release(identity, decision)
+
+	suiteCtx, suiteCancel := context.WithTimeout(commandCtx, opts.suiteTimeout)
+	receipt := deps.run(suiteCtx, providerqualification.Options{
+		Live: true, Identity: identity, Binary: binary, Timeout: opts.timeout,
+		RuntimeVersion: runtimeVersion, PolicySHA256: policySHA,
+	})
+	suiteCancel()
+	if err := receipt.Validate(); err != nil {
+		return fmt.Errorf("live qualification produced an invalid receipt: %w", err)
+	}
+	path, err := deps.store(opts.qualificationDir, receipt)
+	if err != nil {
+		return fmt.Errorf("store create-only qualification receipt: %w", err)
+	}
+	output := providerQualificationRunOutput{
+		SchemaVersion: providerqualification.SchemaVersion,
+		Profile:       opts.profile, Transport: transport, IdentitySHA256: identity.Hash(),
+		RuntimeVersion: runtimeVersion, PolicySHA256: policySHA, ReceiptPath: path, Receipt: receipt,
+	}
+	if IsJSONOutput() {
+		if err := encodeIndentedJSON(cmd.OutOrStdout(), output); err != nil {
+			return err
+		}
+	} else {
+		fmt.Fprintf(cmd.OutOrStdout(), "Z.ai qualification: %s (%d/%d checks)\n", qualificationResult(receipt), countPassedQualificationChecks(receipt), len(receipt.Checks))
+		fmt.Fprintf(cmd.OutOrStdout(), "Receipt: %s\n", path)
+		for _, check := range receipt.Checks {
+			fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", qualificationCheckStatus(check.Passed), check.Name, check.Detail)
+		}
+	}
+	if !receipt.Passed {
+		if IsJSONOutput() {
+			return errJSONFailure
+		}
+		return &providerQualificationExitError{}
+	}
+	deps.admission.RecordSuccess(identity)
+	return nil
+}
+
+type providerQualificationExitError struct{}
+
+func (*providerQualificationExitError) Error() string {
+	return "provider qualification did not pass every mandatory live check"
+}
+func (*providerQualificationExitError) ExitCode() int { return 1 }
+
+func qualificationResult(receipt providerqualification.Receipt) string {
+	if receipt.Passed {
+		return "PASS"
+	}
+	return "NO-GO"
+}
+
+func qualificationCheckStatus(passed bool) string {
+	if passed {
+		return "PASS"
+	}
+	return "FAIL"
+}
+
+func countPassedQualificationChecks(receipt providerqualification.Receipt) int {
+	count := 0
+	for _, check := range receipt.Checks {
+		if check.Passed {
+			count++
+		}
+	}
+	return count
+}
+
+type providerPolicyOptions struct {
+	name    string
+	install bool
+	confirm bool
+}
+
+func newProviderPolicyCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "policy", Short: "Render or install managed provider policy"}
+	opts := providerPolicyOptions{name: agent.GrokWorkspaceWritePolicyName}
+	requirements := &cobra.Command{
+		Use:   "requirements",
+		Short: "Render the root-owned Grok requirements policy",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			document, ok := agent.GrokSystemRequirementsForPolicy(opts.name)
+			if !ok {
+				return fmt.Errorf("unknown Grok automation policy %q", opts.name)
+			}
+			state := "rendered"
+			if opts.install {
+				if !opts.confirm {
+					return errors.New("managed requirements installation requires --confirm")
+				}
+				if err := installProviderRequirements(providerRequirementsPath(), document.Contents); err != nil {
+					return err
+				}
+				state = "installed_verified"
+			}
+			if IsJSONOutput() {
+				return encodeIndentedJSON(cmd.OutOrStdout(), struct {
+					Policy   string `json:"policy"`
+					SHA256   string `json:"sha256"`
+					State    string `json:"state"`
+					Contents string `json:"contents,omitempty"`
+				}{Policy: document.PolicyName, SHA256: document.SHA256, State: state, Contents: document.Contents})
+			}
+			if opts.install {
+				fmt.Fprintf(cmd.OutOrStdout(), "Installed %s at the system Grok requirements path (sha256 %s).\n", document.PolicyName, document.SHA256)
+				return nil
+			}
+			_, err := io.WriteString(cmd.OutOrStdout(), document.Contents)
+			return err
+		},
+	}
+	requirements.Flags().StringVar(&opts.name, "policy", opts.name, "Built-in Grok automation policy")
+	requirements.Flags().BoolVar(&opts.install, "install", false, "Create the system Grok requirements file (never overwrites)")
+	requirements.Flags().BoolVar(&opts.confirm, "confirm", false, "Confirm system-level policy installation")
+	cmd.AddCommand(requirements)
+	return cmd
+}
+
+func installProviderRequirements(path, contents string) error {
+	if !providerRequirementsCanInstall() {
+		return errors.New("system Grok requirements installation requires an administrator/root process")
+	}
+	if filepath.Clean(path) != filepath.Clean(providerRequirementsPath()) {
+		return errors.New("managed requirements installation is restricted to the system Grok requirements path")
+	}
+	if existingFile, err := providerRequirementsOpenExisting(path); err == nil {
+		existing, readErr := io.ReadAll(io.LimitReader(existingFile, 1<<20))
+		info, statErr := existingFile.Stat()
+		closeErr := existingFile.Close()
+		if readErr != nil || statErr != nil || closeErr != nil {
+			return errors.New("inspect existing Grok requirements securely")
+		}
+		if sha256TextCLI(existing) == sha256StringCLI(contents) {
+			if providerRequirementsRootOwned(info) {
+				return nil
+			}
+			return errors.New("existing Grok requirements match but ownership is not system-authoritative")
+		}
+		return errors.New("existing Grok requirements differ; refusing to overwrite without an owner-reviewed migration")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect existing Grok requirements: %w", err)
+	}
+	if err := providerRequirementsPrepareParent(path); err != nil {
+		return err
+	}
+	f, err := providerRequirementsOpenCreate(path)
+	if err != nil {
+		return fmt.Errorf("create Grok requirements: %w", err)
+	}
+	if _, err := io.WriteString(f, contents); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write Grok requirements: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync Grok requirements: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close Grok requirements: %w", err)
+	}
+	installedFile, err := providerRequirementsOpenExisting(path)
+	if err != nil {
+		return errors.New("created Grok requirements but secure reopen failed")
+	}
+	installed, readErr := io.ReadAll(io.LimitReader(installedFile, 1<<20))
+	info, statErr := installedFile.Stat()
+	closeErr := installedFile.Close()
+	if readErr != nil || statErr != nil || closeErr != nil || !providerRequirementsRootOwned(info) {
+		return errors.New("created Grok requirements but could not verify system-authoritative ownership")
+	}
+	if sha256TextCLI(installed) != sha256StringCLI(contents) {
+		return errors.New("created Grok requirements but digest verification failed")
+	}
+	return nil
+}
+
+func newProviderDoctorCmd() *cobra.Command {
+	opts := providerCommandOptions{timeout: 60 * time.Second, qualificationAge: 24 * time.Hour}
+	cmd := &cobra.Command{
+		Use:   "doctor",
+		Short: "Report provider identity, policy, entitlement, and evidence",
+		Long: `Diagnose one exact configured provider profile.
+
+The command is read-only and offline by default. --online performs one bounded,
+no-tool identity/model probe. It does not turn a probe or synthetic conformance
+result into a live coding qualification receipt.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runProviderDoctor(cmd, opts)
+		},
+	}
+	cmd.Flags().StringVar(&opts.profile, "profile", "", "Exact configured provider profile (required)")
+	cmd.Flags().BoolVar(&opts.online, "online", false, "Perform a bounded live no-tool identity/model probe")
+	cmd.Flags().DurationVar(&opts.timeout, "timeout", opts.timeout, "Online probe timeout")
+	cmd.Flags().DurationVar(&opts.qualificationAge, "max-qualification-age", opts.qualificationAge, "Maximum age of a live qualification receipt")
+	cmd.Flags().StringVar(&opts.qualificationDir, "qualification-store", "", "Override qualification receipt directory")
+	return cmd
+}
+
+func newProviderCapabilitiesCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "capabilities",
+		Short: "Print the static provider transport capability matrix",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			matrix := provider.CapabilityMatrix()
+			if IsJSONOutput() {
+				return encodeIndentedJSON(cmd.OutOrStdout(), matrix)
+			}
+			keys := make([]string, 0, len(matrix))
+			for key := range matrix {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			fmt.Fprintln(cmd.OutOrStdout(), "TRANSPORT\tCOMPLETION\tCOMPLETION_SCOPE\tCANCEL\tCANCEL_SCOPE\tRESUME\tCLEANUP\tCLEANUP_SCOPE\tCAPACITY\tLAUNCH_CAPACITY\tREQUEST_CAPACITY\tLIVE_ERROR_FEEDBACK")
+			for _, key := range keys {
+				capability := matrix[key]
+				fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", key, capability.Completion, capability.CompletionAuthorityScope, capability.Cancellation, capability.CancellationAuthorityScope, capability.Resume, capability.Cleanup, capability.CleanupAuthorityScope, capability.CapacityControlScope, capability.LaunchCapacityControl, capability.RequestCapacityControl, capability.LiveErrorFeedback)
+			}
+			return nil
+		},
+	}
+}
+
+func runProviderDoctor(cmd *cobra.Command, opts providerCommandOptions) error {
+	started := providerDoctorDeps.now().UTC()
+	if strings.TrimSpace(opts.profile) == "" {
+		return errors.New("provider doctor requires an exact --profile")
+	}
+	if opts.timeout <= 0 || opts.qualificationAge <= 0 {
+		return errors.New("provider doctor timeout and maximum qualification age must be positive")
+	}
+	loaded := loadSelectedConfigOrDefault()
+	report, err := buildProviderDoctorReport(providerCommandContext(cmd), loaded, opts, providerDoctorDeps)
+	if err != nil {
+		return err
+	}
+	report.GeneratedAt = started
+	report.DurationMS = providerDoctorDeps.now().UTC().Sub(started).Milliseconds()
+	if IsJSONOutput() {
+		if err := encodeIndentedJSON(cmd.OutOrStdout(), report); err != nil {
+			return err
+		}
+	} else {
+		printProviderDoctorHuman(cmd.OutOrStdout(), report)
+	}
+	if report.Readiness != providerReadinessGo {
+		if IsJSONOutput() {
+			return errJSONFailure
+		}
+		return &providerDoctorExitError{report: report}
+	}
+	return nil
+}
+
+type providerDoctorExitError struct{ report providerDoctorReport }
+
+func (e *providerDoctorExitError) Error() string {
+	if e.report.Readiness == providerReadinessGoScoped {
+		return "provider profile is ready only for its declared capability scope; lifecycle evidence is not fully provider-authoritative"
+	}
+	return "provider profile is not live-qualified"
+}
+func (e *providerDoctorExitError) ExitCode() int { return 1 }
+
+func buildProviderDoctorReport(ctx context.Context, cfg *config.Config, opts providerCommandOptions, deps providerDoctorDependencies) (providerDoctorReport, error) {
+	report := providerDoctorReport{
+		SchemaVersion: providerDoctorSchema,
+		Mode:          "offline",
+		Profile:       opts.profile,
+		Readiness:     providerReadinessNoGo,
+		Checks:        []providerDoctorCheck{},
+	}
+	if opts.online {
+		report.Mode = "online"
+	}
+	if cfg == nil {
+		return report, errors.New("provider doctor requires loaded configuration")
+	}
+	profile, err := cfg.ProviderProfile(opts.profile)
+	if err != nil {
+		return report, err
+	}
+	identity, err := profile.Identity()
+	if err != nil {
+		return report, err
+	}
+	report.Identity = providerDoctorIdentity{
+		SHA256: identity.Hash(), Provider: identity.Provider(), Model: identity.Model(), Runtime: identity.Runtime(),
+		CredentialClass: identity.CredentialClass(), BillingClass: identity.BillingClass(), Entitlement: identity.Entitlement(), Evidence: identity.EvidenceGrade(),
+	}
+	report.Transport, err = providerTransportForIdentity(identity)
+	if err != nil {
+		return report, err
+	}
+	capability, ok := provider.CapabilityMatrix()[report.Transport]
+	if !ok {
+		return report, fmt.Errorf("provider transport %q has no declared capability matrix", report.Transport)
+	}
+	report.Capabilities = capability
+	report.Checks = append(report.Checks,
+		providerDoctorCheck{ID: "profile", Status: providerDoctorPass, Provenance: "config_validated", Summary: "exact provider profile validated"},
+		providerDoctorCheck{ID: "identity", Status: providerDoctorPass, Provenance: "profile_attested", Summary: "immutable provider identity is complete", Evidence: identity.Hash()},
+	)
+
+	policy, policyCheck := diagnoseProviderPolicy(ctx, providerDoctorInspectionCWD(), profile, identity, deps)
+	report.Policy = policy
+	report.Checks = append(report.Checks, policyCheck)
+
+	report.Runtime, report.Checks = diagnoseProviderRuntime(ctx, profile, identity, deps, report.Checks)
+	authCheck := diagnoseProviderAuthPresence(identity, deps.lookupEnv)
+	report.Checks = append(report.Checks, authCheck)
+	report.Capacity, report.Checks = diagnoseProviderCapacity(identity, deps, report.Checks)
+
+	if opts.online {
+		var probePreflightErr error
+		switch {
+		case deps.onlineProbe == nil || deps.admission == nil:
+			probePreflightErr = errors.New("online provider probe dependencies are incomplete")
+		case report.Capacity.Scope != provider.CapacityControlScopeLocalShared:
+			probePreflightErr = errors.New("online provider probe requires the cross-process local shared capacity store")
+		case report.Runtime.Drift != "none":
+			probePreflightErr = errors.New("online provider probe requires the exact pinned runtime")
+		case authCheck.Status == providerDoctorFail:
+			probePreflightErr = errors.New("online provider probe requires the exact provider credential lane")
+		case identity.Provider() == "xai" && (policyCheck.Status != providerDoctorPass || !policy.BypassLockAuthoritative):
+			probePreflightErr = errors.New("online Grok probe requires root-owned managed requirements discovered by the pinned runtime")
+		}
+		if probePreflightErr != nil {
+			report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "preflight", Summary: "live no-tool identity/model probe was blocked before provider dispatch", Evidence: safeErrorDigest(probePreflightErr), Remediation: "Repair the failed policy, runtime, credential, or capacity gate before a live probe"})
+		} else if decision := deps.admission.Acquire(identity); !decision.Allowed || !decision.NoFailover {
+			report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "local_shared_admission", Summary: "live no-tool identity/model probe was denied before provider dispatch", Evidence: sha256StringCLI(string(decision.Reason)), Remediation: "Honor the exact identity retry/circuit state; provider failover is prohibited"})
+		} else {
+			probeCtx, cancel := context.WithTimeout(ctx, opts.timeout)
+			live, probeErr := deps.onlineProbe(probeCtx, profile, identity)
+			cancel()
+			deps.admission.Release(identity, decision)
+			if probeErr != nil {
+				report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "live", Summary: "live no-tool identity/model probe failed", Evidence: safeErrorDigest(probeErr), Remediation: "Check the exact credential entitlement, endpoint, model, and provider CLI diagnostics"})
+			} else if !live.ModelVerified || !live.AuthVerified {
+				report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "live", Summary: "live probe lacked exact model or authentication evidence", Evidence: live.SHA256})
+			} else {
+				deps.admission.RecordSuccess(identity)
+				report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorPass, Provenance: "live", Summary: "exact model and authentication were observed", Evidence: live.SHA256})
+				authCheck = providerDoctorCheck{ID: "auth_presence", Status: providerDoctorPass, Provenance: "live", Summary: "credential was accepted for the exact provider lane", Evidence: live.SHA256}
+				replaceProviderDoctorCheck(report.Checks, authCheck)
+			}
+		}
+	} else {
+		report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorUnavailable, Provenance: "offline", Summary: "model entitlement was not probed", Remediation: "Run provider doctor with --online for a bounded no-tool probe"})
+	}
+
+	qualificationPolicySHA := report.Policy.SHA256
+	if report.Transport == "zai_claude_runtime" {
+		qualificationPolicySHA = providerqualification.QualificationPolicySHA256()
+	}
+	report.Qualification, report.Checks = diagnoseQualification(identity, report.Transport, qualificationPolicySHA, opts, deps, report.Checks)
+	if report.Transport == "zai_claude_runtime" {
+		report.Checks = append(report.Checks, diagnoseZAIClaudeRequestAuthority(capability))
+	}
+	report.Checks = append(report.Checks, diagnoseLifecycleAuthority(capability))
+
+	if providerDoctorReady(report) {
+		report.Readiness = providerReadinessGoScoped
+		if providerLifecycleFullyAuthoritative(report.Capabilities) {
+			report.Readiness = providerReadinessGo
+		}
+	}
+	return report, nil
+}
+
+func diagnoseProviderPolicy(ctx context.Context, inspectionCWD string, profile config.ProviderProfileConfig, identity provider.Identity, deps providerDoctorDependencies) (providerDoctorPolicy, providerDoctorCheck) {
+	result := providerDoctorPolicy{Name: profile.AutomationPolicy, ManagedRequirementsState: "not_applicable", RuntimeInspectionState: "not_applicable"}
+	if identity.Provider() != "xai" {
+		result.SHA256 = identity.ConfigSHA256()
+		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorPass, Provenance: "config_validated", Summary: "provider policy is bound by the reviewed profile manifest", Evidence: result.SHA256}
+	}
+	descriptor, ok := agent.GrokAutomationPolicy(profile.AutomationPolicy)
+	if !ok {
+		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "compiled", Summary: "unknown Grok automation policy"}
+	}
+	result.SHA256 = agent.GrokAutomationPolicySHA256(profile.AutomationPolicy)
+	result.Sandbox, result.PermissionMode = descriptor.Sandbox, descriptor.PermissionMode
+	requirements, ok := agent.GrokSystemRequirementsForPolicy(profile.AutomationPolicy)
+	if !ok {
+		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "compiled", Summary: "managed Grok requirements could not be rendered"}
+	}
+	result.ManagedRequirementsSHA256 = requirements.SHA256
+	path := providerRequirementsPath()
+	var data []byte
+	var info os.FileInfo
+	var readErr, statErr error
+	if deps.readRequirements != nil {
+		data, info, readErr = deps.readRequirements(path)
+		statErr = readErr
+	} else {
+		data, readErr = deps.readFile(path)
+		info, statErr = deps.stat(path)
+	}
+	installedSHA := sha256TextCLI(data)
+	acceptedSHA := installedSHA == requirements.SHA256
+	// The root-owned workspace envelope is the maximum managed capability.
+	// A read-only invocation remains safe beneath it because the per-run deny
+	// rules are stricter and Grok deny rules take precedence. This permits both
+	// graduated profiles to coexist on one host without weakening observe mode.
+	if !acceptedSHA && profile.AutomationPolicy == agent.DefaultGrokAutomationPolicyName {
+		if workspaceRequirements, workspaceOK := agent.GrokSystemRequirementsForPolicy(agent.GrokWorkspaceWritePolicyName); workspaceOK && installedSHA == workspaceRequirements.SHA256 {
+			acceptedSHA = true
+			result.ManagedRequirementsSHA256 = workspaceRequirements.SHA256
+		}
+	}
+	switch {
+	case readErr != nil || statErr != nil:
+		result.ManagedRequirementsState = "missing"
+		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "live_local", Summary: "root-owned Grok managed requirements are not installed", Evidence: requirements.SHA256, Remediation: "Install the generated policy at the system Grok requirements path and verify it with grok inspect"}
+	case !acceptedSHA:
+		result.ManagedRequirementsState = "digest_mismatch"
+		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "live_local", Summary: "installed Grok requirements do not match a compatible managed envelope", Evidence: installedSHA, Remediation: "Review and install the exact generated managed requirements"}
+	case !deps.rootOwned(info):
+		result.ManagedRequirementsState = "ownership_unverified"
+		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "live_local", Summary: "Grok bypass lock is not proven system-authoritative", Evidence: requirements.SHA256, Remediation: "Make the system requirements file administrator/root owned"}
+	default:
+		result.ManagedRequirementsState = "installed_verified"
+	}
+	if deps.inspectGrok == nil {
+		result.RuntimeInspectionState = "unavailable"
+		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "live_local", Summary: "root-owned Grok requirements match, but runtime discovery was not inspected", Evidence: requirements.SHA256, Remediation: "Run the pinned Grok runtime inspection and verify the managed settings path"}
+	}
+	inspectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	inspection, inspectErr := deps.inspectGrok(inspectCtx, profile.Command, inspectionCWD)
+	cancel()
+	result.RuntimeInspectionSHA256 = inspection.SHA256
+	if inspectErr != nil {
+		result.RuntimeInspectionState = "failed"
+		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "live_runtime_inspection", Summary: "Grok runtime inspection failed", Evidence: safeErrorDigest(inspectErr), Remediation: "Run grok --no-auto-update inspect --json and review managed configuration discovery"}
+	}
+	if !inspection.PermissionsLoaded || !sameProviderRequirementsPath(inspection.ManagedSettingsPath, path) {
+		result.RuntimeInspectionState = "managed_requirements_not_discovered"
+		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "live_runtime_inspection", Summary: "pinned Grok runtime did not report the exact managed requirements path as loaded", Evidence: inspection.SHA256, Remediation: "Repair the system requirements installation and re-run Grok inspection"}
+	}
+	result.RuntimeInspectionState = "managed_requirements_discovered"
+	result.BypassLockAuthoritative = true
+	return result, providerDoctorCheck{ID: "policy", Status: providerDoctorPass, Provenance: "live_runtime_inspection", Summary: "compiled policy, root-owned bypass lock, and Grok runtime discovery match", Evidence: inspection.SHA256}
+}
+
+// verifyGrokACPDispatchAuthority is the live, fail-closed gate for the legacy
+// robot ACP entry point. Profile validation alone is not authority evidence:
+// the exact managed policy must be root-owned and discovered by the pinned
+// Grok runtime immediately before the provider process is started.
+func verifyGrokACPDispatchAuthority(ctx context.Context, inspectionCWD string, profile config.ProviderProfileConfig, identity provider.Identity, deps providerDoctorDependencies) (string, error) {
+	if deps.lookPath == nil || deps.version == nil || deps.rootOwned == nil || deps.inspectGrok == nil || (deps.readRequirements == nil && (deps.readFile == nil || deps.stat == nil)) {
+		return "", errors.New("Grok ACP authority verification dependencies are incomplete")
+	}
+	if identity.Provider() != "xai" || identity.Runtime() != "grok" {
+		return "", errors.New("Grok ACP authority verification requires an exact xAI/Grok identity")
+	}
+	policy, check := diagnoseProviderPolicy(ctx, inspectionCWD, profile, identity, deps)
+	if check.Status != providerDoctorPass || !policy.BypassLockAuthoritative {
+		return "", errors.New("root-owned Grok managed requirements are missing, mismatched, or not authoritative")
+	}
+	binary, err := deps.lookPath(profile.Command)
+	if err != nil {
+		return "", fmt.Errorf("locate configured Grok runtime: %w", err)
+	}
+	versionCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	actualVersion, err := deps.version(versionCtx, binary)
+	cancel()
+	if err != nil {
+		return "", fmt.Errorf("read configured Grok runtime version: %w", err)
+	}
+	if strings.TrimSpace(profile.RuntimeVersion) == "" || !versionMatches(actualVersion, profile.RuntimeVersion) {
+		return "", errors.New("configured Grok runtime is unpinned or has drifted")
+	}
+	return binary, nil
+}
+
+func diagnoseProviderRuntime(ctx context.Context, profile config.ProviderProfileConfig, identity provider.Identity, deps providerDoctorDependencies, checks []providerDoctorCheck) (providerDoctorRuntime, []providerDoctorCheck) {
+	result := providerDoctorRuntime{ExpectedVersion: profile.RuntimeVersion, Drift: "unknown"}
+	if identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI {
+		const adapterVersion = "zai-native-http-v1"
+		result.Installed, result.Version = true, adapterVersion
+		if profile.RuntimeVersion == "" {
+			result.Drift = "unpinned"
+			checks = append(checks, providerDoctorCheck{ID: "runtime", Status: providerDoctorWarn, Provenance: "compiled", Summary: "native Z.ai adapter is available but its schema version is not pinned", Evidence: sha256StringCLI(adapterVersion), Remediation: "Set runtime_version = \"zai-native-http-v1\" in the reviewed profile"})
+		} else if profile.RuntimeVersion != adapterVersion {
+			result.Drift = "detected"
+			checks = append(checks, providerDoctorCheck{ID: "runtime", Status: providerDoctorFail, Provenance: "compiled", Summary: "native Z.ai adapter schema drift detected", Evidence: sha256StringCLI(adapterVersion)})
+		} else {
+			result.Drift = "none"
+			checks = append(checks, providerDoctorCheck{ID: "runtime", Status: providerDoctorPass, Provenance: "compiled", Summary: "native Z.ai adapter schema matches its pin", Evidence: sha256StringCLI(adapterVersion)})
+		}
+		return result, checks
+	}
+	path, err := deps.lookPath(profile.Command)
+	if err != nil {
+		checks = append(checks, providerDoctorCheck{ID: "runtime", Status: providerDoctorFail, Provenance: "live_local", Summary: "provider runtime executable is not installed", Remediation: "Install the exact provider CLI configured by this profile"})
+		return result, checks
+	}
+	result.Installed = true
+	versionCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	version, versionErr := deps.version(versionCtx, path)
+	if versionErr != nil {
+		checks = append(checks, providerDoctorCheck{ID: "runtime", Status: providerDoctorFail, Provenance: "live_local", Summary: "provider runtime version could not be read", Evidence: safeErrorDigest(versionErr)})
+		return result, checks
+	}
+	result.Version = version
+	if profile.RuntimeVersion == "" {
+		result.Drift = "unpinned"
+		checks = append(checks, providerDoctorCheck{ID: "runtime", Status: providerDoctorWarn, Provenance: "live_local", Summary: "provider runtime is installed but no expected version is pinned", Evidence: sha256StringCLI(version), Remediation: "Set runtime_version in the exact provider profile after review"})
+		return result, checks
+	}
+	if !versionMatches(version, profile.RuntimeVersion) {
+		result.Drift = "detected"
+		checks = append(checks, providerDoctorCheck{ID: "runtime", Status: providerDoctorFail, Provenance: "live_local", Summary: "provider runtime version drift detected", Evidence: sha256StringCLI(version), Remediation: "Review the installed CLI and update either the binary or the pinned profile version"})
+		return result, checks
+	}
+	result.Drift = "none"
+	checks = append(checks, providerDoctorCheck{ID: "runtime", Status: providerDoctorPass, Provenance: "live_local", Summary: "provider runtime version matches its pin", Evidence: sha256StringCLI(version)})
+	return result, checks
+}
+
+func diagnoseProviderAuthPresence(identity provider.Identity, lookup func(string) (string, bool)) providerDoctorCheck {
+	present := func(name string) bool {
+		value, ok := lookup(name)
+		return ok && strings.TrimSpace(value) != ""
+	}
+	switch {
+	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI:
+		if present("ZAI_NATIVE_API_KEY") {
+			return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorPass, Provenance: "live_local", Summary: "separate native API credential is present"}
+		}
+		return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorFail, Provenance: "live_local", Summary: "separate native API credential is absent", Remediation: "Authorize and export ZAI_NATIVE_API_KEY; Coding Plan credentials are not accepted"}
+	case identity.Provider() == "zai":
+		if present("ZAI_API_KEY") {
+			return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorPass, Provenance: "live_local", Summary: "Claude-compatible Coding Plan credential is present"}
+		}
+		return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorFail, Provenance: "live_local", Summary: "Claude-compatible Z.ai credential is absent", Remediation: "Provide ZAI_API_KEY for the Coding Plan lane; generic Anthropic tokens are never forwarded"}
+	case identity.Provider() == "xai" && present("XAI_API_KEY"):
+		return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorPass, Provenance: "live_local", Summary: "xAI API credential is present"}
+	default:
+		return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorUnavailable, Provenance: "offline", Summary: "cached provider authentication cannot be proven from environment presence", Remediation: "Run provider doctor with --online to validate cached authentication"}
+	}
+}
+
+func diagnoseQualification(identity provider.Identity, transport, policySHA string, opts providerCommandOptions, deps providerDoctorDependencies, checks []providerDoctorCheck) (providerDoctorQualification, []providerDoctorCheck) {
+	result := providerDoctorQualification{State: "missing", PolicySHA256: policySHA}
+	if transport != "zai_claude_runtime" {
+		result.State = "not_required"
+		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorPass, Provenance: "capability_registry", Summary: "the nine-check coding qualification is not applicable to this no-tool/provider-native transport; online identity and capability-specific gates still apply"})
+		return result, checks
+	}
+	receipt, _, err := deps.qualificationStore(opts.qualificationDir, identity.Hash())
+	if err != nil {
+		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "unavailable", Summary: "no valid live qualification receipt exists", Remediation: "Run the explicit live provider qualification suite in a disposable repository"})
+		return result, checks
+	}
+	result.Passed = receipt.Passed
+	result.CompletedAt = receipt.CompletedAt
+	result.ReceiptSHA256 = receipt.ReceiptSHA256
+	result.AgeSeconds = int64(deps.now().UTC().Sub(receipt.CompletedAt).Seconds())
+	result.ChecksTotal = len(receipt.Checks)
+	for _, check := range receipt.Checks {
+		if check.Passed {
+			result.ChecksPassed++
+		}
+	}
+	switch {
+	case receipt.Transport != transport || receipt.IdentitySHA256 != identity.Hash() || receipt.PolicySHA256 != policySHA:
+		result.State = "identity_or_policy_mismatch"
+		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "live_receipt", Summary: "qualification receipt does not bind this exact identity, transport, and policy", Evidence: receipt.ReceiptSHA256})
+	case deps.now().UTC().Before(receipt.CompletedAt):
+		result.State = "future_dated"
+		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "live_receipt", Summary: "qualification receipt is future-dated", Evidence: receipt.ReceiptSHA256})
+	case deps.now().UTC().Sub(receipt.CompletedAt) > opts.qualificationAge:
+		result.State = "expired"
+		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "live_receipt", Summary: "live qualification receipt has expired", Evidence: receipt.ReceiptSHA256, Remediation: "Run a fresh live qualification after reviewing CLI and policy drift"})
+	case !receipt.Passed:
+		result.State = "failed"
+		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "live_receipt", Summary: "one or more mandatory live qualification checks failed", Evidence: receipt.ReceiptSHA256})
+	default:
+		result.State = "current_pass"
+		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorPass, Provenance: "live_receipt", Summary: "all mandatory live qualification checks passed and are current", Evidence: receipt.ReceiptSHA256})
+	}
+	return result, checks
+}
+
+func diagnoseProviderCapacity(identity provider.Identity, deps providerDoctorDependencies, checks []providerDoctorCheck) (providerDoctorCapacity, []providerDoctorCheck) {
+	status := deps.capacityStatus()
+	snapshot := deps.capacitySnapshot(identity)
+	result := providerDoctorCapacity{
+		Scope: status.Scope, FallbackReason: status.FallbackReason, CircuitState: "closed",
+		Running: snapshot.Running, Tokens: snapshot.Tokens, ConsecutiveFailures: snapshot.ConsecutiveFailures,
+		NextRetry: snapshot.NextRetry, CircuitOpenUntil: snapshot.CircuitOpenUntil, TerminalReason: snapshot.TerminalReason,
+		HalfOpenInFlight: snapshot.HalfOpenInFlight,
+	}
+	if status.SharedStorePath != "" {
+		result.StoreSHA256 = sha256StringCLI(filepath.Clean(status.SharedStorePath))
+	}
+	if status.Scope != provider.CapacityControlScopeLocalShared {
+		checks = append(checks, providerDoctorCheck{ID: "capacity", Status: providerDoctorFail, Provenance: "live_local", Summary: "capacity/circuit state is not shared across local NTM processes", Evidence: safeErrorDigest(errors.New(status.FallbackReason)), Remediation: "Restore the identity-keyed local shared capacity store"})
+		return result, checks
+	}
+	now := deps.now().UTC()
+	switch {
+	case snapshot.TerminalReason != "":
+		result.CircuitState = "terminal_block"
+	case snapshot.HalfOpenInFlight:
+		result.CircuitState = "half_open"
+	case snapshot.CircuitOpenUntil != nil && snapshot.CircuitOpenUntil.After(now):
+		result.CircuitState = "open"
+	case snapshot.NextRetry != nil && snapshot.NextRetry.After(now):
+		result.CircuitState = "backoff"
+	}
+	statusValue := providerDoctorPass
+	remediation := ""
+	if result.CircuitState != "closed" {
+		statusValue = providerDoctorWarn
+		remediation = "Wait for transient backoff or remediate the exact credential, entitlement, model, or quota before resetting this identity"
+	}
+	checks = append(checks, providerDoctorCheck{ID: "capacity", Status: statusValue, Provenance: "live_local_shared", Summary: "identity-keyed local shared capacity store is active; circuit=" + result.CircuitState, Evidence: sha256StringCLI(identity.CapacityScope().String()), Remediation: remediation})
+	return result, checks
+}
+
+func diagnoseLifecycleAuthority(capability provider.OperationCapabilities) providerDoctorCheck {
+	if providerLifecycleFullyAuthoritative(capability) {
+		return providerDoctorCheck{ID: "lifecycle_authority", Status: providerDoctorPass, Provenance: "capability_registry", Summary: "cancellation and cleanup are provider-authoritative"}
+	}
+	return providerDoctorCheck{ID: "lifecycle_authority", Status: providerDoctorWarn, Provenance: "capability_registry", Summary: fmt.Sprintf("cancellation=%s/%s cleanup=%s/%s; evidence is not fully provider-authoritative", capability.Cancellation, capability.CancellationAuthorityScope, capability.Cleanup, capability.CleanupAuthorityScope), Remediation: "Treat local process-tree control and client submission receipts as narrower than provider acknowledgement"}
+}
+
+func providerLifecycleFullyAuthoritative(capability provider.OperationCapabilities) bool {
+	return capability.Cancellation == provider.EvidenceAuthoritative &&
+		capability.CancellationAuthorityScope == provider.EvidenceAuthorityScopeProvider &&
+		capability.Cleanup == provider.EvidenceAuthoritative &&
+		capability.CleanupAuthorityScope == provider.EvidenceAuthorityScopeProvider
+}
+
+func providerDoctorReady(report providerDoctorReport) bool {
+	if report.Mode != "online" || report.Runtime.Drift != "none" || report.Capacity.Scope != provider.CapacityControlScopeLocalShared {
+		return false
+	}
+	if report.Transport == "zai_claude_runtime" && (!report.Qualification.Passed || report.Qualification.State != "current_pass") {
+		return false
+	}
+	// A Claude-compatible Z.ai pane can be admission-controlled only while NTM
+	// starts the pane. Its opaque runtime calls have neither per-request lease
+	// enforcement nor structured error feedback, so even a current coding
+	// qualification must not become a readiness/GO claim for that lane.
+	if report.Transport == "zai_claude_runtime" && (report.Capabilities.RequestCapacityControl != provider.EvidenceAuthoritative || report.Capabilities.LiveErrorFeedback != provider.EvidenceAuthoritative) {
+		return false
+	}
+	for _, check := range report.Checks {
+		if check.Status == providerDoctorFail || check.ID == "model_entitlement" && check.Status != providerDoctorPass {
+			return false
+		}
+	}
+	return true
+}
+
+func diagnoseZAIClaudeRequestAuthority(capability provider.OperationCapabilities) providerDoctorCheck {
+	if capability.RequestCapacityControl == provider.EvidenceAuthoritative && capability.LiveErrorFeedback == provider.EvidenceAuthoritative {
+		return providerDoctorCheck{ID: "request_authority", Status: providerDoctorPass, Provenance: "capability_registry", Summary: "per-request capacity/circuit control and live provider error feedback are authoritative"}
+	}
+	return providerDoctorCheck{
+		ID: "request_authority", Status: providerDoctorFail, Provenance: "capability_registry",
+		Summary:     fmt.Sprintf("request capacity=%s live error feedback=%s; the Claude-compatible pane runtime is opaque per request", capability.RequestCapacityControl, capability.LiveErrorFeedback),
+		Remediation: "Do not treat pane launch admission or a qualification receipt as per-request concurrency/circuit authority; use a provider-native structured transport when one is authorized and qualified",
+	}
+}
+
+func providerTransportForIdentity(identity provider.Identity) (string, error) {
+	switch {
+	case identity.Provider() == "xai" && identity.Runtime() == "grok":
+		return "xai_acp", nil
+	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementClaudeCompat:
+		return "zai_claude_runtime", nil
+	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI:
+		return "zai_native_api", nil
+	default:
+		return "", fmt.Errorf("unsupported provider/runtime/entitlement combination %s/%s/%s", identity.Provider(), identity.Runtime(), identity.Entitlement())
+	}
+}
+
+func runProviderDoctorOnlineProbe(ctx context.Context, profile config.ProviderProfileConfig, identity provider.Identity) (providerDoctorLiveEvidence, error) {
+	nonce, err := providerDoctorNonce()
+	if err != nil {
+		return providerDoctorLiveEvidence{}, err
+	}
+	switch {
+	case identity.Provider() == "xai":
+		cwd, err := os.Getwd()
+		if err != nil {
+			return providerDoctorLiveEvidence{}, err
+		}
+		result, runErr := grok.Run(ctx, grok.OSRunner{}, grok.Request{
+			Prompt: "Reply with this exact nonce and no other text: " + nonce, CWD: cwd, Binary: profile.Command,
+			Model: identity.Model(), ExpectedNonce: nonce, AutomationPolicyArgs: agent.GrokAutomationACPPolicyArgs(profile.AutomationPolicy),
+		})
+		digest := digestSafeJSON(result)
+		if runErr != nil {
+			return providerDoctorLiveEvidence{SHA256: digest}, runErr
+		}
+		return providerDoctorLiveEvidence{ModelVerified: result.Model == identity.Model() && result.ModelEvidence != "", AuthVerified: result.Success && result.AcknowledgementVerified, SHA256: digest}, nil
+	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementClaudeCompat:
+		receipt, probeErr := zai.Probe(ctx, zai.ProbeSpec{Binary: profile.Command, Endpoint: identity.Endpoint(), Model: identity.Model()})
+		digest := digestSafeJSON(receipt)
+		if probeErr != nil {
+			return providerDoctorLiveEvidence{SHA256: digest}, probeErr
+		}
+		return providerDoctorLiveEvidence{ModelVerified: receipt.ModelSessionEvidence && receipt.Model == identity.Model(), AuthVerified: receipt.ModelSessionEvidence, SHA256: digest}, nil
+	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI:
+		key := strings.TrimSpace(os.Getenv("ZAI_NATIVE_API_KEY"))
+		receipt, probeErr := zai.RunNative(ctx, zai.DefaultNativeHTTPClient(), zai.NativeRequest{
+			Endpoint: identity.Endpoint(), Model: identity.Model(), Prompt: "Reply with this exact nonce and no other text: " + nonce,
+			ExpectedNonce: nonce, NativeAPIKey: key, ExplicitOptIn: true, AllowTools: false,
+		})
+		digest := digestSafeJSON(receipt)
+		if probeErr != nil {
+			return providerDoctorLiveEvidence{SHA256: digest}, probeErr
+		}
+		return providerDoctorLiveEvidence{ModelVerified: receipt.Model == identity.Model() && receipt.NonceVerified, AuthVerified: receipt.HTTPStatus >= 200 && receipt.HTTPStatus < 300, SHA256: digest}, nil
+	default:
+		return providerDoctorLiveEvidence{}, errors.New("provider has no online doctor probe")
+	}
+}
+
+func providerDoctorInspectionCWD() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return cwd
+}
+
+func sameProviderRequirementsPath(actual, expected string) bool {
+	actual, expected = filepath.Clean(strings.TrimSpace(actual)), filepath.Clean(strings.TrimSpace(expected))
+	if actual == "." || expected == "." {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(actual, expected)
+	}
+	return actual == expected
+}
+
+func providerRuntimeInspectGrok(ctx context.Context, binary, cwd string) (providerGrokInspection, error) {
+	if ctx == nil || strings.TrimSpace(binary) == "" {
+		return providerGrokInspection{}, errors.New("Grok runtime inspection requires a context and binary")
+	}
+	cmd := exec.CommandContext(ctx, binary, "--no-auto-update", "inspect", "--json")
+	if strings.TrimSpace(cwd) != "" {
+		cmd.Dir = cwd
+	}
+	const maxInspectBytes = 1 << 20
+	capture := &providerCappedOutput{limit: maxInspectBytes}
+	cmd.Stdout = capture
+	cmd.Stderr = io.Discard
+	err := cmd.Run()
+	if err != nil {
+		return providerGrokInspection{}, err
+	}
+	output := capture.Bytes()
+	if len(output) == 0 || capture.exceeded {
+		return providerGrokInspection{}, errors.New("Grok runtime inspection output was empty or exceeded its limit")
+	}
+	var envelope struct {
+		GrokVersion string `json:"grokVersion"`
+		Permissions struct {
+			Loaded              bool   `json:"loaded"`
+			ManagedSettingsPath string `json:"managedSettingsPath"`
+		} `json:"permissions"`
+	}
+	if err := json.Unmarshal(output, &envelope); err != nil {
+		return providerGrokInspection{}, errors.New("Grok runtime inspection returned invalid JSON")
+	}
+	if strings.TrimSpace(envelope.GrokVersion) == "" {
+		return providerGrokInspection{}, errors.New("Grok runtime inspection omitted its version")
+	}
+	return providerGrokInspection{
+		GrokVersion:         strings.TrimSpace(envelope.GrokVersion),
+		PermissionsLoaded:   envelope.Permissions.Loaded,
+		ManagedSettingsPath: strings.TrimSpace(envelope.Permissions.ManagedSettingsPath),
+		SHA256:              sha256TextCLI(output),
+	}, nil
+}
+
+func providerRuntimeVersion(ctx context.Context, binary string) (string, error) {
+	cmd := exec.CommandContext(ctx, binary, "--version")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	if len(output) > 4096 {
+		return "", errors.New("provider runtime version output exceeded limit")
+	}
+	line := strings.TrimSpace(strings.SplitN(string(output), "\n", 2)[0])
+	if line == "" || strings.IndexFunc(line, func(r rune) bool { return r < 0x20 && r != '\t' }) >= 0 {
+		return "", errors.New("provider runtime returned an invalid version line")
+	}
+	if len(line) > 256 {
+		line = line[:256]
+	}
+	return line, nil
+}
+
+func versionMatches(actual, expected string) bool {
+	actual, expected = strings.TrimSpace(actual), strings.TrimSpace(expected)
+	if actual == expected {
+		return true
+	}
+	for _, token := range strings.Fields(actual) {
+		if token == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func providerDoctorNonce() (string, error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	// Grok's native acknowledgement validator requires the NTM_ACK_ prefix;
+	// the same high-entropy token is also valid for the Z.ai probes.
+	return "NTM_ACK_" + hex.EncodeToString(raw), nil
+}
+
+func providerRequirementsPath() string {
+	if runtime.GOOS == "windows" {
+		base := strings.TrimSpace(os.Getenv("ProgramData"))
+		if base == "" {
+			base = `C:\\ProgramData`
+		}
+		return filepath.Join(base, "grok", "requirements.toml")
+	}
+	return "/etc/grok/requirements.toml"
+}
+
+func replaceProviderDoctorCheck(checks []providerDoctorCheck, replacement providerDoctorCheck) {
+	for i := range checks {
+		if checks[i].ID == replacement.ID {
+			checks[i] = replacement
+			return
+		}
+	}
+}
+
+func encodeIndentedJSON(w io.Writer, value any) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(value)
+}
+
+func printProviderDoctorHuman(w io.Writer, report providerDoctorReport) {
+	fmt.Fprintf(w, "Provider readiness: %s\n", report.Readiness)
+	fmt.Fprintf(w, "Profile: %s (%s)\n", report.Profile, report.Transport)
+	fmt.Fprintf(w, "Identity: %s\n", report.Identity.SHA256)
+	fmt.Fprintf(w, "Policy: %s (%s)\n", report.Policy.Name, report.Policy.SHA256)
+	fmt.Fprintf(w, "Qualification: %s (%d/%d checks)\n", report.Qualification.State, report.Qualification.ChecksPassed, report.Qualification.ChecksTotal)
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "STATUS\tCHECK\tEVIDENCE\tSUMMARY")
+	for _, check := range report.Checks {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", strings.ToUpper(string(check.Status)), check.ID, check.Provenance, check.Summary)
+		if check.Remediation != "" {
+			fmt.Fprintf(w, "  next: %s\n", check.Remediation)
+		}
+	}
+}
+
+func digestSafeJSON(value any) string {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return safeErrorDigest(err)
+	}
+	return sha256TextCLI(data)
+}
+
+func sha256TextCLI(value []byte) string {
+	sum := sha256.Sum256(value)
+	return hex.EncodeToString(sum[:])
+}
+
+func sha256StringCLI(value string) string { return sha256TextCLI([]byte(value)) }
+
+func safeErrorDigest(err error) string {
+	if err == nil {
+		return ""
+	}
+	return sha256StringCLI(err.Error())
+}
+
+func providerCommandContext(cmd *cobra.Command) context.Context {
+	if cmd != nil && cmd.Context() != nil {
+		return cmd.Context()
+	}
+	return context.Background()
+}

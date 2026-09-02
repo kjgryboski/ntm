@@ -1,0 +1,20 @@
+# Non-secret example used for local provider-doctor validation.
+# Review and re-hash the complete redacted manifest before adapting it to a
+# different account, model, endpoint, runtime version, or policy. Never put a
+# credential in this file.
+#
+# Hashed manifest:
+# provider=xai;account=local-cached;model=grok-4.6;endpoint=https://api.x.ai/v1;runtime=grok;runtime_version=1.0.13;policy=grok-readonly-ci
+
+[provider_profiles."grok-observe"]
+provider = "xai"
+account_alias = "local-cached"
+model = "grok-4.6"
+endpoint = "https://api.x.ai/v1"
+runtime = "grok"
+runtime_version = "1.0.13"
+config_sha256 = "8ef1037867e53a83a12e3170773f2d5b510fd7b3c25dbf002eedb2e28077d7b4"
+command = "grok"
+automation_policy = "grok-readonly-ci"
+exact_target_only = true
+probe_required = false

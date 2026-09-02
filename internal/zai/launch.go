@@ -60,7 +60,7 @@ func RestrictedLaunchCommand(binary, endpoint, model string) (string, error) {
 		return "", errors.New("model must be a non-empty trimmed literal value")
 	}
 	q := shellQuote
-	auth := "${ZAI_API_KEY:-${ANTHROPIC_AUTH_TOKEN:-}}"
+	auth := "${ZAI_API_KEY:-}"
 	launch := strings.Join([]string{
 		"env", "-i",
 		"PATH=\"$PATH\"", "HOME=\"$HOME\"", "TMPDIR=\"$TMPDIR\"", "LANG=\"$LANG\"", "TERM=\"$TERM\"",
@@ -316,20 +316,13 @@ func minimalEnvironment(in []string, endpoint, model string) []string {
 	return append(out, "ANTHROPIC_BASE_URL="+endpoint, "ANTHROPIC_DEFAULT_OPUS_MODEL="+model, "ANTHROPIC_DEFAULT_SONNET_MODEL="+model, "ANTHROPIC_DEFAULT_HAIKU_MODEL="+model)
 }
 func canonicalAuth(in []string) string {
-	var zaiToken, anthropicToken string
 	for _, item := range in {
 		key, value, _ := strings.Cut(item, "=")
-		switch key {
-		case "ZAI_API_KEY":
-			zaiToken = value
-		case "ANTHROPIC_AUTH_TOKEN":
-			anthropicToken = value
+		if key == "ZAI_API_KEY" && strings.TrimSpace(value) != "" {
+			return value
 		}
 	}
-	if zaiToken != "" {
-		return zaiToken
-	}
-	return anthropicToken
+	return ""
 }
 
 func newNonce() (string, error) {

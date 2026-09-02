@@ -9,10 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 )
 
 func TestRunCompletesFromACPTranscript(t *testing.T) {
@@ -55,7 +58,7 @@ func TestRunCompletesFromACPTranscript(t *testing.T) {
 	if !proc.closed || proc.killCalls != 1 || proc.waitCalls != 1 {
 		t.Fatalf("process cleanup = %+v", proc)
 	}
-	if got := runner.spec; got.Binary != "grok" || got.CWD != "/work/project" || !sameStrings(got.Args, append(append([]string{"--no-auto-update"}, DefaultReadOnlyAutomationPolicyArgs...), "agent", "stdio")) {
+	if got := runner.spec; got.Binary != "grok" || got.CWD != "/work/project" || !sameStrings(got.Args, append(append([]string{"--no-auto-update"}, defaultReadOnlyAutomationPolicyArgs()...), "agent", "stdio")) {
 		t.Fatalf("start spec = %+v", got)
 	}
 
@@ -79,14 +82,16 @@ func TestRunCompletesFromACPTranscript(t *testing.T) {
 func TestRunPlacesNamedPolicyAndExactModelBeforeACPSubcommand(t *testing.T) {
 	proc := newFakeProcess(strings.NewReader(successfulTranscript(`[{"id":"cached_token"}]`)), strings.NewReader(""))
 	runner := &fakeRunner{proc: proc}
+	policyArgs := agentpkg.GrokAutomationACPPolicyArgs(agentpkg.DefaultGrokAutomationPolicyName)
 	_, err := Run(t.Context(), runner, Request{
 		Prompt: "hello", CWD: "/repo", Model: "grok-exact-model",
-		AutomationPolicyArgs: []string{"--sandbox=read-only", "--permission-mode=dontAsk", "--allow=Read", "--deny=Bash(*)"},
+		AutomationPolicyArgs: policyArgs,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"--no-auto-update", "--sandbox=read-only", "--permission-mode=dontAsk", "--allow=Read", "--deny=Bash(*)", "--model", "grok-exact-model", "agent", "stdio"}
+	want := append([]string{"--no-auto-update"}, policyArgs...)
+	want = append(want, "--model", "grok-exact-model", "agent", "stdio")
 	if !sameStrings(runner.spec.Args, want) {
 		t.Fatalf("ACP args = %#v, want %#v", runner.spec.Args, want)
 	}
@@ -99,11 +104,12 @@ func TestRunRejectsUnsafeAutomationPolicyArgument(t *testing.T) {
 	assertCode(t, err, ErrInvalidRequest)
 }
 
-func TestRunRequiresReadOnlySandboxAndDontAsk(t *testing.T) {
+func TestRunRejectsPoliciesThatAreNotExactCompiledDescriptors(t *testing.T) {
 	for _, policy := range [][]string{
 		{"--permission-mode=dontAsk", "--allow=Read"},
 		{"--sandbox=read-only", "--allow=Read"},
 		{"--sandbox=workspace", "--permission-mode=dontAsk", "--allow=Read"},
+		{"--sandbox=strict", "--permission-mode=dontAsk", "--allow=Read", "--allow=Grep", "--allow=Edit", "--deny=Bash(*)", "--deny=WebFetch", "--deny=WebSearch"},
 	} {
 		runner := &fakeRunner{proc: newFakeProcess(strings.NewReader(""), strings.NewReader(""))}
 		_, err := Run(t.Context(), runner, Request{
@@ -112,6 +118,20 @@ func TestRunRequiresReadOnlySandboxAndDontAsk(t *testing.T) {
 		assertCode(t, err, ErrInvalidRequest)
 		if runner.spec.Binary != "" {
 			t.Fatalf("runner started for unsafe policy %#v: %+v", policy, runner.spec)
+		}
+	}
+}
+
+func TestRunAcceptsBothExactCompiledPolicies(t *testing.T) {
+	for _, policyName := range []string{agentpkg.DefaultGrokAutomationPolicyName, agentpkg.GrokWorkspaceWritePolicyName} {
+		policyArgs := agentpkg.GrokAutomationACPPolicyArgs(policyName)
+		proc := newFakeProcess(strings.NewReader(successfulTranscript(`[{"id":"cached_token"}]`)), strings.NewReader(""))
+		runner := &fakeRunner{proc: proc}
+		if _, err := Run(t.Context(), runner, Request{Prompt: "hello", CWD: "/repo", AutomationPolicyArgs: policyArgs}); err != nil {
+			t.Fatalf("Run(%s) error = %v", policyName, err)
+		}
+		if !slices.Equal(runner.spec.Args[1:1+len(policyArgs)], policyArgs) {
+			t.Fatalf("Run(%s) args = %#v", policyName, runner.spec.Args)
 		}
 	}
 }

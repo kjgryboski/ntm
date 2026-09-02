@@ -19,14 +19,23 @@ func TestGetProviderConformanceRunsSyntheticHarnessWithoutCoordinationStores(t *
 		"zai-primary": {
 			Provider: "zai", AccountAlias: "test", Model: "glm-5.3-flash", Endpoint: "https://api.z.ai/api/anthropic",
 			Runtime: "claude-code", ConfigSHA256: strings.Repeat("b", 64), Command: "claude",
+			CredentialClass: provider.CredentialClassCodingPlan, BillingClass: provider.BillingClassCodingPlan, Entitlement: provider.EntitlementClaudeCompat,
 			AutomationPolicy: provider.DefaultZAIAutomationPolicyName, ExactTargetOnly: true, ProbeRequired: true,
 			ModelProbeState: "qualified", ModelProbeReceiptSHA256: strings.Repeat("c", 64),
+		},
+		"zai-native": {
+			Provider: "zai", AccountAlias: "native-test", Model: "glm-test", Endpoint: "https://api.z.ai/api/paas/v4/chat/completions",
+			Runtime: "zai-api", RuntimeVersion: "zai-native-http-v1", ConfigSHA256: strings.Repeat("d", 64),
+			CredentialClass: provider.CredentialClassAPIKey, BillingClass: provider.BillingClassAPIUsage, Entitlement: provider.EntitlementNativeAPI,
+			AutomationPolicy: provider.NativeZAINoToolsPolicyName, ExactTargetOnly: true, ProbeRequired: true,
 		},
 	}}
 	for _, test := range []struct{ profile, transport string }{
 		{"xai-primary", "xai_acp"},
+		{"xai-primary", "xai_headless_session"},
 		{"xai-primary", "xai_grok_tui"},
 		{"zai-primary", "zai_claude_runtime"},
+		{"zai-native", "zai_native_api"},
 	} {
 		out, err := GetProviderConformance(t.Context(), cfg, test.profile, test.transport)
 		if err != nil || !out.Success || !out.Passed || out.Mode != "synthetic_offline" || out.Report.Coverage.Satisfied != 7 {

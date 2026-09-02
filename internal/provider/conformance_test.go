@@ -83,12 +83,45 @@ func TestCapabilityMatrixPreservesEvidenceBoundaries(t *testing.T) {
 		t.Fatalf("Grok TUI matrix = %+v, want submission-only", got)
 	}
 	for transport, capabilities := range matrix {
-		if capabilities.Cleanup != EvidenceSubmission {
-			t.Fatalf("%s cleanup = %q, want submission until process-tree residuals are proven", transport, capabilities.Cleanup)
+		want := EvidenceSubmission
+		if transport == "xai_headless_session" {
+			want = EvidenceAuthoritative
+		}
+		if capabilities.Cleanup != want {
+			t.Fatalf("%s cleanup = %q, want %q", transport, capabilities.Cleanup, want)
+		}
+		for name, scope := range map[string]EvidenceAuthorityScope{
+			"completion":   capabilities.CompletionAuthorityScope,
+			"cancellation": capabilities.CancellationAuthorityScope,
+			"cleanup":      capabilities.CleanupAuthorityScope,
+		} {
+			if scope == "" {
+				t.Fatalf("%s %s authority scope is omitted", transport, name)
+			}
 		}
 	}
-	if got := matrix["zai_claude_runtime"]; !got.IdentityProbeRequired || got.Delivery != EvidenceSubmission || got.IdentityEvidence != IdentityEvidenceProfileAttested || got.CapacityControlScope != CapacityControlScopeProcessLocal {
+	if got := matrix["xai_headless_session"]; got.Completion != EvidenceAuthoritative || got.CompletionAuthorityScope != EvidenceAuthorityScopeProvider || got.Resume != EvidenceAuthoritative || got.Cancellation != EvidenceAuthoritative || got.CancellationAuthorityScope != EvidenceAuthorityScopeLocalProcessTree || got.Cleanup != EvidenceAuthoritative || got.CleanupAuthorityScope != EvidenceAuthorityScopeLocalProcessTree || got.CapacityControlScope != CapacityControlScopeLocalShared {
+		t.Fatalf("xAI headless session matrix = %+v", got)
+	}
+	if got := matrix["zai_claude_runtime"]; !got.IdentityProbeRequired || got.Delivery != EvidenceSubmission || got.IdentityEvidence != IdentityEvidenceProfileAttested || got.CapacityControlScope != CapacityControlScopeLocalShared {
 		t.Fatalf("Z.ai Claude-runtime matrix = %+v", got)
+	}
+	if got := matrix["zai_native_api"]; !got.IdentityProbeRequired || got.Launch != EvidenceAuthoritative || got.Delivery != EvidenceAuthoritative || got.Completion != EvidenceAuthoritative || got.CompletionAuthorityScope != EvidenceAuthorityScopeProvider || got.LiveErrorFeedback != EvidenceAuthoritative || got.Cancellation != EvidenceUnavailable || got.CancellationAuthorityScope != EvidenceAuthorityScopeUnavailable || got.Resume != EvidenceUnavailable || got.Cleanup != EvidenceSubmission || got.CleanupAuthorityScope != EvidenceAuthorityScopeLocalClient || got.CapacityControlScope != CapacityControlScopeLocalShared {
+		t.Fatalf("Z.ai native API matrix = %+v", got)
+	}
+}
+
+func TestRunConformanceGrokHeadlessBindsResumeWithoutProviderCancelOverclaim(t *testing.T) {
+	t.Parallel()
+	id := conformanceIdentity(t)
+	report := RunConformance(context.Background(), fakeRuntime{
+		identityHash: id.Hash(), completion: true,
+		cancel: CancelObservation{Attempted: true, Authoritative: true},
+		resume: ResumeObservation{Resumed: true, SameSessionID: true},
+		errors: genericErrors(),
+	}, "xai_headless_session", id, conformanceFixture(id), "nonce-headless")
+	if !report.Passed() {
+		t.Fatalf("headless report = %+v", report)
 	}
 }
 
@@ -111,6 +144,23 @@ func TestRunConformanceZAIRequiresEveryExactErrorClass(t *testing.T) {
 	report = RunConformance(context.Background(), fakeRuntime{identityHash: id.Hash(), cancel: CancelObservation{Attempted: true}, errors: zaiErrors()[:7]}, "zai_claude_runtime", id, conformanceFixture(id), "nonce-1")
 	if report.Passed() || checkByName(report, "provider_error_taxonomy").Passed {
 		t.Fatalf("incomplete Z.ai taxonomy must fail: %+v", report)
+	}
+}
+
+func TestRunConformanceZAINativeDoesNotPromoteUnavailableLifecycle(t *testing.T) {
+	t.Parallel()
+	id := zaiConformanceIdentity(t)
+	baseline := fakeRuntime{identityHash: id.Hash(), completion: true, cancel: CancelObservation{Attempted: true}, errors: zaiErrors()}
+	report := RunConformance(context.Background(), baseline, "zai_native_api", id, conformanceFixture(id), "nonce-native")
+	if !report.Passed() {
+		t.Fatalf("native baseline report = %+v", report)
+	}
+	unsupported := baseline
+	unsupported.cancel = CancelObservation{Attempted: true, Authoritative: true}
+	unsupported.resume = ResumeObservation{Resumed: true, SameSessionID: true}
+	report = RunConformance(context.Background(), unsupported, "zai_native_api", id, conformanceFixture(id), "nonce-native-overclaim")
+	if report.Passed() || len(report.Discrepancies) == 0 || checkByName(report, "session_resumption").Passed {
+		t.Fatalf("native lifecycle overclaim was accepted: %+v", report)
 	}
 }
 

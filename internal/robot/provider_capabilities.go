@@ -16,22 +16,26 @@ import (
 // executable commands, endpoints, raw configuration, credentials, and keys.
 type ProviderCapabilitiesOutput struct {
 	RobotResponse
-	Transports                map[string]provider.OperationCapabilities `json:"transports"`
-	GrokAutomationPolicy      GrokPolicyCapability                      `json:"grok_automation_policy"`
-	OfflineConformanceHarness ProviderConformanceCapability             `json:"offline_conformance_harness"`
-	ConfigSupplied            bool                                      `json:"config_supplied"`
-	ProviderProfiles          []ProviderProfileCapability               `json:"provider_profiles"`
+	Transports             map[string]provider.OperationCapabilities `json:"transports"`
+	GrokAutomationPolicies []GrokPolicyCapability                    `json:"grok_automation_policies"`
+	// GrokAutomationPolicy is retained as the default observe policy for
+	// older robot consumers. New consumers must inspect the complete list.
+	GrokAutomationPolicy      GrokPolicyCapability          `json:"grok_automation_policy"`
+	OfflineConformanceHarness ProviderConformanceCapability `json:"offline_conformance_harness"`
+	ConfigSupplied            bool                          `json:"config_supplied"`
+	ProviderProfiles          []ProviderProfileCapability   `json:"provider_profiles"`
 }
 
 // GrokPolicyCapability describes the compiled-in named policy without
 // serializing its rules. The digest binds a receipt to the policy definition.
 type GrokPolicyCapability struct {
-	Name           string `json:"name"`
-	Sandbox        string `json:"sandbox"`
-	PermissionMode string `json:"permission_mode"`
-	SHA256         string `json:"sha256"`
-	AllowRuleCount int    `json:"allow_rule_count"`
-	DenyRuleCount  int    `json:"deny_rule_count"`
+	Name                     string `json:"name"`
+	Sandbox                  string `json:"sandbox"`
+	PermissionMode           string `json:"permission_mode"`
+	SHA256                   string `json:"sha256"`
+	SystemRequirementsSHA256 string `json:"system_requirements_sha256"`
+	AllowRuleCount           int    `json:"allow_rule_count"`
+	DenyRuleCount            int    `json:"deny_rule_count"`
 }
 
 // ProviderConformanceCapability advertises the offline-only conformance
@@ -59,18 +63,15 @@ type ProviderProfileCapability struct {
 // GetProviderCapabilities builds a deterministic, entirely local provider
 // capability receipt. cfg may be nil when no configuration has been loaded.
 func GetProviderCapabilities(cfg *config.Config) (*ProviderCapabilitiesOutput, error) {
-	policy := agentpkg.DefaultGrokAutomationPolicy()
+	policies := []GrokPolicyCapability{
+		grokPolicyCapability(agentpkg.DefaultGrokAutomationPolicyName),
+		grokPolicyCapability(agentpkg.GrokWorkspaceWritePolicyName),
+	}
 	output := &ProviderCapabilitiesOutput{
-		RobotResponse: NewRobotResponse(true),
-		Transports:    provider.CapabilityMatrix(),
-		GrokAutomationPolicy: GrokPolicyCapability{
-			Name:           policy.Name,
-			Sandbox:        policy.Sandbox,
-			PermissionMode: policy.PermissionMode,
-			SHA256:         agentpkg.DefaultGrokAutomationPolicySHA256(),
-			AllowRuleCount: len(policy.AllowRules),
-			DenyRuleCount:  len(policy.DenyRules),
-		},
+		RobotResponse:          NewRobotResponse(true),
+		Transports:             provider.CapabilityMatrix(),
+		GrokAutomationPolicies: policies,
+		GrokAutomationPolicy:   policies[0],
 		OfflineConformanceHarness: ProviderConformanceCapability{
 			Available:   true,
 			Description: "operator-runnable synthetic lifecycle conformance via --robot-provider-conformance; no provider, network, Beads, or Agent Mail calls",
@@ -118,6 +119,23 @@ func GetProviderCapabilities(cfg *config.Config) (*ProviderCapabilitiesOutput, e
 		output.ProviderProfiles = append(output.ProviderProfiles, capability)
 	}
 	return output, nil
+}
+
+func grokPolicyCapability(name string) GrokPolicyCapability {
+	policy, ok := agentpkg.GrokAutomationPolicy(name)
+	if !ok {
+		return GrokPolicyCapability{}
+	}
+	requirements, _ := agentpkg.GrokSystemRequirementsForPolicy(name)
+	return GrokPolicyCapability{
+		Name:                     policy.Name,
+		Sandbox:                  policy.Sandbox,
+		PermissionMode:           policy.PermissionMode,
+		SHA256:                   agentpkg.GrokAutomationPolicySHA256(name),
+		SystemRequirementsSHA256: requirements.SHA256,
+		AllowRuleCount:           len(policy.AllowRules),
+		DenyRuleCount:            len(policy.DenyRules),
+	}
 }
 
 // PrintProviderCapabilities writes the redacted receipt to the standard robot

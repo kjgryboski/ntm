@@ -17,6 +17,7 @@ func TestGetProviderCapabilitiesRedactsConfiguredProfiles(t *testing.T) {
 		"zai-operator-glm": {
 			Provider: "zai", AccountAlias: "operator", Model: "glm-5.3-flash",
 			Endpoint: "https://api.z.ai/api/anthropic", Runtime: "claude-code", ConfigSHA256: configHash,
+			CredentialClass: provider.CredentialClassCodingPlan, BillingClass: provider.BillingClassCodingPlan, Entitlement: provider.EntitlementClaudeCompat,
 			Command: "claude", AutomationPolicy: provider.DefaultZAIAutomationPolicyName,
 			ExactTargetOnly: true, ProbeRequired: true, ModelProbeState: "live_verified", ModelProbeReceiptSHA256: probeHash,
 		},
@@ -34,11 +35,23 @@ func TestGetProviderCapabilitiesRedactsConfiguredProfiles(t *testing.T) {
 	if !output.Success || !output.ConfigSupplied || len(output.ProviderProfiles) != 2 {
 		t.Fatalf("output = %+v", output)
 	}
-	if output.Transports["xai_acp"].Completion != provider.EvidenceAuthoritative || !output.OfflineConformanceHarness.Available {
+	if output.Transports["xai_acp"].Completion != provider.EvidenceAuthoritative || output.Transports["xai_acp"].CapacityControlScope != provider.CapacityControlScopeLocalShared || !output.OfflineConformanceHarness.Available {
 		t.Fatalf("transport/conformance capability = %+v", output)
 	}
-	if output.GrokAutomationPolicy.Name == "" || output.GrokAutomationPolicy.Sandbox != "read-only" || output.GrokAutomationPolicy.SHA256 == "" || output.GrokAutomationPolicy.AllowRuleCount == 0 || output.GrokAutomationPolicy.DenyRuleCount == 0 {
+	if len(output.GrokAutomationPolicies) != 2 || output.GrokAutomationPolicy.Name == "" || output.GrokAutomationPolicy.Sandbox != "read-only" || output.GrokAutomationPolicy.SHA256 == "" || output.GrokAutomationPolicy.SystemRequirementsSHA256 == "" || output.GrokAutomationPolicy.AllowRuleCount == 0 || output.GrokAutomationPolicy.DenyRuleCount == 0 {
 		t.Fatalf("Grok policy capability = %+v", output.GrokAutomationPolicy)
+	}
+	workspace := output.GrokAutomationPolicies[1]
+	if workspace.Name != "grok-workspace-write-ci" || workspace.Sandbox != "strict" || workspace.SystemRequirementsSHA256 == "" || workspace.AllowRuleCount == 0 || workspace.DenyRuleCount == 0 {
+		t.Fatalf("workspace policy capability = %+v", workspace)
+	}
+	native := output.Transports["zai_native_api"]
+	if native.Completion != provider.EvidenceAuthoritative || native.CompletionAuthorityScope != provider.EvidenceAuthorityScopeProvider || native.LiveErrorFeedback != provider.EvidenceAuthoritative || native.Cancellation != provider.EvidenceUnavailable || native.CancellationAuthorityScope != provider.EvidenceAuthorityScopeUnavailable || native.Resume != provider.EvidenceUnavailable || native.Cleanup != provider.EvidenceSubmission || native.CleanupAuthorityScope != provider.EvidenceAuthorityScopeLocalClient || native.CapacityControlScope != provider.CapacityControlScopeLocalShared {
+		t.Fatalf("native Z.ai capability = %+v", native)
+	}
+	headless := output.Transports["xai_headless_session"]
+	if headless.Completion != provider.EvidenceAuthoritative || headless.CompletionAuthorityScope != provider.EvidenceAuthorityScopeProvider || headless.Resume != provider.EvidenceAuthoritative || headless.Cancellation != provider.EvidenceAuthoritative || headless.CancellationAuthorityScope != provider.EvidenceAuthorityScopeLocalProcessTree || headless.Cleanup != provider.EvidenceAuthoritative || headless.CleanupAuthorityScope != provider.EvidenceAuthorityScopeLocalProcessTree || headless.CapacityControlScope != provider.CapacityControlScopeLocalShared {
+		t.Fatalf("native Grok headless capability = %+v", headless)
 	}
 
 	valid := output.ProviderProfiles[1]
@@ -85,6 +98,7 @@ func TestGetProviderCapabilitiesDoesNotPromoteTupleValidUnlaunchableProfile(t *t
 		"zai-valid-tuple-invalid-policy": {
 			Provider: "zai", AccountAlias: "operator", Model: "glm-5.3-flash",
 			Endpoint: "https://api.z.ai/api/anthropic", Runtime: "claude-code", ConfigSHA256: hash,
+			CredentialClass: provider.CredentialClassCodingPlan, BillingClass: provider.BillingClassCodingPlan, Entitlement: provider.EntitlementClaudeCompat,
 			Command: "claude", AutomationPolicy: "",
 			ExactTargetOnly: true, ProbeRequired: true, ModelProbeState: "qualified", ModelProbeReceiptSHA256: hash,
 		},

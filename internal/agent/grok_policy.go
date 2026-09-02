@@ -11,6 +11,13 @@ import (
 // output and execution receipts identify the policy without copying rules.
 const DefaultGrokAutomationPolicyName = "grok-readonly-ci"
 
+// GrokWorkspaceWritePolicyName is the narrowly scoped policy for an
+// explicitly disposable worktree. It is not a general-purpose approval mode.
+// The provider may edit, but executable verification stays controller-owned:
+// source code which the model can edit is not safe to execute in a process
+// that can also reach provider credentials.
+const GrokWorkspaceWritePolicyName = "grok-workspace-write-ci"
+
 // DefaultGrokAutomationCommand is the fully rendered compatibility launch
 // when no model or reasoning override is requested. Restart/restore paths use
 // this value directly and must never receive Go template syntax.
@@ -81,11 +88,127 @@ func DefaultGrokAutomationPolicy() GrokAutomationPolicyDescriptor {
 	}
 }
 
+// GrokSystemRequirements is the deterministic, non-secret system-layer
+// requirements document that an owner may install at /etc/grok/requirements.toml.
+// Installation is an explicit, create-only owner action: the root-owned system
+// layer is the authority that prevents an interactive bypass from weakening an
+// automated policy.
+type GrokSystemRequirements struct {
+	PolicyName string
+	Contents   string
+	SHA256     string
+}
+
+// GrokSystemRequirementsForPolicy renders the exact TOML and digest expected
+// for a named built-in policy. The ordering comes from the reviewed rule lists
+// and must not be changed without intentionally changing the receipt digest.
+func GrokSystemRequirementsForPolicy(name string) (GrokSystemRequirements, bool) {
+	policy, ok := GrokAutomationPolicy(name)
+	if !ok {
+		return GrokSystemRequirements{}, false
+	}
+	var builder strings.Builder
+	builder.WriteString("# NTM-managed Grok policy. Install as a root-owned system requirement.\n")
+	builder.WriteString("[sandbox]\nprofile = \"")
+	builder.WriteString(policy.Sandbox)
+	builder.WriteString("\"\n\n[ui]\npermission_mode = \"")
+	builder.WriteString(policy.PermissionMode)
+	builder.WriteString("\"\ndisable_bypass_permissions_mode = true\n\n[permission]\nrules = [\n")
+	for _, rule := range policy.AllowRules {
+		writeGrokRequirementRule(&builder, "allow", rule)
+	}
+	for _, rule := range policy.DenyRules {
+		writeGrokRequirementRule(&builder, "deny", rule)
+	}
+	builder.WriteString("]\n")
+	contents := builder.String()
+	sum := sha256.Sum256([]byte(contents))
+	return GrokSystemRequirements{PolicyName: policy.Name, Contents: contents, SHA256: hex.EncodeToString(sum[:])}, true
+}
+
+// writeGrokRequirementRule converts the CLI's Tool(pattern) notation to the
+// documented requirements.toml schema. Keeping this conversion explicit
+// prevents a syntactically valid but ignored `rule = ...` field from creating
+// a false policy-installation receipt.
+func writeGrokRequirementRule(builder *strings.Builder, action, rule string) {
+	tool, pattern := rule, ""
+	if open := strings.IndexByte(rule, '('); open > 0 && strings.HasSuffix(rule, ")") {
+		tool, pattern = rule[:open], rule[open+1:len(rule)-1]
+	}
+	builder.WriteString("  { action = \"")
+	builder.WriteString(tomlEscape(action))
+	builder.WriteString("\", tool = \"")
+	builder.WriteString(tomlEscape(strings.ToLower(tool)))
+	builder.WriteString("\"")
+	if pattern != "" {
+		builder.WriteString(", pattern = \"")
+		builder.WriteString(tomlEscape(pattern))
+		builder.WriteString("\"")
+	}
+	builder.WriteString(" },\n")
+}
+
+func tomlEscape(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	return strings.ReplaceAll(value, `"`, `\"`)
+}
+
+// GrokWorkspaceWritePolicy returns the reviewed disposable-worktree policy.
+// The strict sandbox blocks child-process network access on Linux and narrows
+// filesystem reads to the workspace and system paths. Bash remains entirely
+// denied: an exact-looking test command can execute model-edited code, which
+// can read a parent process or credential store unless a separate OS-isolated
+// verifier owns that execution.
+func GrokWorkspaceWritePolicy() GrokAutomationPolicyDescriptor {
+	base := DefaultGrokAutomationPolicy()
+	denyRules := append([]string{}, base.DenyRules[2:]...)
+	// strict intentionally keeps ~/.grok and temp writable for the runtime.
+	// Mirror every sensitive Read path as an Edit denial so the model cannot
+	// mutate credential/config material merely because Edit itself is allowed.
+	for _, rule := range base.DenyRules {
+		if strings.HasPrefix(rule, "Read(") {
+			denyRules = append(denyRules, "Edit("+strings.TrimPrefix(rule, "Read("))
+		}
+	}
+	denyRules = append(denyRules, "WebFetch", "WebSearch", "Bash(*)")
+	return GrokAutomationPolicyDescriptor{
+		Name:           GrokWorkspaceWritePolicyName,
+		Sandbox:        "strict",
+		PermissionMode: "dontAsk",
+		AllowRules: []string{
+			"Read", "Grep", "Edit",
+		},
+		DenyRules: denyRules,
+	}
+}
+
+// GrokAutomationPolicy resolves the only built-in unattended Grok policies.
+// It returns a copy so callers cannot mutate the reviewed rule set.
+func GrokAutomationPolicy(name string) (GrokAutomationPolicyDescriptor, bool) {
+	switch name {
+	case DefaultGrokAutomationPolicyName:
+		return DefaultGrokAutomationPolicy(), true
+	case GrokWorkspaceWritePolicyName:
+		return GrokWorkspaceWritePolicy(), true
+	default:
+		return GrokAutomationPolicyDescriptor{}, false
+	}
+}
+
 // DefaultGrokAutomationPermissionArgs returns exec-ready permission arguments.
 // Values are not shell-quoted because native adapters pass this vector directly
 // to execve rather than joining it into a shell command.
 func DefaultGrokAutomationPermissionArgs() []string {
-	policy := DefaultGrokAutomationPolicy()
+	return GrokAutomationPermissionArgs(DefaultGrokAutomationPolicyName)
+}
+
+// GrokAutomationPermissionArgs returns exec-ready permission arguments for a
+// named built-in policy. Unknown policy names return nil so callers fail closed.
+func GrokAutomationPermissionArgs(name string) []string {
+	policy, ok := GrokAutomationPolicy(name)
+	if !ok {
+		return nil
+	}
 	args := []string{"--permission-mode", policy.PermissionMode}
 	for _, rule := range policy.AllowRules {
 		args = append(args, "--allow", rule)
@@ -100,7 +223,15 @@ func DefaultGrokAutomationPermissionArgs() []string {
 // single-argument form accepted by the ACP adapter's narrow launch validator.
 // Keeping the permission mode explicit prevents CLI-default drift.
 func DefaultGrokAutomationACPPolicyArgs() []string {
-	policy := DefaultGrokAutomationPolicy()
+	return GrokAutomationACPPolicyArgs(DefaultGrokAutomationPolicyName)
+}
+
+// GrokAutomationACPPolicyArgs returns ACP-ready arguments for a named policy.
+func GrokAutomationACPPolicyArgs(name string) []string {
+	policy, ok := GrokAutomationPolicy(name)
+	if !ok {
+		return nil
+	}
 	args := []string{"--sandbox=" + policy.Sandbox, "--permission-mode=" + policy.PermissionMode}
 	for _, rule := range policy.AllowRules {
 		args = append(args, "--allow="+rule)
@@ -115,7 +246,15 @@ func DefaultGrokAutomationACPPolicyArgs() []string {
 // digest for receipts. Length-prefix-free ambiguity is avoided with NUL
 // separators because policy names and rules cannot contain control bytes.
 func DefaultGrokAutomationPolicySHA256() string {
-	policy := DefaultGrokAutomationPolicy()
+	return GrokAutomationPolicySHA256(DefaultGrokAutomationPolicyName)
+}
+
+// GrokAutomationPolicySHA256 returns the receipt-safe digest for a policy.
+func GrokAutomationPolicySHA256(name string) string {
+	policy, ok := GrokAutomationPolicy(name)
+	if !ok {
+		return ""
+	}
 	fields := []string{policy.Name, policy.Sandbox, policy.PermissionMode}
 	fields = append(fields, policy.AllowRules...)
 	fields = append(fields, policy.DenyRules...)
@@ -128,7 +267,15 @@ func DefaultGrokAutomationPolicySHA256() string {
 // containing spaces are single-quoted because those launchers join the vector
 // into a shell command rather than invoking execve directly.
 func DefaultGrokAutomationShellArgs() []string {
-	policy := DefaultGrokAutomationPolicy()
+	return GrokAutomationShellArgs(DefaultGrokAutomationPolicyName)
+}
+
+// GrokAutomationShellArgs returns shell-ready static args for a named policy.
+func GrokAutomationShellArgs(name string) []string {
+	policy, ok := GrokAutomationPolicy(name)
+	if !ok {
+		return nil
+	}
 	args := []string{"--no-auto-update", "--sandbox", policy.Sandbox, "--permission-mode", policy.PermissionMode}
 	for _, rule := range policy.AllowRules {
 		args = append(args, "--allow", "'"+rule+"'")

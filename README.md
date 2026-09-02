@@ -155,16 +155,15 @@ automation path rather than screen scraping. One-shot runs launch
 `grok --no-auto-update --sandbox=read-only --permission-mode=dontAsk <allow/deny rules> [--model EXACT_MODEL] agent stdio`,
 apply the named `grok-readonly-ci` policy, and return a nonce-bound receipt
 containing provider session/completion metadata plus redacted hashes and cleanup
-evidence. Exact-identity admission applies a separate, process-local
-concurrency/token budget, backoff, and circuit state to each
-provider/account/model/endpoint/runtime/config tuple and never changes provider
-on denial. The policy is deliberately
-least-privilege: xAI's filesystem sandbox independently blocks workspace
-writes and, on Linux, child-network access, while named permission rules permit
-only read/search and deny all Bash, common credential paths, and broad approval
-bypasses. NTM performs tests and other verification itself; provider-side test
-execution remains unavailable until a non-exportable credential broker and
-kernel-enforced sandbox can support it honestly.
+evidence. Exact-identity admission applies a separate, cross-process local shared
+concurrency/token budget, backoff, and circuit state to each exact provider,
+account, model, endpoint, runtime, credential class, billing class, entitlement,
+and config tuple, and never changes provider on denial. The default observe
+policy is deliberately read/search-only. The separately named workspace policy
+runs only in a linked disposable worktree, uses the strict sandbox, permits
+edits, and denies provider-run shell/web operations, credential-path reads,
+pushes, destructive commands, and approval bypasses. Model-edited tests are
+never executed inside the credential-bearing provider process.
 
 Bind each ACP run to an exact non-secret provider profile. The `command` field
 is the executable path passed directly to the operating system, not a shell
@@ -270,6 +269,10 @@ account_alias = "team"
 model = "glm-5.3-flash"
 endpoint = "https://api.z.ai/api/anthropic"
 runtime = "claude-code"
+runtime_version = "YOUR_REVIEWED_CLAUDE_CODE_VERSION"
+credential_class = "coding_plan"
+billing_class = "coding_plan"
+entitlement = "claude_compatible"
 config_sha256 = "YOUR_64_CHARACTER_LOWERCASE_REDACTED_CONFIG_SHA256"
 command = "claude"
 automation_policy = "zai-readonly-ci"
@@ -279,7 +282,27 @@ model_probe_state = "unprobed"
 model_probe_receipt_sha256 = ""
 ```
 
-For Z.ai, the selected profile must use the official
+The separately billed native no-tool lane uses a different profile and key:
+
+```toml
+[provider_profiles.zai-native-no-tools]
+provider = "zai"
+account_alias = "team-api"
+model = "glm-5.3"
+endpoint = "https://api.z.ai/api/paas/v4/chat/completions"
+runtime = "zai-api"
+runtime_version = "zai-native-http-v1"
+credential_class = "api_key"
+billing_class = "api_usage"
+entitlement = "native_api"
+config_sha256 = "YOUR_64_CHARACTER_LOWERCASE_REDACTED_CONFIG_SHA256"
+command = ""
+automation_policy = "zai-native-no-tools-v1"
+exact_target_only = true
+probe_required = true
+```
+
+For the Claude-compatible Z.ai lane, the selected profile must use the official
 `https://api.z.ai/api/anthropic` endpoint and `claude-code` runtime. Its
 `command` is an executable only: NTM generates the exact endpoint/model and
 restricted policy (`--restricted`, `--safe-mode`, strict MCP, no slash
@@ -287,11 +310,12 @@ commands/Chrome, and only `Read,Glob,Grep,WebSearch`; Bash/Edit/write tools
 are denied). Before any tmux mutation, production launch runs a fresh zero-tool,
 no-session-persistence Claude stream-JSON probe. It must return the nonce in a
 successful result for the same session whose initialization names the exact
-model; otherwise launch is NO-GO. The probe requires an explicit `ZAI_API_KEY`
-or deliberately Z.ai-scoped `ANTHROPIC_AUTH_TOKEN`. The provider child receives
-only a canonical `ANTHROPIC_AUTH_TOKEN` plus a minimal runtime environment; it
+model; otherwise launch is NO-GO. The probe requires the explicitly Z.ai-scoped
+`ZAI_API_KEY`; a generic `ANTHROPIC_AUTH_TOKEN` is never forwarded. The provider
+child receives only a canonical `ANTHROPIC_AUTH_TOKEN` mapped from that key plus
+a minimal runtime environment; it
 does not inherit unrelated xAI, AWS, GitHub, or other credentials. The tmux
-server must also have inherited one of those Z.ai auth variables: the compiled
+server must also have inherited `ZAI_API_KEY`: the compiled
 pane command fails with `NTM_ZAI_AUTH_REQUIRED` when it did not, and NTM does
 not claim that a profile or preflight proves tmux credential delivery.
 
@@ -303,10 +327,12 @@ recovery, resumption, rate-limit classification, and cleanup against redacted
 fixtures. That harness makes no provider or network call and is not a live
 qualification receipt.
 
-Current Z.ai documentation lists `glm-5.3-flash` as an official model code,
-but documentation availability is not account/plan availability. If the local
-Claude client cannot emit session-scoped model evidence, production Z.ai launch
-remains NO-GO while dry-run/profile identity discovery stays available.
+Current Z.ai Coding Plan documentation explicitly lists GLM-5.3 and
+GLM-5.3-Flash for all plan tiers and names `glm-5.3-flash` as a Claude Code
+model identifier. Documentation availability is still not account/plan
+entitlement. If the local Claude client cannot emit session-scoped exact-model
+evidence, production Z.ai launch remains NO-GO while dry-run/profile identity
+discovery stays available.
 
 Capability discovery never calls a configured profile “launchable”: xAI
 profiles report `operation_evidence_required`, while Z.ai profiles report
@@ -316,8 +342,8 @@ similarly named value written into configuration remains a diagnostic claim,
 not qualification evidence.
 
 Capacity evidence is transport-specific. Native Grok ACP calls are governed per
-exact identity by process-local concurrency, token-bucket, backoff, and circuit
-state. The Z.ai preflight and first authorized pane launch share one exact-
+exact identity by a cross-process local shared concurrency lease, token bucket,
+backoff, and circuit state. The Z.ai preflight and first authorized pane launch share one exact-
 identity admission, and structured live preflight errors update the same
 rate-limit/overload/permanent-error circuit. For the resulting Claude-compatible
 TUI, NTM still cannot
@@ -333,6 +359,132 @@ fixture-backed adapter contract check, not live-provider qualification. For an
 opt-in no-write live Grok ACP check, run
 `NTM_LIVE_GROK_ACP=1 NTM_LIVE_GROK_MODEL=grok-4.6 go test -tags=integration ./internal/grok -run '^TestLiveACPReadOnlyRoundTrip$' -count=1 -v`
 only in an authenticated Grok environment you are authorized to use.
+
+#### Provider readiness, policy ownership, and live qualification
+
+An exact provider identity is immutable and non-secret. It binds the provider,
+account alias, model, normalized HTTPS endpoint, runtime, credential class,
+billing class, entitlement, and the SHA-256 of a redacted configuration
+manifest. The resulting identity hash is the admission, circuit, receipt, and
+qualification boundary. A profile is therefore not interchangeable with a
+runtime executable, and NTM never changes identity or fails over when
+admission is denied. Profile-attested identity is a safe boundary, not proof
+that an opaque provider runtime currently honors every configured field.
+
+Grok has exactly two built-in unattended policies:
+
+- `grok-readonly-ci` is the observe policy: read/search only, read-only
+  sandbox, fail-closed `dontAsk`, and no `Bash(*)` or edits.
+- `grok-workspace-write-ci` is the narrowly reviewed edit policy for a
+  disposable linked Git worktree. It uses xAI's `strict` sandbox, permits
+  edits, and denies provider-run shell commands, web tools, pushes,
+  destructive commands, approval bypasses, and credential-path reads. NTM
+  rejects this policy unless the working directory is a linked disposable
+  worktree. Executing model-edited tests is controller-owned and requires a
+  separate OS-isolated verifier; a permission allowlist alone is not a
+  credential or network boundary.
+
+The Grok requirements document is a system-owned bypass lock, not a
+per-project setting. An administrator/root process must install it once; the
+installer never overwrites a different existing document and verifies both
+digest and system-authoritative ownership:
+
+```bash
+ntm provider policy requirements --policy=grok-readonly-ci --install --confirm
+# or, when the reviewed workspace-write envelope is needed:
+ntm provider policy requirements --policy=grok-workspace-write-ci --install --confirm
+```
+
+Run `ntm provider doctor --profile=PROFILE` for the read-only report, or add
+`--online` for one bounded, no-tool identity/model probe. Doctor checks the
+exact identity, pinned runtime, authorization presence, managed-policy digest
+and ownership, local shared capacity/circuit state, lifecycle evidence, and,
+for the Z.ai Claude-compatible coding lane, a stored qualification receipt.
+The online probe and offline conformance harness are not coding qualification;
+for provider-native no-tool transports, the online probe is instead one of the
+capability-scoped readiness gates.
+
+Doctor reserves `GO` for a transport whose cancellation and cleanup are both
+acknowledged authoritatively by the provider. `GO_SCOPED` means every required
+gate for the declared operation scope passed, but lifecycle control is local or
+unavailable; doctor deliberately exits non-zero so automation cannot mistake
+that narrower result for Claude/Codex-equivalent lifecycle authority.
+The Claude-compatible Z.ai pane transport cannot earn either `GO` state: its
+opaque runtime exposes neither per-request capacity/circuit enforcement nor
+structured live error feedback. A successful pane preflight or coding
+qualification is evidence for those bounded checks only, never a claim that
+NTM governs the pane's individual provider requests.
+
+Native Grok ACP is the receipt-bearing one-shot route. For native headless
+lineage operations, use `ntm provider session resume` or `ntm provider session
+fork` with an exact Grok profile, `--session-id`, `--prompt`, and (when using
+the write policy) a linked disposable worktree. These commands additionally
+require a root-owned matching requirements document, a reviewed runtime-version
+pin with no drift, and the cross-process local shared capacity store. They emit
+nonce-bound receipts that bind identity, policy, working-directory hash,
+admission, action, and child-session lineage without echoing the provider
+session ID or preserving the prompt. Cancellation and cleanup are authoritative
+only for the locally observed process tree; they are not provider-side
+cancellation acknowledgements. Arbitrary provider output, raw tool arguments,
+credentials, and opaque runtime settings are not authoritative evidence.
+
+The local shared store coordinates concurrency, token budget, backoff, and
+circuits across cooperating local NTM processes, keyed by exact identity. It
+is not a fleet-wide quota service; if it falls back to process-local state,
+doctor reports that degradation and native headless session resume/fork is
+refused.
+
+Z.ai has two separate authorization lanes. The Claude-compatible Coding Plan
+lane uses only the deliberately Z.ai-scoped `ZAI_API_KEY`, remapped to the
+Claude-compatible child token; it is the only lane
+accepted by live qualification. A native Z.ai API profile is a different
+immutable credential/billing/entitlement identity and requires
+`ZAI_NATIVE_API_KEY`; Coding Plan credentials are not accepted for it. Native
+API structured completion, usage, and error records do not confer native
+cancellation or resume evidence.
+
+The native no-tool API lane is an explicit single-request operation, not a
+substitute for Claude-compatible coding qualification. After configuring a
+separate native API entitlement, invoke it only with an explicit durable
+operation identifier:
+
+```bash
+ntm provider run --profile=zai-native-no-tools --operation-id=YOUR_UNIQUE_OPERATION_ID --prompt='bounded no-tool task' --live
+```
+
+Its redacted receipt binds the operation, exact identity, and request outcome;
+it does not establish provider-side cancellation, resume, or coding-policy
+authority. Do not use a Coding Plan credential in this lane, and do not infer a
+live Z.ai qualification from this command.
+
+Run the live suite explicitly in its disposable repository:
+
+```bash
+ntm provider qualify --profile=zai-team-model --live
+```
+
+This suite creates a create-only, self-digested local receipt bound to the exact identity,
+transport, policy digest, runtime version, and disposable-repository hash. Its
+nine mandatory live checks are model identity, workspace edit, test execution,
+secret-access denial, push denial, crash recovery, cancellation, session
+resumption, and zero-residual cleanup. It is supported only on Linux: without
+an explicitly injected test verifier, NTM rejects non-Linux hosts during
+preflight, before it creates the disposable repository or calls the provider,
+because the production test verifier relies on Bubblewrap namespace isolation.
+The native no-tool API lane above is separate and is not a workaround or
+substitute. **Hard NO-GO:** do not treat a provider
+Z.ai Claude-compatible lane as ready for production coding until `ntm provider doctor --profile=PROFILE`
+reports a current pass for all nine checks bound to that exact identity,
+transport, and policy. No live qualification is claimed by this document.
+The receipt is not signed and is not tamper-evident against the same local
+account. Test execution is performed by NTM after an exact repository-delta
+check, inside a cleared-environment Bubblewrap network/PID/filesystem sandbox,
+not by trusting model-authored output or a provider-run shell command.
+
+Managed-policy discovery and a configuration digest are configuration
+attestation. They can prove the local controller saw a matching policy file and
+runtime report; they never upgrade local process-tree cancellation or cleanup
+into a provider cancellation acknowledgement.
 
 Use labels when you want multiple coordinated swarms on the same project while
 keeping a shared project directory:

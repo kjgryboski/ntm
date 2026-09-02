@@ -222,6 +222,9 @@ func qualifiedZAIProfile() config.ProviderProfileConfig {
 		Model:                   "glm-5.3-flash",
 		Endpoint:                "https://api.z.ai/api/anthropic",
 		Runtime:                 "claude-code",
+		CredentialClass:         provider.CredentialClassCodingPlan,
+		BillingClass:            provider.BillingClassCodingPlan,
+		Entitlement:             provider.EntitlementClaudeCompat,
 		ConfigSHA256:            hash,
 		Command:                 "claude",
 		AutomationPolicy:        "zai-readonly-ci",
@@ -275,6 +278,7 @@ func TestGetSpawnZAIRequiresExactQualifiedProviderProfile(t *testing.T) {
 	opts.NoUserPane = true
 	opts.WorkingDir = t.TempDir()
 	opts.LifecycleDeps = deps
+	opts.ProviderAdmission = &scriptedProviderAdmission{decision: ratelimit.Decision{Allowed: true, NoFailover: true}}
 	out, err = GetSpawn(t.Context(), opts, cfg)
 	if err != nil || !out.Success {
 		t.Fatalf("GetSpawn(live fake) output=%+v err=%v", out, err)
@@ -282,7 +286,7 @@ func TestGetSpawnZAIRequiresExactQualifiedProviderProfile(t *testing.T) {
 	if gotType != "zai" || !strings.Contains(gotCommand, "ANTHROPIC_BASE_URL='https://api.z.ai/api/anthropic'") || !strings.Contains(gotCommand, "--restricted") || !strings.Contains(gotCommand, "--disallowedTools 'Bash,Edit,Write,NotebookEdit'") {
 		t.Fatalf("Z.ai launch=(%q,%q), want NTM-compiled restricted command", gotType, gotCommand)
 	}
-	if len(out.Agents) != 1 || out.Agents[0].ProviderIdentityHash != identity.Hash() || out.Agents[0].ProviderIdentityEvidence != provider.IdentityEvidenceProfileAttested || out.Agents[0].Admission == nil || out.Agents[0].Admission.CapacityControlScope != provider.CapacityControlScopeProcessLocal {
+	if len(out.Agents) != 1 || out.Agents[0].ProviderIdentityHash != identity.Hash() || out.Agents[0].ProviderIdentityEvidence != provider.IdentityEvidenceProfileAttested || out.Agents[0].Admission == nil || out.Agents[0].Admission.CapacityControlScope != provider.CapacityControlScopeLocalShared {
 		t.Fatalf("Z.ai spawned agent identity=%+v", out.Agents)
 	}
 
@@ -328,6 +332,7 @@ func TestGetSpawnZAIProbeBusinessErrorRecordsExactCapacityClass(t *testing.T) {
 
 type scriptedProviderAdmission struct {
 	decision  ratelimit.Decision
+	scope     provider.CapacityControlScope
 	acquires  int
 	releases  int
 	successes int
@@ -340,12 +345,19 @@ func (s *scriptedProviderAdmission) Acquire(identity provider.Identity) ratelimi
 	s.identity = identity
 	return s.decision
 }
-func (s *scriptedProviderAdmission) Release(provider.Identity) { s.releases++ }
+func (s *scriptedProviderAdmission) Release(provider.Identity, ratelimit.Decision) { s.releases++ }
 func (s *scriptedProviderAdmission) RecordResult(provider.Identity, ratelimit.ErrorClass, time.Duration) ratelimit.Decision {
 	s.failures++
 	return ratelimit.Decision{NoFailover: true}
 }
 func (s *scriptedProviderAdmission) RecordSuccess(provider.Identity) { s.successes++ }
+func (s *scriptedProviderAdmission) CapacityStatus() ratelimit.CapacityStatus {
+	scope := s.scope
+	if scope == "" {
+		scope = provider.CapacityControlScopeLocalShared
+	}
+	return ratelimit.CapacityStatus{Scope: scope}
+}
 
 func TestGetSpawnZAIAdmissionDenialDoesNotLaunchOrFallback(t *testing.T) {
 	profile := qualifiedZAIProfile()
@@ -385,6 +397,52 @@ func TestGetSpawnZAIAdmissionDenialDoesNotLaunchOrFallback(t *testing.T) {
 	identity, _ := profile.Identity()
 	if admission.acquires != 1 || admission.identity.Hash() != identity.Hash() || admission.releases != 0 {
 		t.Fatalf("admission calls acquire=%d release=%d identity=%q", admission.acquires, admission.releases, admission.identity.Hash())
+	}
+}
+
+func TestGetSpawnZAIRejectsAdmissionThatPermitsFailover(t *testing.T) {
+	profile := qualifiedZAIProfile()
+	cfg := testSpawnConfig()
+	cfg.ProviderProfiles = map[string]config.ProviderProfileConfig{"zai-test-glm53": profile}
+	deps := testSpawnLifecycleDependencies([]tmux.Pane{{ID: "%zai", WindowIndex: 0, Index: 0}})
+	probes, creates := 0, 0
+	deps.ProbeZAI = func(context.Context, config.ProviderProfileConfig, provider.Identity) (zaipkg.Receipt, error) {
+		probes++
+		return zaipkg.Receipt{}, nil
+	}
+	deps.CreateSession = func(context.Context, string, string, int) error { creates++; return nil }
+	admission := &scriptedProviderAdmission{decision: ratelimit.Decision{Allowed: true, NoFailover: false}}
+	out, err := GetSpawn(t.Context(), SpawnOptions{
+		Session: "zai-failover-admission", ZAICount: 1, ZAIProviderProfile: "zai-test-glm53", NoUserPane: true,
+		WorkingDir: t.TempDir(), LifecycleDeps: deps, ProviderAdmission: admission,
+	}, cfg)
+	if err != nil || out.Success || probes != 0 || creates != 0 || admission.acquires != 1 || admission.releases != 0 {
+		t.Fatalf("output=%+v err=%v probes=%d creates=%d admission=%+v", out, err, probes, creates, admission)
+	}
+}
+
+func TestGetSpawnZAIRejectsProcessLocalCapacityBeforeProbeOrTmuxMutation(t *testing.T) {
+	profile := qualifiedZAIProfile()
+	cfg := testSpawnConfig()
+	cfg.ProviderProfiles = map[string]config.ProviderProfileConfig{"zai-test-glm53": profile}
+	deps := testSpawnLifecycleDependencies([]tmux.Pane{{ID: "%zai", WindowIndex: 0, Index: 0}})
+	probes, creates, launches := 0, 0, 0
+	deps.ProbeZAI = func(context.Context, config.ProviderProfileConfig, provider.Identity) (zaipkg.Receipt, error) {
+		probes++
+		return zaipkg.Receipt{}, nil
+	}
+	deps.CreateSession = func(context.Context, string, string, int) error { creates++; return nil }
+	deps.LaunchAgent = func(context.Context, tmux.Pane, string, string, int, string, string) (SpawnedAgent, error) {
+		launches++
+		return SpawnedAgent{}, nil
+	}
+	out, err := GetSpawn(t.Context(), SpawnOptions{
+		Session: "zai-local-capacity", ZAICount: 1, ZAIProviderProfile: "zai-test-glm53", NoUserPane: true,
+		WorkingDir: t.TempDir(), LifecycleDeps: deps,
+		ProviderAdmission: &scriptedProviderAdmission{decision: ratelimit.Decision{Allowed: true, NoFailover: true}, scope: provider.CapacityControlScopeProcessLocal},
+	}, cfg)
+	if err != nil || out.Success || probes != 0 || creates != 0 || launches != 0 || !strings.Contains(out.Error, "local shared capacity") {
+		t.Fatalf("output=%+v err=%v probes=%d creates=%d launches=%d", out, err, probes, creates, launches)
 	}
 }
 

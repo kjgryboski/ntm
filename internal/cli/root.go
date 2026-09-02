@@ -425,9 +425,11 @@ func activeRobotFlag(cmd *cobra.Command, name string) bool {
 }
 
 type grokACPProfileResolution struct {
-	Identity provider.Identity
-	Binary   string
-	Model    string
+	Identity         provider.Identity
+	Profile          config.ProviderProfileConfig
+	Binary           string
+	Model            string
+	AutomationPolicy string
 }
 
 // resolveGrokACPProviderProfile converts optional CLI assertions into one
@@ -449,7 +451,7 @@ func resolveGrokACPProviderProfile(selected *config.Config, target, modelAsserti
 	if identity.Provider() != "xai" || identity.Runtime() != "grok" || !profile.ExactTargetOnly {
 		return grokACPProfileResolution{}, fmt.Errorf("provider profile %q must bind provider=xai, runtime=grok, and exact_target_only=true", target)
 	}
-	if strings.TrimSpace(profile.AutomationPolicy) != agent.DefaultGrokAutomationPolicyName {
+	if _, ok := agent.GrokAutomationPolicy(strings.TrimSpace(profile.AutomationPolicy)); !ok {
 		return grokACPProfileResolution{}, fmt.Errorf("provider profile %q names unsupported automation policy %q", target, profile.AutomationPolicy)
 	}
 	if requested := strings.TrimSpace(modelAssertion); requested != "" && requested != identity.Model() {
@@ -459,7 +461,7 @@ func resolveGrokACPProviderProfile(selected *config.Config, target, modelAsserti
 	if assertion := strings.TrimSpace(binaryAssertion); assertion != "" && assertion != binary {
 		return grokACPProfileResolution{}, fmt.Errorf("--grok-binary does not match the executable bound by provider profile %q", target)
 	}
-	return grokACPProfileResolution{Identity: identity, Binary: binary, Model: identity.Model()}, nil
+	return grokACPProfileResolution{Identity: identity, Profile: profile, Binary: binary, Model: identity.Model(), AutomationPolicy: profile.AutomationPolicy}, nil
 }
 
 // encryptionStartupError reports a fatal encryption-at-rest startup failure.
@@ -2148,14 +2150,21 @@ Shell Integration:
 			}
 			runCtx, cancel := context.WithTimeout(cmd.Context(), timeout)
 			defer cancel()
+			verifiedBinary, err := verifyGrokACPDispatchAuthority(runCtx, cwd, resolvedProfile.Profile, resolvedProfile.Identity, providerDoctorDeps)
+			if err != nil {
+				failRobotCommand(err, robot.ErrCodeDependencyMissing, "Install and verify the exact root-owned Grok managed policy and pinned runtime before dispatch", "robot-grok-acp-run")
+				return
+			}
+			resolvedProfile.Binary = verifiedBinary
 			if err := robot.PrintGrokACPOperation(runCtx, robot.GrokACPOperationOptions{
-				Prompt:      msg,
-				CWD:         cwd,
-				Binary:      resolvedProfile.Binary,
-				Model:       resolvedProfile.Model,
-				OperationID: strings.TrimSpace(robotSendOpID),
-				Nonce:       strings.TrimSpace(robotGrokACPNonce),
-				Identity:    resolvedProfile.Identity,
+				Prompt:           msg,
+				CWD:              cwd,
+				Binary:           resolvedProfile.Binary,
+				Model:            resolvedProfile.Model,
+				OperationID:      strings.TrimSpace(robotSendOpID),
+				Nonce:            strings.TrimSpace(robotGrokACPNonce),
+				Identity:         resolvedProfile.Identity,
+				AutomationPolicy: resolvedProfile.AutomationPolicy,
 			}); err != nil {
 				recordRobotProcessExit(err)
 			}
@@ -5377,6 +5386,7 @@ func init() {
 		newHooksCmd(),
 		newHealthCmd(),
 		newDoctorCmd(),
+		newProviderCmd(),
 		newCleanupCmd(),
 		newClaimCmd(),
 		newSupportBundleCmd(),

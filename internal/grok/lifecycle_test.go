@@ -1,0 +1,233 @@
+package grok
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"io"
+	"strings"
+	"testing"
+	"time"
+
+	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
+)
+
+func TestBuildSessionSpecResumeAndFork(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	for _, action := range []SessionAction{SessionResume, SessionFork} {
+		spec, receipt, err := BuildSessionSpec(SessionRequest{Action: action, SessionID: "parent", Prompt: nonce, CWD: "/repo", ExpectedNonce: nonce})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if receipt.ParentSessionSHA256 == "" || receipt.NonceSHA256 == "" || spec.Binary != "grok" {
+			t.Fatalf("bad receipt/spec: %+v %+v", receipt, spec)
+		}
+		if action == SessionFork && !sameStrings(spec.Args[len(spec.Args)-1:], []string{"--fork-session"}) {
+			t.Fatalf("fork args: %#v", spec.Args)
+		}
+	}
+}
+
+func TestBuildSessionSpecAcceptsExactWorkspaceWritePolicy(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	policyArgs := agentpkg.GrokAutomationACPPolicyArgs(agentpkg.GrokWorkspaceWritePolicyName)
+	spec, _, err := BuildSessionSpec(SessionRequest{
+		Action: SessionResume, SessionID: "parent", Prompt: nonce, CWD: "/repo",
+		ExpectedNonce: nonce, PolicyArgs: policyArgs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameStrings(spec.Args[1:1+len(policyArgs)], policyArgs) {
+		t.Fatalf("workspace policy args = %#v", spec.Args)
+	}
+}
+
+type lifecycleRunnerFake struct {
+	spec  StartSpec
+	proc  LifecycleProcess
+	calls int
+}
+
+func (r *lifecycleRunnerFake) Start(_ context.Context, spec StartSpec) (LifecycleProcess, error) {
+	r.calls++
+	r.spec = spec
+	return r.proc, nil
+}
+
+type lifecycleProcessFake struct {
+	stdout string
+	wait   chan error
+	pid    int32
+}
+
+func (p *lifecycleProcessFake) Stdout() io.Reader { return strings.NewReader(p.stdout) }
+func (p *lifecycleProcessFake) Stderr() io.Reader { return strings.NewReader("") }
+func (p *lifecycleProcessFake) Wait() error       { return <-p.wait }
+func (p *lifecycleProcessFake) PID() int32        { return p.pid }
+
+func TestExecuteSessionBindsForkOnlyAfterStructuredNonceAndChildSession(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	p := &lifecycleProcessFake{stdout: "{\"type\":\"assistant\",\"delta\":{\"text\":\"work\"}}\n{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"child\",\"model\":\"grok-4.6\",\"stop_reason\":\"end_turn\",\"result\":\"" + nonce + "\",\"usage\":{\"input_tokens\":2,\"output_tokens\":3}}\n", wait: make(chan error, 1)}
+	p.wait <- nil
+	runner := &lifecycleRunnerFake{proc: p}
+	r, err := ExecuteSession(t.Context(), runner, SessionRequest{Action: SessionFork, SessionID: "parent", Prompt: nonce, CWD: "/repo", ExpectedNonce: nonce, Model: "grok-4.6"})
+	if err != nil || !r.LineageBound || !r.ProviderAcknowledged || !r.CompletionConfirmed || r.Model != "grok-4.6" || r.OutputSHA256 == "" {
+		t.Fatalf("receipt=%+v err=%v", r, err)
+	}
+	if !strings.Contains(strings.Join(runner.spec.Args, " "), "--fork-session") {
+		t.Fatalf("fork spec=%#v", runner.spec)
+	}
+}
+
+func TestExecuteSessionAcceptsGrok1013StreamingEndSchema(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	stdout := strings.Join([]string{
+		`{"type":"available_commands","commands":[{"name":"help"}]}`,
+		`{"type":"thought","data":"redacted reasoning that must not be hashed"}`,
+		`{"type":"text","data":"NTM_ACK_0123456789abcdef"}`,
+		`{"type":"text","data":"0123456789abcdef"}`,
+		`{"type":"usage","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}`,
+		`{"type":"end","stopReason":"end_turn","sessionId":"child","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5},"modelUsage":{"grok-4.6-build":{"inputTokens":2,"outputTokens":3,"modelCalls":1}}}`,
+	}, "\n") + "\n"
+	p := &lifecycleProcessFake{stdout: stdout, wait: make(chan error, 1)}
+	p.wait <- nil
+	r, err := ExecuteSession(t.Context(), &lifecycleRunnerFake{proc: p}, SessionRequest{
+		Action: SessionFork, SessionID: "parent", Prompt: nonce, CWD: "/repo",
+		ExpectedNonce: nonce, Model: "grok-4.6-build",
+	})
+	wantHash := sha256.Sum256([]byte(nonce))
+	if err != nil || !r.LineageBound || !r.ProviderAcknowledged || !r.CompletionConfirmed {
+		t.Fatalf("receipt=%+v err=%v", r, err)
+	}
+	if r.Model != "grok-4.6-build" || r.ModelEvidence != "end.modelUsage_singleton" || r.StopReason != "end_turn" {
+		t.Fatalf("provider evidence=%+v", r)
+	}
+	if r.OutputSHA256 != hex.EncodeToString(wantHash[:]) {
+		t.Fatalf("output hash=%q want=%q", r.OutputSHA256, hex.EncodeToString(wantHash[:]))
+	}
+	if r.Usage == nil || r.Usage.TotalTokens == nil || *r.Usage.TotalTokens != 5 {
+		t.Fatalf("usage=%+v", r.Usage)
+	}
+}
+
+func TestExecuteSessionFailsClosedOnUndocumentedModelAliasAndRetainsEvidence(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	stdout := `{"type":"text","data":"` + nonce + `"}` + "\n" +
+		`{"type":"end","stopReason":"end_turn","sessionId":"child","modelUsage":{"grok-4.6-build":{}}}` + "\n"
+	p := &lifecycleProcessFake{stdout: stdout, wait: make(chan error, 1)}
+	p.wait <- nil
+	r, err := ExecuteSession(t.Context(), &lifecycleRunnerFake{proc: p}, SessionRequest{
+		Action: SessionFork, SessionID: "parent", Prompt: nonce, CWD: "/repo",
+		ExpectedNonce: nonce, Model: "grok-4.6",
+	})
+	var got *Error
+	if !errors.As(err, &got) || got.Code != ErrIdentityMismatch {
+		t.Fatalf("receipt=%+v err=%v", r, err)
+	}
+	if !r.CompletionConfirmed || r.Model != "grok-4.6-build" || r.ModelEvidence != "end.modelUsage_singleton" || r.LineageBound {
+		t.Fatalf("identity mismatch evidence=%+v", r)
+	}
+}
+
+func TestParseLifecycleStreamRejectsAmbiguousEndModelEvidence(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	stream := `{"type":"text","data":"` + nonce + `"}` + "\n" +
+		`{"type":"end","stopReason":"end_turn","sessionId":"child","modelUsage":{"grok-4.6":{},"other":{}}}` + "\n"
+	result := parseLifecycleStream(strings.NewReader(stream), nonce, "grok-4.6")
+	if result.err == nil || !strings.Contains(result.err.Error(), "multiple provider models") {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestParseLifecycleStreamRejectsCompletionWithoutStopReason(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	stream := `{"type":"result","subtype":"success","session_id":"child","model":"grok-4.6","result":"` + nonce + `"}` + "\n"
+	result := parseLifecycleStream(strings.NewReader(stream), nonce, "grok-4.6")
+	if result.err == nil || !strings.Contains(result.err.Error(), "stop reason") {
+		t.Fatalf("result=%+v", result)
+	}
+}
+
+func TestExecuteSessionRejectsMissingNonceWithoutBinding(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	p := &lifecycleProcessFake{stdout: "{\"type\":\"result\",\"subtype\":\"success\",\"session_id\":\"child\",\"model\":\"grok-4.6\",\"stop_reason\":\"end_turn\",\"result\":\"wrong\"}\n", wait: make(chan error, 1)}
+	p.wait <- nil
+	r, err := ExecuteSession(t.Context(), &lifecycleRunnerFake{proc: p}, SessionRequest{Action: SessionFork, SessionID: "parent", Prompt: nonce, CWD: "/repo", ExpectedNonce: nonce, Model: "grok-4.6"})
+	var got *Error
+	if !errors.As(err, &got) || got.Code != ErrAcknowledgementUnconfirmed || r.LineageBound {
+		t.Fatalf("receipt=%+v err=%v", r, err)
+	}
+}
+
+func TestExecuteSessionCancellationNeverClaimsProviderAcknowledgement(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	p := &lifecycleProcessFake{stdout: "", wait: make(chan error, 1), pid: 0}
+	p.wait <- context.Canceled
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	runner := &lifecycleRunnerFake{proc: p}
+	r, err := ExecuteSession(ctx, runner, SessionRequest{Action: SessionResume, SessionID: "parent", Prompt: nonce, CWD: "/repo", ExpectedNonce: nonce})
+	var got *Error
+	if !errors.As(err, &got) || got.Code != ErrOutcomeUnknown || r.Cancellation.ProviderAcknowledged || r.Cancellation.LocalTermination != "not_started" || runner.calls != 0 {
+		t.Fatalf("receipt=%+v err=%v", r, err)
+	}
+}
+
+func TestExecuteSessionCancellationInterruptsWaitAfterParserEOF(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	p := &lifecycleProcessFake{stdout: "", wait: make(chan error), pid: 0}
+	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+	defer cancel()
+	r, err := ExecuteSession(ctx, &lifecycleRunnerFake{proc: p}, SessionRequest{Action: SessionResume, SessionID: "parent", Prompt: nonce, CWD: "/repo", ExpectedNonce: nonce})
+	var got *Error
+	if !errors.As(err, &got) || got.Code != ErrOutcomeUnknown || r.Cancellation.ProviderAcknowledged || r.Cancellation.LocalTermination != "unsupported" {
+		t.Fatalf("receipt=%+v err=%v", r, err)
+	}
+}
+
+func TestBindSessionLineageRequiresNonceAndNewForkID(t *testing.T) {
+	r := SessionReceipt{Action: SessionFork, ParentSessionSHA256: lifecycleHash("parent")}
+	if _, err := BindSessionLineage(r, "parent", true); err == nil {
+		t.Fatal("same fork session accepted")
+	}
+	if _, err := BindSessionLineage(r, "child", false); err == nil {
+		t.Fatal("missing nonce accepted")
+	}
+	got, err := BindSessionLineage(r, "child", true)
+	if err != nil || !got.LineageBound || !got.ProviderAcknowledged {
+		t.Fatalf("lineage: %+v %v", got, err)
+	}
+}
+
+type treeInspector struct {
+	children map[int32][]int32
+	live     map[int32]bool
+	killed   []int32
+	failKill bool
+}
+
+func (i *treeInspector) Children(pid int32) ([]int32, error) { return i.children[pid], nil }
+func (i *treeInspector) Exists(pid int32) (bool, error)      { return i.live[pid], nil }
+func (i *treeInspector) Kill(pid int32) error {
+	if i.failKill {
+		return context.Canceled
+	}
+	i.killed = append(i.killed, pid)
+	i.live[pid] = false
+	return nil
+}
+
+func TestTerminateAndVerifyDistinguishesLocalTreeEvidence(t *testing.T) {
+	// The descendant has a smaller PID so a numeric sort would incorrectly
+	// terminate the parent first. Structural postorder must still win.
+	i := &treeInspector{children: map[int32][]int32{10: {5}}, live: map[int32]bool{10: true, 5: true}}
+	r := terminateAndVerify(t.Context(), 10, i)
+	if r.LocalTermination != "observed_tree_terminated_verified" || r.ProviderAcknowledged || len(r.ResidualPIDs) != 0 {
+		t.Fatalf("receipt: %+v", r)
+	}
+	if len(i.killed) != 2 || i.killed[0] != 5 || i.killed[1] != 10 {
+		t.Fatalf("kill order=%v, want descendant before parent", i.killed)
+	}
+}

@@ -25,14 +25,30 @@ var configSHA256Pattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 // safe to persist, while the identity itself never accepts a credential,
 // query string, URL fragment, or URL userinfo.
 type Identity struct {
-	provider       string
-	accountAlias   string
-	model          string
-	endpoint       string
-	runtime        string
-	configSHA256   string
-	identitySHA256 string
+	provider        string
+	accountAlias    string
+	model           string
+	endpoint        string
+	runtime         string
+	credentialClass string
+	billingClass    string
+	entitlement     string
+	configSHA256    string
+	identitySHA256  string
 }
+
+// CredentialClass, BillingClass, and Entitlement are separate, immutable
+// authorization facts. They prevent a Coding Plan credential from being
+// accidentally used as though it were an API credential (or vice versa).
+const (
+	CredentialClassCodingPlan = "coding_plan"
+	CredentialClassAPIKey     = "api_key"
+	BillingClassCodingPlan    = "coding_plan"
+	BillingClassAPIUsage      = "api_usage"
+	EntitlementClaudeCompat   = "claude_compatible"
+	EntitlementNativeAPI      = "native_api"
+	identityClassUnspecified  = "unspecified"
+)
 
 // IdentityEvidenceGrade states how much of an identity tuple has been
 // independently observed. A profile-attested identity is immutable and safe
@@ -54,6 +70,14 @@ const (
 // the hash of a separately redacted configuration manifest, never a hash of a
 // secret value.
 func NewIdentity(providerName, accountAlias, model, endpoint, runtime, configSHA256 string) (Identity, error) {
+	return NewIdentityWithAuthorization(providerName, accountAlias, model, endpoint, runtime,
+		identityClassUnspecified, identityClassUnspecified, identityClassUnspecified, configSHA256)
+}
+
+// NewIdentityWithAuthorization validates and normalizes the complete
+// provider tuple, including the credential and commercial authorization
+// boundary. The authorization fields contain labels only, never a credential.
+func NewIdentityWithAuthorization(providerName, accountAlias, model, endpoint, runtime, credentialClass, billingClass, entitlement, configSHA256 string) (Identity, error) {
 	providerName, err := normalizePart("provider", providerName)
 	if err != nil {
 		return Identity{}, err
@@ -63,6 +87,18 @@ func NewIdentity(providerName, accountAlias, model, endpoint, runtime, configSHA
 		return Identity{}, err
 	}
 	runtime, err = normalizePart("runtime", runtime)
+	if err != nil {
+		return Identity{}, err
+	}
+	credentialClass, err = normalizePart("credential class", credentialClass)
+	if err != nil {
+		return Identity{}, err
+	}
+	billingClass, err = normalizePart("billing class", billingClass)
+	if err != nil {
+		return Identity{}, err
+	}
+	entitlement, err = normalizePart("entitlement", entitlement)
 	if err != nil {
 		return Identity{}, err
 	}
@@ -80,14 +116,17 @@ func NewIdentity(providerName, accountAlias, model, endpoint, runtime, configSHA
 	}
 
 	id := Identity{
-		provider:     providerName,
-		accountAlias: accountAlias,
-		model:        model,
-		endpoint:     endpoint,
-		runtime:      runtime,
-		configSHA256: configSHA256,
+		provider:        providerName,
+		accountAlias:    accountAlias,
+		model:           model,
+		endpoint:        endpoint,
+		runtime:         runtime,
+		credentialClass: credentialClass,
+		billingClass:    billingClass,
+		entitlement:     entitlement,
+		configSHA256:    configSHA256,
 	}
-	id.identitySHA256 = hashFields(id.provider, id.accountAlias, id.model, id.endpoint, id.runtime, id.configSHA256)
+	id.identitySHA256 = hashFields(id.provider, id.accountAlias, id.model, id.endpoint, id.runtime, id.credentialClass, id.billingClass, id.entitlement, id.configSHA256)
 	return id, nil
 }
 
@@ -143,13 +182,16 @@ func hashFields(fields ...string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func (i Identity) Provider() string     { return i.provider }
-func (i Identity) AccountAlias() string { return i.accountAlias }
-func (i Identity) Model() string        { return i.model }
-func (i Identity) Endpoint() string     { return i.endpoint }
-func (i Identity) Runtime() string      { return i.runtime }
-func (i Identity) ConfigSHA256() string { return i.configSHA256 }
-func (i Identity) Hash() string         { return i.identitySHA256 }
+func (i Identity) Provider() string        { return i.provider }
+func (i Identity) AccountAlias() string    { return i.accountAlias }
+func (i Identity) Model() string           { return i.model }
+func (i Identity) Endpoint() string        { return i.endpoint }
+func (i Identity) Runtime() string         { return i.runtime }
+func (i Identity) CredentialClass() string { return i.credentialClass }
+func (i Identity) BillingClass() string    { return i.billingClass }
+func (i Identity) Entitlement() string     { return i.entitlement }
+func (i Identity) ConfigSHA256() string    { return i.configSHA256 }
+func (i Identity) Hash() string            { return i.identitySHA256 }
 
 // EvidenceGrade reports the evidence available from a configured immutable
 // tuple alone. Runtime-specific adapters may publish stronger, separately
