@@ -514,6 +514,10 @@ func mergeSignalBatch(target *AggregatedSignals, batch *SignalBatch) {
 
 	if batch.Quota != nil {
 		target.Quota.Accounts = append(target.Quota.Accounts, batch.Quota.Accounts...)
+		target.Quota.Available = target.Quota.Available || batch.Quota.Available
+		if target.Quota.Reason == "" {
+			target.Quota.Reason = batch.Quota.Reason
+		}
 		if batch.Quota.Summary != nil && target.Quota.Summary == nil {
 			target.Quota.Summary = batch.Quota.Summary
 		}

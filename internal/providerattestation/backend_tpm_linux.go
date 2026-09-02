@@ -7,8 +7,10 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -21,8 +23,9 @@ import (
 const windowsBridgeEnvironment = "NTM_WINDOWS_PROVIDER_BRIDGE"
 
 type windowsBridgeSigner struct {
-	path   string
-	invoke func(context.Context, string, BridgeRequest) (BridgeResponse, error)
+	path           string
+	expectedSHA256 string
+	invoke         func(context.Context, string, BridgeRequest) (BridgeResponse, error)
 }
 
 func newNativeHardwareSigner() hardwareSigner {
@@ -33,8 +36,19 @@ func newNativeHardwareSigner() hardwareSigner {
 	return &windowsBridgeSigner{path: path, invoke: invokeWindowsBridge}
 }
 
+// NewPinnedWindowsBridge constructs a WSL attestor for one exact, immutable
+// Windows bridge executable. Unlike the ambient compatibility path, the file
+// is re-opened and re-hashed immediately before every ensure/sign invocation.
+func NewPinnedWindowsBridge(path, expectedSHA256 string) (*Attestor, error) {
+	signer := &windowsBridgeSigner{path: strings.TrimSpace(path), expectedSHA256: strings.TrimSpace(expectedSHA256), invoke: invokeWindowsBridge}
+	if !isWSLHost() || !signer.pinnedPathValid() {
+		return nil, ErrProtectionUnavailable
+	}
+	return &Attestor{hardware: signer}, nil
+}
+
 func (s *windowsBridgeSigner) EnsureKey(ctx context.Context, name string) (KeyMetadata, error) {
-	if s == nil || name != WindowsBridgeKeyName || s.invoke == nil {
+	if s == nil || name != WindowsBridgeKeyName || s.invoke == nil || !s.pathReady() {
 		return KeyMetadata{}, ErrProtectionUnavailable
 	}
 	response, err := s.invoke(ctx, s.path, BridgeRequest{Operation: BridgeOperationEnsure})
@@ -45,7 +59,7 @@ func (s *windowsBridgeSigner) EnsureKey(ctx context.Context, name string) (KeyMe
 }
 
 func (s *windowsBridgeSigner) Sign(ctx context.Context, name string, payload []byte) (SignatureMetadata, error) {
-	if s == nil || name != WindowsBridgeKeyName || s.invoke == nil || ValidateBridgePayload(payload) != nil {
+	if s == nil || name != WindowsBridgeKeyName || s.invoke == nil || !s.pathReady() || ValidateBridgePayload(payload) != nil {
 		return SignatureMetadata{}, ErrProtectionUnavailable
 	}
 	response, err := s.invoke(ctx, s.path, BridgeRequest{Operation: BridgeOperationSign, Payload: base64.RawURLEncoding.EncodeToString(payload)})
@@ -53,6 +67,37 @@ func (s *windowsBridgeSigner) Sign(ctx context.Context, name string, payload []b
 		return SignatureMetadata{}, ErrProtectionUnavailable
 	}
 	return *response.Signature, nil
+}
+
+func (s *windowsBridgeSigner) pathReady() bool {
+	if s == nil || !validBridgePath(s.path) {
+		return false
+	}
+	if s.expectedSHA256 == "" {
+		return true
+	}
+	return s.pinnedPathValid()
+}
+
+func (s *windowsBridgeSigner) pinnedPathValid() bool {
+	if s == nil || !validBridgePath(s.path) || len(s.expectedSHA256) != 64 {
+		return false
+	}
+	for _, r := range s.expectedSHA256 {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	info, err := os.Lstat(s.path)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 || info.Mode().Perm()&0o022 != 0 {
+		return false
+	}
+	contents, err := os.ReadFile(s.path)
+	if err != nil {
+		return false
+	}
+	digest := sha256.Sum256(contents)
+	return hex.EncodeToString(digest[:]) == s.expectedSHA256
 }
 
 func validBridgePath(path string) bool {

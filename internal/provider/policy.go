@@ -6,6 +6,11 @@ package provider
 // does not claim to introspect an opaque wrapper after launch.
 const DefaultZAIAutomationPolicyName = "zai-readonly-ci"
 
+// DefaultZAICodexAutomationPolicyName is the dedicated Coding Plan policy for
+// the official Codex runtime. It must never be selected by the legacy Claude
+// bridge or the separately billed native API adapter.
+const DefaultZAICodexAutomationPolicyName = "zai-codex-workspace-write-v1"
+
 // NativeZAINoToolsPolicyName identifies the separately billed native API lane.
 // The current adapter implements one nonce-bound completion and rejects every
 // provider tool call; this stable name prevents a profile from implying a

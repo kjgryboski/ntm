@@ -129,6 +129,27 @@ func CapabilityMatrix() map[string]OperationCapabilities {
 			LaunchCapacityControl: EvidenceAuthoritative, RequestCapacityControl: EvidenceUnavailable,
 			LiveErrorFeedback: EvidenceUnavailable,
 		},
+		// Z.ai Coding Plan via the official Codex Responses endpoint is the
+		// primary structured Z.ai coding lane. Its potential authority is
+		// realized only after the exact identity has a signed live qualification;
+		// this static declaration is never a local promotion receipt.
+		"zai_codex_runtime": {
+			IdentityEvidence:           IdentityEvidenceProfileAttested,
+			CapacityControlScope:       CapacityControlScopeLocalShared,
+			Launch:                     EvidenceAuthoritative,
+			Delivery:                   EvidenceAuthoritative,
+			Completion:                 EvidenceAuthoritative,
+			CompletionAuthorityScope:   EvidenceAuthorityScopeProvider,
+			Cancellation:               EvidenceAuthoritative,
+			CancellationAuthorityScope: EvidenceAuthorityScopeLocalProcessTree,
+			Resume:                     EvidenceAuthoritative,
+			Cleanup:                    EvidenceAuthoritative,
+			CleanupAuthorityScope:      EvidenceAuthorityScopeLocalProcessTree,
+			IdentityProbeRequired:      true,
+			LaunchCapacityControl:      EvidenceAuthoritative,
+			RequestCapacityControl:     EvidenceAuthoritative,
+			LiveErrorFeedback:          EvidenceUnavailable,
+		},
 		// Native Z.ai API requests emit structured completion, usage, and error
 		// records. Cancellation and resume remain unavailable until their own
 		// authoritative provider receipts exist; local cleanup is submission-only.

@@ -177,6 +177,26 @@ type providerDoctorCapacity struct {
 	CircuitOpenUntil    *time.Time                    `json:"circuit_open_until,omitempty"`
 	TerminalReason      provider.ErrorClass           `json:"terminal_reason,omitempty"`
 	HalfOpenInFlight    bool                          `json:"half_open_in_flight"`
+	// Subscription is populated only for the structured Z.ai Coding Plan
+	// Codex lane. The top-level fields remain that lane's exact-identity
+	// circuit snapshot; this nested view describes the shared plan budget.
+	Subscription *providerDoctorSubscriptionCapacity `json:"subscription,omitempty"`
+}
+
+// providerDoctorSubscriptionCapacity is intentionally limited to non-secret,
+// controller-local estimates. It never serializes endpoint, account alias,
+// credential material, store paths, or raw provider output.
+type providerDoctorSubscriptionCapacity struct {
+	ScopeSHA256          string     `json:"scope_sha256"`
+	FiveHourCreditsUsed  float64    `json:"five_hour_credits_used"`
+	FiveHourCreditsLimit float64    `json:"five_hour_credits_limit"`
+	FiveHourResetsAt     *time.Time `json:"five_hour_resets_at,omitempty"`
+	WeeklyCreditsUsed    float64    `json:"weekly_credits_used"`
+	WeeklyCreditsLimit   float64    `json:"weekly_credits_limit"`
+	WeeklyResetsAt       *time.Time `json:"weekly_resets_at,omitempty"`
+	UnknownUsageReserved bool       `json:"unknown_usage_reserved"`
+	LimitEvidence        string     `json:"limit_evidence,omitempty"`
+	ResetEvidence        string     `json:"reset_evidence,omitempty"`
 }
 
 type providerDoctorReport struct {
@@ -225,16 +245,23 @@ type providerDoctorDependencies struct {
 	// readRequirements securely binds content and metadata to the same open
 	// file descriptor. Production sets it; unit tests may inject the older
 	// readFile/stat pair to exercise report assembly without privileged files.
-	readRequirements     func(string) ([]byte, os.FileInfo, error)
-	inspectGrok          func(context.Context, string, string) (providerGrokInspection, error)
-	probeGrokBypassLock  func(context.Context, string) (providerGrokBypassProbe, error)
-	onlineProbe          func(context.Context, config.ProviderProfileConfig, provider.Identity) (providerDoctorLiveEvidence, error)
-	qualificationStore   func(string, string) (providerqualification.Receipt, string, error)
-	capacityStatus       func() ratelimit.CapacityStatus
-	capacitySnapshot     func(provider.Identity) ratelimit.AdmissionSnapshot
-	credentialStatus     func(context.Context, string) (providercredential.Status, error)
-	attestationPreflight func(context.Context) (providerattestation.SignatureMetadata, error)
-	admission            providerDoctorAdmission
+	readRequirements    func(string) ([]byte, os.FileInfo, error)
+	inspectGrok         func(context.Context, string, string) (providerGrokInspection, error)
+	probeGrokBypassLock func(context.Context, string) (providerGrokBypassProbe, error)
+	onlineProbe         func(context.Context, config.ProviderProfileConfig, provider.Identity) (providerDoctorLiveEvidence, error)
+	qualificationStore  func(string, string) (providerqualification.Receipt, string, error)
+	capacityStatus      func() ratelimit.CapacityStatus
+	capacitySnapshot    func(provider.Identity) ratelimit.AdmissionSnapshot
+	// codexSubscription* are intentionally separate from the generic doctor
+	// admission: Z.ai Codex billing is governed by the same singleton paired
+	// identity/subscription controller used by `provider codex run`.
+	codexSubscriptionStatus   func() ratelimit.CapacityStatus
+	codexSubscriptionSnapshot func(provider.Identity) ratelimit.SubscriptionCapacitySnapshot
+	credentialStatus          func(context.Context, string) (providercredential.Status, error)
+	attestationPreflight      func(context.Context) (providerattestation.SignatureMetadata, error)
+	codexCredentialStatus     func(context.Context, config.ProviderProfileConfig) (providercredential.Status, error)
+	codexAttestationPreflight func(context.Context, config.ProviderProfileConfig) (providerattestation.SignatureMetadata, error)
+	admission                 providerDoctorAdmission
 }
 
 type providerQualificationDependencies struct {
@@ -251,6 +278,7 @@ type providerQualificationDependencies struct {
 
 func defaultProviderDoctorDependencies() providerDoctorDependencies {
 	admission := ratelimit.DefaultAdmissionController()
+	codexAdmission := defaultProviderCodexSubscriptionAdmission()
 	return providerDoctorDependencies{
 		now:                 time.Now,
 		lookPath:            exec.LookPath,
@@ -271,9 +299,25 @@ func defaultProviderDoctorDependencies() providerDoctorDependencies {
 		capacitySnapshot: func(identity provider.Identity) ratelimit.AdmissionSnapshot {
 			return admission.Snapshot(identity)
 		},
+		codexSubscriptionStatus: func() ratelimit.CapacityStatus {
+			return codexAdmission.CapacityStatus()
+		},
+		codexSubscriptionSnapshot: func(identity provider.Identity) ratelimit.SubscriptionCapacitySnapshot {
+			return codexAdmission.Snapshot(identity)
+		},
 		credentialStatus: providerCredentialDeps.store.Status,
 		attestationPreflight: func(ctx context.Context) (providerattestation.SignatureMetadata, error) {
 			return preflightProviderReceiptSignerMetadata(ctx, signProviderReceiptPayload)
+		},
+		codexCredentialStatus: func(ctx context.Context, profile config.ProviderProfileConfig) (providercredential.Status, error) {
+			return zai.CodexCredentialStatus(ctx, profile.CredentialBridgeCommand, profile.CredentialBridgeCommandSHA256, profile.BrokerCredentialID)
+		},
+		codexAttestationPreflight: func(ctx context.Context, profile config.ProviderProfileConfig) (providerattestation.SignatureMetadata, error) {
+			sign, err := providerCodexPinnedSigner(profile)
+			if err != nil {
+				return providerattestation.SignatureMetadata{}, err
+			}
+			return preflightProviderReceiptSignerMetadata(ctx, sign)
 		},
 		admission: admission,
 	}
@@ -300,7 +344,7 @@ func newProviderCmd() *cobra.Command {
 		Use:   "provider",
 		Short: "Inspect and qualify exact AI provider lanes",
 	}
-	cmd.AddCommand(newProviderDoctorCmd(), newProviderQualifyCmd(), newProviderSessionCmd(), newProviderNativeRunCmd(), newProviderVerifyCmd(), newProviderCredentialCmd(), newProviderAttestationCmd(), newProviderCapabilitiesCmd(), newProviderPolicyCmd(), newProviderTelemetryCmd())
+	cmd.AddCommand(newProviderDoctorCmd(), newProviderQualifyCmd(), newProviderSessionCmd(), newProviderNativeRunCmd(), newProviderCodexCmd(), newProviderVerifyCmd(), newProviderCredentialCmd(), newProviderAttestationCmd(), newProviderCapabilitiesCmd(), newProviderPolicyCmd(), newProviderTelemetryCmd())
 	return cmd
 }
 
@@ -359,6 +403,9 @@ func runProviderQualification(cmd *cobra.Command, opts providerQualificationOpti
 	}
 	if transport == "zai_native_api" {
 		return runProviderNativeQualification(cmd, opts, profile, identity, providerNativeQualificationDeps)
+	}
+	if transport == "zai_codex_runtime" {
+		return runProviderCodexQualification(cmd, opts, profile, identity, providerCodexQualificationDeps)
 	}
 	if transport != "zai_claude_runtime" {
 		return errors.New("the live qualification suite accepts only exact Z.ai Coding Plan or native API profiles")
@@ -770,14 +817,27 @@ func buildProviderDoctorReport(ctx context.Context, cfg *config.Config, opts pro
 	authCheck := diagnoseProviderAuthPresence(identity, deps.lookupEnv)
 	if identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI {
 		authCheck = diagnoseNativeProviderCredential(ctx, identity, deps.credentialStatus)
+	} else if identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementCodexResponses {
+		authCheck = diagnoseCodexProviderCredential(ctx, profile, deps.codexCredentialStatus)
 	}
 	report.Checks = append(report.Checks, authCheck)
-	report.Checks = append(report.Checks, diagnoseProviderReceiptAttestation(ctx, deps.attestationPreflight))
+	attestationPreflight := deps.attestationPreflight
+	if identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementCodexResponses {
+		attestationPreflight = func(ctx context.Context) (providerattestation.SignatureMetadata, error) {
+			if deps.codexAttestationPreflight == nil {
+				return providerattestation.SignatureMetadata{}, providerattestation.ErrProtectionUnavailable
+			}
+			return deps.codexAttestationPreflight(ctx, profile)
+		}
+	}
+	report.Checks = append(report.Checks, diagnoseProviderReceiptAttestation(ctx, attestationPreflight))
 	report.Capacity, report.Checks = diagnoseProviderCapacity(identity, deps, report.Checks)
 
 	if opts.online {
 		var probePreflightErr error
 		switch {
+		case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementCodexResponses:
+			probePreflightErr = errors.New("Z.ai Codex online doctor probes are disabled; use provider codex run or provider qualify so subscription admission, the durable no-replay ledger, signed receipts, and usage reconciliation remain mandatory")
 		case deps.onlineProbe == nil || deps.admission == nil:
 			probePreflightErr = errors.New("online provider probe dependencies are incomplete")
 		case executionAuthorityErr != nil:
@@ -812,7 +872,11 @@ func buildProviderDoctorReport(ctx context.Context, cfg *config.Config, opts pro
 			}
 		}
 	} else {
-		report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorUnavailable, Provenance: "offline", Summary: "model entitlement was not probed", Remediation: "Run provider doctor with --online for a bounded no-tool probe"})
+		remediation := "Run provider doctor with --online for a bounded no-tool probe"
+		if identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementCodexResponses {
+			remediation = "Use provider codex run or provider qualify; Codex online doctor dispatch is disabled so every paid request stays admission-controlled and receipted"
+		}
+		report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorUnavailable, Provenance: "offline", Summary: "model entitlement was not probed", Remediation: remediation})
 	}
 
 	qualificationPolicySHA := report.Policy.SHA256
@@ -838,6 +902,8 @@ func diagnoseProviderPolicy(ctx context.Context, inspectionCWD string, profile c
 	result := providerDoctorPolicy{Name: profile.AutomationPolicy, ManagedRequirementsState: "not_applicable", RuntimeInspectionState: "not_applicable", BypassLockProbeState: "not_applicable"}
 	if identity.Provider() != "xai" {
 		switch {
+		case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementCodexResponses:
+			result.SHA256 = providerCodexPolicySHA256()
 		case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI && profile.AutomationPolicy == provider.NativeZAIToolsPolicyName:
 			result.SHA256 = providerNativeToolsPolicySHA256()
 		case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI:
@@ -1068,6 +1134,20 @@ func diagnoseNativeProviderCredential(ctx context.Context, identity provider.Ide
 	return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorPass, Provenance: "os_credential_broker", Summary: "exact native API credential is present in OS-protected storage", Evidence: digestSafeJSON(status)}
 }
 
+func diagnoseCodexProviderCredential(ctx context.Context, profile config.ProviderProfileConfig, statusFn func(context.Context, config.ProviderProfileConfig) (providercredential.Status, error)) providerDoctorCheck {
+	if statusFn == nil {
+		return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorFail, Provenance: "os_credential_broker", Summary: "Z.ai Coding Plan credential status is unavailable", Remediation: "Provision the exact isolated profile with ntm provider credential set --stdin"}
+	}
+	status, err := statusFn(ctx, profile)
+	if err != nil || !status.Available {
+		return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorFail, Provenance: "os_credential_broker", Summary: "pinned Z.ai Coding Plan credential bridge is unavailable", Evidence: safeErrorDigest(err), Remediation: "Repair the profile-pinned bridge before provisioning or using the Coding Plan token"}
+	}
+	if !status.Present || status.Evidence != providercredential.EvidenceOSProtectedProcessReadable {
+		return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorFail, Provenance: "os_credential_broker", Summary: "exact Z.ai Coding Plan credential is absent or insufficiently protected", Evidence: digestSafeJSON(status), Remediation: "Provision the Individual GLM Coding Plan key with ntm provider credential set --profile=<exact-profile> --stdin"}
+	}
+	return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorPass, Provenance: "os_credential_broker", Summary: "exact Z.ai Coding Plan credential is present in OS-protected storage", Evidence: digestSafeJSON(status)}
+}
+
 func diagnoseProviderReceiptAttestation(ctx context.Context, preflight func(context.Context) (providerattestation.SignatureMetadata, error)) providerDoctorCheck {
 	if preflight == nil {
 		return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorFail, Provenance: "local_attestation", Summary: "provider receipt signing preflight is unavailable", Remediation: "Run ntm provider attestation init on a supported local attestation backend"}
@@ -1087,7 +1167,7 @@ func diagnoseProviderReceiptAttestation(ctx context.Context, preflight func(cont
 
 func diagnoseQualification(identity provider.Identity, transport, policySHA string, opts providerCommandOptions, deps providerDoctorDependencies, checks []providerDoctorCheck) (providerDoctorQualification, []providerDoctorCheck) {
 	result := providerDoctorQualification{State: "missing", PolicySHA256: policySHA}
-	qualificationRequired := transport == "zai_claude_runtime" || transport == "zai_native_api" && policySHA == providerNativeToolsPolicySHA256()
+	qualificationRequired := transport == "zai_claude_runtime" || transport == "zai_codex_runtime" || transport == "zai_native_api" && policySHA == providerNativeToolsPolicySHA256()
 	if !qualificationRequired {
 		result.State = "not_required"
 		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorPass, Provenance: "capability_registry", Summary: "the nine-check coding qualification is not applicable to this no-tool/provider-native transport; online identity and capability-specific gates still apply"})
@@ -1132,13 +1212,39 @@ func diagnoseQualification(identity provider.Identity, transport, policySHA stri
 }
 
 func diagnoseProviderCapacity(identity provider.Identity, deps providerDoctorDependencies, checks []providerDoctorCheck) (providerDoctorCapacity, []providerDoctorCheck) {
-	status := deps.capacityStatus()
-	snapshot := deps.capacitySnapshot(identity)
+	var status ratelimit.CapacityStatus
+	var snapshot ratelimit.AdmissionSnapshot
+	var subscription *providerDoctorSubscriptionCapacity
+	if identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementCodexResponses {
+		if deps.codexSubscriptionStatus == nil || deps.codexSubscriptionSnapshot == nil {
+			result := providerDoctorCapacity{Scope: provider.CapacityControlScopeProcessLocal, CircuitState: "unknown", FallbackReason: "Z.ai Codex subscription capacity dependencies are unavailable"}
+			checks = append(checks, providerDoctorCheck{ID: "capacity", Status: providerDoctorFail, Provenance: "compiled", Summary: "Z.ai Codex subscription capacity snapshot is unavailable", Remediation: "Restore the paired local shared Z.ai Coding Plan admission controller"})
+			return result, checks
+		}
+		status = deps.codexSubscriptionStatus()
+		codexSnapshot := deps.codexSubscriptionSnapshot(identity)
+		snapshot = codexSnapshot.Exact
+		subscription = &providerDoctorSubscriptionCapacity{
+			ScopeSHA256:          codexSnapshot.SubscriptionScopeSHA256,
+			FiveHourCreditsUsed:  codexSnapshot.FiveHourCreditsUsed,
+			FiveHourCreditsLimit: codexSnapshot.FiveHourCreditsLimit,
+			FiveHourResetsAt:     codexSnapshot.FiveHourResetsAt,
+			WeeklyCreditsUsed:    codexSnapshot.WeeklyCreditsUsed,
+			WeeklyCreditsLimit:   codexSnapshot.WeeklyCreditsLimit,
+			WeeklyResetsAt:       codexSnapshot.WeeklyResetsAt,
+			UnknownUsageReserved: codexSnapshot.UnknownUsageReserved,
+			LimitEvidence:        codexSnapshot.LimitEvidence,
+			ResetEvidence:        codexSnapshot.ResetEvidence,
+		}
+	} else {
+		status = deps.capacityStatus()
+		snapshot = deps.capacitySnapshot(identity)
+	}
 	result := providerDoctorCapacity{
 		Scope: status.Scope, FallbackReason: status.FallbackReason, CircuitState: "closed",
 		Running: snapshot.Running, Tokens: snapshot.Tokens, ConsecutiveFailures: snapshot.ConsecutiveFailures,
 		NextRetry: snapshot.NextRetry, CircuitOpenUntil: snapshot.CircuitOpenUntil, TerminalReason: snapshot.TerminalReason,
-		HalfOpenInFlight: snapshot.HalfOpenInFlight,
+		HalfOpenInFlight: snapshot.HalfOpenInFlight, Subscription: subscription,
 	}
 	if status.SharedStorePath != "" {
 		result.StoreSHA256 = sha256StringCLI(filepath.Clean(status.SharedStorePath))
@@ -1221,6 +1327,8 @@ func providerTransportForIdentity(identity provider.Identity) (string, error) {
 		return "xai_acp", nil
 	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementClaudeCompat:
 		return "zai_claude_runtime", nil
+	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementCodexResponses:
+		return "zai_codex_runtime", nil
 	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI:
 		return "zai_native_api", nil
 	default:
@@ -1259,6 +1367,8 @@ func runProviderDoctorOnlineProbe(ctx context.Context, profile config.ProviderPr
 			return providerDoctorLiveEvidence{SHA256: digest}, probeErr
 		}
 		return providerDoctorLiveEvidence{ModelVerified: receipt.ModelSessionEvidence && receipt.Model == identity.Model(), AuthVerified: receipt.ModelSessionEvidence, SHA256: digest}, nil
+	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementCodexResponses:
+		return providerDoctorLiveEvidence{}, errors.New("Z.ai Codex online doctor dispatch is disabled; use provider codex run or provider qualify for admission-controlled, durable, signed execution")
 	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI:
 		keyBytes, credentialErr := providerCredentialDeps.store.Get(ctx, providerCredentialID(identity))
 		if credentialErr != nil || len(keyBytes) == 0 {

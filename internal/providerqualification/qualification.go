@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -133,17 +134,26 @@ type Invocation struct {
 	Binary      string
 	Args, Env   []string
 	Dir         string
+	Stdin       []byte
 	OutputLimit int
 }
 
 // Outcome is deliberately an in-memory transport result. Implementations must
-// set ProcessTreeTerminated only after an authoritative local cancellation and
-// residual-process check; callers otherwise fail closed.
+// set ProcessTreeTerminated only after an authoritative local residual-process
+// check following normal completion or cancellation; callers otherwise fail
+// closed.
 type Outcome struct {
 	Stdout, Stderr        []byte
 	ExitCode              int
+	ProcessStarted        bool
 	ProcessTreeTerminated bool
 	ResidualProcessIDs    []int
+	// ResidualCheckPerformed distinguishes an observed empty process set from
+	// the default zero value on an ordinary exit where no descendant scan ran.
+	ResidualCheckPerformed bool
+	// OutputTruncated is explicit so callers never parse a prefix as if it were
+	// a complete provider event stream.
+	OutputTruncated bool
 }
 
 // Runner is injectable so unit tests can test receipt rules without pretending
@@ -152,59 +162,152 @@ type Runner interface {
 	Run(context.Context, Invocation) (Outcome, error)
 }
 
-// LocalRunner is the real process runner. For a context-cancelled child, a
-// completed Wait plus no known residual child is authoritative for that local
-// process. It makes no claim about provider-side session cancellation.
+// LocalRunner is the real process runner. It continuously samples the local
+// descendant tree while the child is alive, terminates every observed process
+// after normal exit or cancellation, and records the resulting observed-tree
+// residual set. It makes no claim about provider-side session cancellation or
+// a process that escaped the tree before any local observation.
 type LocalRunner struct{}
 
 func (LocalRunner) Run(ctx context.Context, in Invocation) (Outcome, error) {
 	cmd := exec.Command(in.Binary, in.Args...)
 	cmd.Dir, cmd.Env = in.Dir, in.Env
+	if len(in.Stdin) > 0 {
+		cmd.Stdin = bytes.NewReader(in.Stdin)
+	}
 	stdout, stderr := &limitedBuffer{limit: in.OutputLimit}, &limitedBuffer{limit: in.OutputLimit}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	if err := cmd.Start(); err != nil {
 		return Outcome{ExitCode: -1}, err
 	}
+	observer := startObservedProcessTree(cmd.Process.Pid)
 	wait := make(chan error, 1)
 	go func() { wait <- cmd.Wait() }()
 	var err error
-	out := Outcome{}
+	out := Outcome{ProcessStarted: true}
 	select {
 	case err = <-wait:
+		processes, observed := observer.stopAndSnapshot()
+		terminateErr := terminateObservedTree(processes)
+		out.ResidualProcessIDs = waitForObservedProcessExit(processes, 250*time.Millisecond)
+		out.ResidualCheckPerformed = observed
+		out.ProcessTreeTerminated = observed && terminateErr == nil && len(out.ResidualProcessIDs) == 0 && cmd.ProcessState != nil && cmd.ProcessState.Exited()
 	case <-ctx.Done():
-		ids, snapshotErr := processTree(cmd.Process.Pid)
-		terminateErr := terminateTree(ids)
+		processes, observed := observer.stopAndSnapshot()
+		terminateErr := terminateObservedTree(processes)
 		select {
 		case err = <-wait:
 		case <-time.After(5 * time.Second):
 			err = errors.New("process-tree termination wait timed out")
 		}
-		out.ResidualProcessIDs = residualProcesses(ids)
-		out.ProcessTreeTerminated = snapshotErr == nil && terminateErr == nil && len(out.ResidualProcessIDs) == 0 && cmd.ProcessState != nil && cmd.ProcessState.Exited()
+		out.ResidualProcessIDs = waitForObservedProcessExit(processes, 250*time.Millisecond)
+		out.ResidualCheckPerformed = observed
+		out.ProcessTreeTerminated = observed && terminateErr == nil && len(out.ResidualProcessIDs) == 0 && cmd.ProcessState != nil && cmd.ProcessState.Exited()
 		if err == nil {
 			err = ctx.Err()
 		}
 	}
 	out.Stdout, out.Stderr, out.ExitCode = stdout.Bytes(), stderr.Bytes(), exitCode(err)
 	if stdout.exceeded || stderr.exceeded {
+		out.OutputTruncated = true
 		return out, errors.New("qualification output limit exceeded")
 	}
 	return out, err
 }
 
-func processTree(pid int) ([]int32, error) {
+type observedProcessTree struct {
+	root      int32
+	mu        sync.Mutex
+	processes map[int32]observedProcess
+	observed  bool
+	stop      chan struct{}
+	done      chan struct{}
+}
+
+// observedProcess binds a PID to the creation time observed from the OS. PID
+// values are reusable: never signal, or report a residual for, a PID unless it
+// still names the process observed in this local tree.
+type observedProcess struct {
+	pid       int32
+	createdAt int64
+}
+
+func startObservedProcessTree(root int) *observedProcessTree {
+	observer := &observedProcessTree{root: int32(root), processes: make(map[int32]observedProcess), stop: make(chan struct{}), done: make(chan struct{})}
+	// Retain the root only when its creation time can be bound. If that proof is
+	// unavailable, later cleanup remains explicitly unverified rather than
+	// risking a signal to a recycled PID.
+	if observed, err := observeProcess(int32(root)); err == nil {
+		observer.processes[observed.pid] = observed
+	}
+	observer.scan()
+	go func() {
+		defer close(observer.done)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				observer.scan()
+			case <-observer.stop:
+				return
+			}
+		}
+	}()
+	return observer
+}
+
+func (o *observedProcessTree) scan() {
+	processes, err := processTree(int(o.root))
+	if err != nil {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.observed = true
+	for _, observed := range processes {
+		o.processes[observed.pid] = observed
+	}
+}
+
+func (o *observedProcessTree) stopAndSnapshot() ([]observedProcess, bool) {
+	close(o.stop)
+	<-o.done
+	o.scan()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	processes := make([]observedProcess, 0, len(o.processes))
+	for pid, observed := range o.processes {
+		if pid != o.root {
+			processes = append(processes, observed)
+		}
+	}
+	sort.Slice(processes, func(i, j int) bool { return processes[i].pid < processes[j].pid })
+	// Kill the observed root last so it cannot intentionally leave a child
+	// behind between descendant termination and its own exit.
+	if root, ok := o.processes[o.root]; ok {
+		processes = append(processes, root)
+	}
+	return processes, o.observed
+}
+
+func processTree(pid int) ([]observedProcess, error) {
 	root, err := process.NewProcess(int32(pid))
 	if err != nil {
 		return nil, err
 	}
 	seen := map[int32]bool{}
-	var ids []int32
+	var processes []observedProcess
 	var visit func(*process.Process) error
 	visit = func(p *process.Process) error {
 		if seen[p.Pid] {
 			return nil
 		}
 		seen[p.Pid] = true
+		observed, err := observeProcess(p.Pid)
+		if err != nil {
+			return err
+		}
 		children, err := p.Children()
 		if err != nil {
 			return err
@@ -217,23 +320,87 @@ func processTree(pid int) ([]int32, error) {
 		// Postorder guarantees that termination visits each observed child before
 		// its observed parent. It is an observed-tree receipt, not a claim about
 		// processes which escaped the tree before the snapshot.
-		ids = append(ids, p.Pid)
+		processes = append(processes, observed)
 		return nil
 	}
 	if err := visit(root); err != nil {
 		return nil, err
 	}
-	return ids, nil
+	return processes, nil
 }
-func terminateTree(ids []int32) error {
+
+func observeProcess(pid int32) (observedProcess, error) {
+	p, err := process.NewProcess(pid)
+	if err != nil {
+		return observedProcess{}, err
+	}
+	createdAt, err := p.CreateTime()
+	if err != nil || createdAt <= 0 {
+		return observedProcess{}, errors.New("process creation time is unavailable")
+	}
+	return observedProcess{pid: pid, createdAt: createdAt}, nil
+}
+
+// observedProcessStatus reports whether the exact observed process is live.
+// A zombie is terminated for cleanup purposes. A mismatched creation time
+// denotes a recycled PID, which is conclusively not this observed process.
+func observedProcessStatus(observed observedProcess) (live, conclusive bool) {
+	exists, err := process.PidExists(observed.pid)
+	if err != nil {
+		return false, false
+	}
+	if !exists {
+		return false, true
+	}
+	p, err := process.NewProcess(observed.pid)
+	if err != nil {
+		return false, false
+	}
+	createdAt, err := p.CreateTime()
+	if err != nil || createdAt <= 0 {
+		return false, false
+	}
+	if createdAt != observed.createdAt {
+		return false, true
+	}
+	if statuses, err := p.Status(); err == nil && hasTerminatedProcessStatus(statuses) {
+		return false, true
+	}
+	running, err := p.IsRunning()
+	if err != nil {
+		return false, false
+	}
+	return running, true
+}
+
+func hasTerminatedProcessStatus(statuses []string) bool {
+	for _, status := range statuses {
+		if status == "Z" || strings.EqualFold(status, "zombie") {
+			return true
+		}
+	}
+	return false
+}
+
+func terminateObservedTree(processes []observedProcess) error {
 	var first error
-	// IDs are in postorder: observed descendants precede their parent.
-	for _, id := range ids {
-		p, err := process.NewProcess(id)
-		if err != nil {
+	// Observed descendants precede their root. Bind PID and creation time before
+	// every signal so a PID reuse race cannot kill an unrelated process.
+	for _, observed := range processes {
+		running, conclusive := observedProcessStatus(observed)
+		if !conclusive || !running {
 			continue
 		}
-		if running, err := p.IsRunning(); err != nil || !running {
+		p, err := process.NewProcess(observed.pid)
+		if err != nil {
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		// Revalidate at the final possible point before Kill.
+		running, conclusive = observedProcessStatus(observed)
+		if !conclusive || !running {
 			continue
 		}
 		if err := p.Kill(); err != nil && first == nil {
@@ -242,22 +409,32 @@ func terminateTree(ids []int32) error {
 	}
 	return first
 }
-func residualProcesses(ids []int32) []int {
+func residualObservedProcesses(processes []observedProcess) []int {
 	var residuals []int
-	for _, id := range ids {
-		p, err := process.NewProcess(id)
-		if err != nil {
-			// We could not distinguish an exited PID from an inaccessible one, so
-			// leave the check unverified rather than silently accepting cleanup.
-			residuals = append(residuals, int(id))
-			continue
-		}
-		running, err := p.IsRunning()
-		if err != nil || running {
-			residuals = append(residuals, int(id))
+	for _, observed := range processes {
+		running, conclusive := observedProcessStatus(observed)
+		if !conclusive || running {
+			// Unknown access remains unverified; zombies and recycled PIDs are
+			// conclusively terminated/not-this-process respectively.
+			residuals = append(residuals, int(observed.pid))
 		}
 	}
+	sort.Ints(residuals)
 	return residuals
+}
+
+// waitForObservedProcessExit gives a killed child a short, bounded chance to
+// transition through its kernel zombie state and be reaped. It never broadens
+// the observed tree and reports any still-live or uninspectable observed PID.
+func waitForObservedProcessExit(processes []observedProcess, limit time.Duration) []int {
+	deadline := time.Now().Add(limit)
+	for {
+		residuals := residualObservedProcesses(processes)
+		if len(residuals) == 0 || !time.Now().Before(deadline) {
+			return residuals
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // Run executes the qualification. It creates a new disposable repository but

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
+	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/providertelemetry"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
@@ -669,6 +671,94 @@ func providerTestDeps(t *testing.T, now time.Time, receipt providerqualification
 			return providerattestation.SignatureMetadata{KeyMetadata: providerattestation.KeyMetadata{Algorithm: providerattestation.AlgorithmEd25519, ProtectionEvidence: providerattestation.ProtectionOSProcessRead}}, nil
 		},
 		admission: admission,
+	}
+}
+
+func TestProviderDoctorCodexCapacityUsesSubscriptionControllerSnapshot(t *testing.T) {
+	root := t.TempDir()
+	profile := providerCodexProfile(root)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 2, 15, 0, 0, 0, time.UTC)
+	fiveReset, weeklyReset := now.Add(5*time.Hour), now.Add(7*24*time.Hour)
+	deps := providerDoctorDependencies{
+		now: func() time.Time { return now },
+		codexSubscriptionStatus: func() ratelimit.CapacityStatus {
+			return ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared, SharedStorePath: "/redacted/zai-coding-plan-capacity.json"}
+		},
+		codexSubscriptionSnapshot: func(got provider.Identity) ratelimit.SubscriptionCapacitySnapshot {
+			if got.Hash() != identity.Hash() {
+				t.Fatalf("snapshot identity=%s want %s", got.Hash(), identity.Hash())
+			}
+			return ratelimit.SubscriptionCapacitySnapshot{
+				IdentityHash: identity.Hash(), SubscriptionScopeSHA256: strings.Repeat("b", 64),
+				Exact:               ratelimit.AdmissionSnapshot{IdentityHash: identity.Hash(), Scope: provider.CapacityControlScopeLocalShared, Tokens: 0.5, Running: 1, ConsecutiveFailures: 2},
+				FiveHourCreditsUsed: 1999.5, FiveHourCreditsLimit: 2000, FiveHourResetsAt: &fiveReset,
+				WeeklyCreditsUsed: 10000, WeeklyCreditsLimit: 10000, WeeklyResetsAt: &weeklyReset,
+				UnknownUsageReserved: true, LimitEvidence: "documented_zai_lite_floor_controller_local_estimate", ResetEvidence: "controller_local_rolling_window_estimate",
+			}
+		},
+	}
+	capacity, checks := diagnoseProviderCapacity(identity, deps, nil)
+	if capacity.Subscription == nil || capacity.Subscription.ScopeSHA256 != strings.Repeat("b", 64) || capacity.Subscription.FiveHourCreditsUsed != 1999.5 || capacity.Subscription.WeeklyCreditsLimit != 10000 || !capacity.Subscription.UnknownUsageReserved || capacity.Subscription.FiveHourResetsAt == nil || !capacity.Subscription.FiveHourResetsAt.Equal(fiveReset) || capacity.Running != 1 || capacity.Tokens != 0.5 || capacity.ConsecutiveFailures != 2 {
+		t.Fatalf("capacity=%+v", capacity)
+	}
+	if len(checks) != 1 || checks[0].ID != "capacity" || checks[0].Status != providerDoctorPass {
+		t.Fatalf("capacity checks=%+v", checks)
+	}
+	encoded := string(mustJSON(t, capacity))
+	for _, forbidden := range []string{"kevin", "api.z.ai", "ntm.zai.coding_plan"} {
+		if strings.Contains(encoded, forbidden) {
+			t.Fatalf("subscription capacity leaked %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestProviderDoctorNeverDispatchesCodexOnlineProbeOutsideRunLane(t *testing.T) {
+	root := t.TempDir()
+	profile := providerCodexProfile(root)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeCalls := 0
+	admission := &providerSessionAdmissionFake{decision: ratelimit.Decision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	deps := providerDoctorDependencies{
+		now:      time.Now,
+		lookPath: func(string) (string, error) { return profile.Command, nil },
+		version:  func(context.Context, string) (string, error) { return "codex-cli 0.149.0", nil },
+		lookupEnv: func(string) (string, bool) {
+			return "", false
+		},
+		onlineProbe: func(context.Context, config.ProviderProfileConfig, provider.Identity) (providerDoctorLiveEvidence, error) {
+			probeCalls++
+			return providerDoctorLiveEvidence{ModelVerified: true, AuthVerified: true}, nil
+		},
+		qualificationStore: func(string, string) (providerqualification.Receipt, string, error) {
+			return providerqualification.Receipt{}, "", fs.ErrNotExist
+		},
+		codexSubscriptionStatus: func() ratelimit.CapacityStatus {
+			return ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared, SharedStorePath: filepath.Join(root, "capacity.json")}
+		},
+		codexSubscriptionSnapshot: func(provider.Identity) ratelimit.SubscriptionCapacitySnapshot {
+			return ratelimit.SubscriptionCapacitySnapshot{Exact: ratelimit.AdmissionSnapshot{IdentityHash: identity.Hash(), Scope: provider.CapacityControlScopeLocalShared}}
+		},
+		codexCredentialStatus: func(context.Context, config.ProviderProfileConfig) (providercredential.Status, error) {
+			return providercredential.Status{Available: true, Present: true, Evidence: providercredential.EvidenceOSProtectedProcessReadable}, nil
+		},
+		codexAttestationPreflight: func(context.Context, config.ProviderProfileConfig) (providerattestation.SignatureMetadata, error) {
+			return providerattestation.SignatureMetadata{KeyMetadata: providerattestation.KeyMetadata{Algorithm: providerattestation.AlgorithmEd25519, ProtectionEvidence: providerattestation.ProtectionOSProcessRead}}, nil
+		},
+		admission: admission,
+	}
+	report, err := buildProviderDoctorReport(context.Background(), &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{"zai-codex": profile}}, providerCommandOptions{profile: "zai-codex", online: true, timeout: time.Second, qualificationAge: time.Hour}, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probeCalls != 0 || admission.acquires != 0 || report.Readiness != providerReadinessNoGo || checkStatus(report.Checks, "model_entitlement") != providerDoctorFail {
+		t.Fatalf("unsafe Codex doctor dispatch: calls=%d admission=%+v report=%+v", probeCalls, admission, report)
 	}
 }
 

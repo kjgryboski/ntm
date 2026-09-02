@@ -29,12 +29,22 @@ func TestGetProviderConformanceRunsSyntheticHarnessWithoutCoordinationStores(t *
 			CredentialClass: provider.CredentialClassAPIKey, BillingClass: provider.BillingClassAPIUsage, Entitlement: provider.EntitlementNativeAPI,
 			AutomationPolicy: provider.NativeZAINoToolsPolicyName, ExactTargetOnly: true, ProbeRequired: true,
 		},
+		"zai-codex": {
+			Provider: "zai", AccountAlias: "coding-plan", Model: "glm-5.3", Endpoint: "https://api.z.ai/api/v1",
+			Runtime: "codex", RuntimeVersion: "0.149.0", ConfigSHA256: strings.Repeat("e", 64), Command: "/usr/bin/codex", RuntimeHome: "/tmp/zai-codex",
+			CredentialClass: provider.CredentialClassCodingPlan, BillingClass: provider.BillingClassCodingPlan, Entitlement: provider.EntitlementCodexResponses,
+			AutomationPolicy: provider.DefaultZAICodexAutomationPolicyName, ExactTargetOnly: true, ProbeRequired: true,
+			BrokerCredentialID: "ntm.zai.coding_plan.test-account",
+			RuntimeSHA256:      strings.Repeat("f", 64), BrokerCommand: "/usr/bin/caam", BrokerCommandSHA256: strings.Repeat("1", 64),
+			CredentialBridgeCommand: "/usr/bin/ntm-provider-bridge", CredentialBridgeCommandSHA256: strings.Repeat("2", 64),
+		},
 	}}
 	for _, test := range []struct{ profile, transport string }{
 		{"xai-primary", "xai_acp"},
 		{"xai-primary", "xai_headless_session"},
 		{"xai-primary", "xai_grok_tui"},
 		{"zai-primary", "zai_claude_runtime"},
+		{"zai-codex", "zai_codex_runtime"},
 		{"zai-native", "zai_native_api"},
 	} {
 		out, err := GetProviderConformance(t.Context(), cfg, test.profile, test.transport)

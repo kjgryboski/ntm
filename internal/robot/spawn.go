@@ -322,6 +322,9 @@ func spawnLifecycleDeps(custom *SpawnLifecycleDependencies) SpawnLifecycleDepend
 		ProbeZAI: func(ctx context.Context, profile config.ProviderProfileConfig, identity provider.Identity) (zaipkg.Receipt, error) {
 			probeCtx, cancel := context.WithTimeout(ctx, zaipkg.DefaultProbeTimeout)
 			defer cancel()
+			if identity.Entitlement() == provider.EntitlementCodexResponses {
+				return zaipkg.CodexProbe(probeCtx, profile.Command, identity.Endpoint(), identity.Model(), profile.RuntimeHome)
+			}
 			return zaipkg.Probe(probeCtx, zaipkg.ProbeSpec{Binary: profile.Command, Endpoint: identity.Endpoint(), Model: identity.Model()})
 		},
 		WaitForReady:        waitForAgentsReady,
@@ -483,8 +486,11 @@ func resolveZAISpawnProfile(opts SpawnOptions, cfg *config.Config) (config.Provi
 	if identity.Provider() != "zai" {
 		return config.ProviderProfileConfig{}, provider.Identity{}, fmt.Errorf("provider profile %q is %q, but --spawn-zai only accepts provider = \"zai\"", opts.ZAIProviderProfile, identity.Provider())
 	}
+	if identity.Entitlement() == provider.EntitlementCodexResponses && identity.Runtime() == "codex" {
+		return config.ProviderProfileConfig{}, provider.Identity{}, errors.New("--spawn-zai is the secondary Claude-compatible pane lane; the primary Z.ai Codex lane is invoked through provider codex commands and requires signed live qualification")
+	}
 	if identity.Entitlement() != provider.EntitlementClaudeCompat || identity.Runtime() != "claude-code" {
-		return config.ProviderProfileConfig{}, provider.Identity{}, fmt.Errorf("provider profile %q is not the Z.ai Claude-compatible Coding Plan pane lane", opts.ZAIProviderProfile)
+		return config.ProviderProfileConfig{}, provider.Identity{}, fmt.Errorf("provider profile %q is not the supported secondary Z.ai Claude-compatible Coding Plan pane lane", opts.ZAIProviderProfile)
 	}
 	if !profile.ExactTargetOnly {
 		return config.ProviderProfileConfig{}, provider.Identity{}, fmt.Errorf("provider profile %q must require exact targeting", opts.ZAIProviderProfile)
@@ -496,6 +502,9 @@ func resolveZAISpawnProfile(opts SpawnOptions, cfg *config.Config) (config.Provi
 }
 
 func restrictedZAILaunchCommand(profile config.ProviderProfileConfig, identity provider.Identity) (string, error) {
+	if identity.Entitlement() == provider.EntitlementCodexResponses && identity.Runtime() == "codex" {
+		return zaipkg.RestrictedCodexLaunchCommand(profile.Command, identity.Endpoint(), identity.Model(), profile.RuntimeHome)
+	}
 	return zaipkg.RestrictedLaunchCommand(profile.Command, identity.Endpoint(), identity.Model())
 }
 

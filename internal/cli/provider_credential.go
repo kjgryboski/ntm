@@ -108,7 +108,10 @@ func runProviderCredential(cmd *cobra.Command, action string, opts providerCrede
 	if err != nil {
 		return err
 	}
-	id := providerCredentialID(identity)
+	id, err := providerCredentialIDForProfile(profile, identity)
+	if err != nil {
+		return err
+	}
 	ctx := providerCommandContext(cmd)
 	output := providerCredentialOutput{
 		SchemaVersion: providerCredentialOutputSchema, Profile: opts.profile, IdentitySHA256: identity.Hash(),
@@ -170,6 +173,21 @@ func runProviderCredential(cmd *cobra.Command, action string, opts providerCrede
 
 func providerCredentialID(identity provider.Identity) string {
 	return providercredential.CanonicalID(identity)
+}
+
+// providerCredentialIDForProfile preserves the canonical native-API key
+// namespace while requiring the explicitly configured opaque broker ID for
+// Coding Plan Codex. This prevents a plan token from being written to, or read
+// from, a native API identity slot.
+func providerCredentialIDForProfile(profile config.ProviderProfileConfig, identity provider.Identity) (string, error) {
+	if identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementCodexResponses {
+		id := strings.TrimSpace(profile.BrokerCredentialID)
+		if id == "" {
+			return "", errors.New("Z.ai Coding Plan Codex profile requires broker_credential_id")
+		}
+		return id, nil
+	}
+	return providerCredentialID(identity), nil
 }
 
 func trimOneLineEnding(value []byte) []byte {

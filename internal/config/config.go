@@ -776,16 +776,37 @@ type ProviderProfileConfig struct {
 	// Command is exactly one executable reference (for example "claude" or an
 	// absolute path). NTM compiles every Z.ai endpoint/model/policy argument;
 	// profile-owned shell fragments are never executed.
-	Command          string `toml:"command"`
-	AutomationPolicy string `toml:"automation_policy"`
-	ExactTargetOnly  bool   `toml:"exact_target_only"`
-	ProbeRequired    bool   `toml:"probe_required"`
+	Command string `toml:"command"`
+	// RuntimeSHA256 pins the exact Codex executable for codex_responses. The
+	// runtime version string alone is not content identity.
+	RuntimeSHA256 string `toml:"runtime_sha256"`
+	// BrokerCommand is the exact CAAM executable that resolves the profile-bound
+	// OS credential reference. Its stdout is consumed only in memory immediately
+	// before exec; BrokerCommandSHA256 prevents a path-only substitution.
+	BrokerCommand       string `toml:"broker_command"`
+	BrokerCommandSHA256 string `toml:"broker_command_sha256"`
+	// CredentialBridgeCommand is the exact OS-protected credential/signing
+	// bridge invoked by the pinned broker. It is supplied by NTM rather than
+	// trusted from ambient environment state.
+	CredentialBridgeCommand       string `toml:"credential_bridge_command"`
+	CredentialBridgeCommandSHA256 string `toml:"credential_bridge_command_sha256"`
+	AutomationPolicy              string `toml:"automation_policy"`
+	ExactTargetOnly               bool   `toml:"exact_target_only"`
+	ProbeRequired                 bool   `toml:"probe_required"`
 	// ModelProbeState is historical, operator-recorded diagnostic metadata.
 	// It never authorizes launch or proves provider/model availability.
 	ModelProbeState string `toml:"model_probe_state"`
 	// ModelProbeReceiptSHA256 identifies a separately reviewed historical
 	// diagnostic receipt. Production Z.ai spawn always performs a fresh probe.
 	ModelProbeReceiptSHA256 string `toml:"model_probe_receipt_sha256"`
+	// RuntimeHome is the dedicated, provider-owned CODEX_HOME for the Z.ai
+	// Coding Plan Codex runtime. It is a local path, never a credential, and
+	// its reviewed contents are bound by ConfigSHA256.
+	RuntimeHome string `toml:"runtime_home"`
+	// BrokerCredentialID is an opaque, separately provisioned current-user OS
+	// broker key for the Z.ai Coding Plan Codex Responses lane. It is never an
+	// API token and must not be used by native API profiles.
+	BrokerCredentialID string `toml:"broker_credential_id"`
 }
 
 func init() {
@@ -867,15 +888,57 @@ func validateProviderProfile(name string, profile ProviderProfileConfig) []error
 		if identityErr == nil && profile.Entitlement == provider.EntitlementClaudeCompat && identity.Runtime() != "claude-code" {
 			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai runtime must be claude-code", target))
 		}
+		if identityErr == nil && profile.Entitlement == provider.EntitlementCodexResponses && identity.Endpoint() != zai.OfficialCodexEndpoint {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai Codex endpoint must be the official Responses endpoint %s", target, zai.OfficialCodexEndpoint))
+		}
+		if identityErr == nil && profile.Entitlement == provider.EntitlementCodexResponses && identity.Runtime() != "codex" {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai Codex runtime must be codex", target))
+		}
 		if profile.Entitlement == provider.EntitlementClaudeCompat && strings.TrimSpace(profile.AutomationPolicy) != provider.DefaultZAIAutomationPolicyName {
 			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai profiles must use automation_policy = %q", target, provider.DefaultZAIAutomationPolicyName))
+		}
+		if profile.Entitlement == provider.EntitlementCodexResponses && strings.TrimSpace(profile.AutomationPolicy) != provider.DefaultZAICodexAutomationPolicyName {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai Codex profiles must use automation_policy = %q", target, provider.DefaultZAICodexAutomationPolicyName))
 		}
 		if profile.Entitlement == provider.EntitlementNativeAPI && strings.TrimSpace(profile.AutomationPolicy) != provider.NativeZAINoToolsPolicyName && strings.TrimSpace(profile.AutomationPolicy) != provider.NativeZAIToolsPolicyName {
 			errs = append(errs, fmt.Errorf("provider_profiles.%s native Z.ai profiles must use automation_policy = %q or %q", target, provider.NativeZAINoToolsPolicyName, provider.NativeZAIToolsPolicyName))
 		}
-		if profile.Entitlement == provider.EntitlementClaudeCompat && zai.ValidateExecutable(profile.Command) != nil {
+		if (profile.Entitlement == provider.EntitlementClaudeCompat || profile.Entitlement == provider.EntitlementCodexResponses) && zai.ValidateExecutable(profile.Command) != nil {
 			err := zai.ValidateExecutable(profile.Command)
 			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai command: %w", target, err))
+		}
+		if profile.Entitlement == provider.EntitlementCodexResponses && !filepath.IsAbs(profile.Command) {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai Codex command must be an absolute pinned executable path", target))
+		}
+		if profile.Entitlement == provider.EntitlementCodexResponses && !validProviderSHA256(profile.RuntimeSHA256) {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai Codex profiles require runtime_sha256", target))
+		}
+		if profile.Entitlement == provider.EntitlementCodexResponses && (!filepath.IsAbs(profile.BrokerCommand) || containsControlCharacter(profile.BrokerCommand)) {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai Codex profiles require an absolute broker_command", target))
+		}
+		if profile.Entitlement == provider.EntitlementCodexResponses && !validProviderSHA256(profile.BrokerCommandSHA256) {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai Codex profiles require broker_command_sha256", target))
+		}
+		if profile.Entitlement == provider.EntitlementCodexResponses && (!filepath.IsAbs(profile.CredentialBridgeCommand) || containsControlCharacter(profile.CredentialBridgeCommand)) {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai Codex profiles require an absolute credential_bridge_command", target))
+		}
+		if profile.Entitlement == provider.EntitlementCodexResponses && !validProviderSHA256(profile.CredentialBridgeCommandSHA256) {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai Codex profiles require credential_bridge_command_sha256", target))
+		}
+		if profile.Entitlement == provider.EntitlementCodexResponses && (!filepath.IsAbs(profile.RuntimeHome) || containsControlCharacter(profile.RuntimeHome)) {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai Codex profiles require an absolute runtime_home dedicated to CODEX_HOME", target))
+		}
+		if profile.Entitlement == provider.EntitlementCodexResponses && (strings.TrimSpace(profile.RuntimeVersion) == "" || containsControlCharacter(profile.RuntimeVersion)) {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai Codex profiles require an exact runtime_version", target))
+		}
+		if profile.Entitlement == provider.EntitlementCodexResponses && !validZAICodingPlanBrokerCredentialID(profile.BrokerCredentialID) {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai Codex profiles require broker_credential_id with prefix %q and safe canonical characters", target, "ntm.zai.coding_plan."))
+		}
+		if profile.Entitlement != provider.EntitlementCodexResponses && strings.TrimSpace(profile.BrokerCredentialID) != "" {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s broker_credential_id is only valid for Z.ai codex_responses profiles", target))
+		}
+		if profile.Entitlement != provider.EntitlementCodexResponses && (strings.TrimSpace(profile.RuntimeSHA256) != "" || strings.TrimSpace(profile.BrokerCommand) != "" || strings.TrimSpace(profile.BrokerCommandSHA256) != "" || strings.TrimSpace(profile.CredentialBridgeCommand) != "" || strings.TrimSpace(profile.CredentialBridgeCommandSHA256) != "") {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Codex runtime/broker pins are only valid for Z.ai codex_responses profiles", target))
 		}
 		if !profile.ExactTargetOnly {
 			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai profiles must set exact_target_only = true", target))
@@ -890,6 +953,33 @@ func validateProviderProfile(name string, profile ProviderProfileConfig) []error
 	return errs
 }
 
+func validZAICodingPlanBrokerCredentialID(value string) bool {
+	const prefix = "ntm.zai.coding_plan."
+	raw := value
+	value = strings.TrimSpace(value)
+	if value == "" || value != raw || !strings.HasPrefix(value, prefix) || len(value) <= len(prefix) || len(value) > 160 {
+		return false
+	}
+	for _, r := range value[len(prefix):] {
+		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func validProviderSHA256(value string) bool {
+	if len(value) != 64 || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, r := range value {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 func validateZAIAuthorization(profile ProviderProfileConfig) error {
 	credentialClass := strings.TrimSpace(profile.CredentialClass)
 	billingClass := strings.TrimSpace(profile.BillingClass)
@@ -898,6 +988,10 @@ func validateZAIAuthorization(profile ProviderProfileConfig) error {
 	case provider.EntitlementClaudeCompat:
 		if credentialClass != provider.CredentialClassCodingPlan || billingClass != provider.BillingClassCodingPlan {
 			return fmt.Errorf("claude_compatible transport requires credential_class = %q and billing_class = %q", provider.CredentialClassCodingPlan, provider.BillingClassCodingPlan)
+		}
+	case provider.EntitlementCodexResponses:
+		if credentialClass != provider.CredentialClassCodingPlan || billingClass != provider.BillingClassCodingPlan {
+			return fmt.Errorf("codex_responses transport requires credential_class = %q and billing_class = %q", provider.CredentialClassCodingPlan, provider.BillingClassCodingPlan)
 		}
 	case provider.EntitlementNativeAPI:
 		if credentialClass != provider.CredentialClassAPIKey || billingClass != provider.BillingClassAPIUsage {
@@ -910,7 +1004,7 @@ func validateZAIAuthorization(profile ProviderProfileConfig) error {
 			return fmt.Errorf("native_api transport requires endpoint = %q", zai.NativeChatCompletionsEndpoint)
 		}
 	default:
-		return fmt.Errorf("entitlement must be %q or %q", provider.EntitlementClaudeCompat, provider.EntitlementNativeAPI)
+		return fmt.Errorf("entitlement must be %q, %q, or %q", provider.EntitlementClaudeCompat, provider.EntitlementCodexResponses, provider.EntitlementNativeAPI)
 	}
 	return nil
 }
@@ -3905,6 +3999,27 @@ func Print(cfg *Config, w io.Writer) error {
 			fmt.Fprintf(w, "billing_class = %q\n", profile.BillingClass)
 			fmt.Fprintf(w, "entitlement = %q\n", profile.Entitlement)
 			fmt.Fprintf(w, "config_sha256 = %q\n", profile.ConfigSHA256)
+			if profile.RuntimeHome != "" {
+				fmt.Fprintf(w, "runtime_home = %q\n", profile.RuntimeHome)
+			}
+			if profile.BrokerCredentialID != "" {
+				fmt.Fprintf(w, "broker_credential_id = %q\n", profile.BrokerCredentialID)
+			}
+			if profile.RuntimeSHA256 != "" {
+				fmt.Fprintf(w, "runtime_sha256 = %q\n", profile.RuntimeSHA256)
+			}
+			if profile.BrokerCommand != "" {
+				fmt.Fprintf(w, "broker_command = %q\n", profile.BrokerCommand)
+			}
+			if profile.BrokerCommandSHA256 != "" {
+				fmt.Fprintf(w, "broker_command_sha256 = %q\n", profile.BrokerCommandSHA256)
+			}
+			if profile.CredentialBridgeCommand != "" {
+				fmt.Fprintf(w, "credential_bridge_command = %q\n", profile.CredentialBridgeCommand)
+			}
+			if profile.CredentialBridgeCommandSHA256 != "" {
+				fmt.Fprintf(w, "credential_bridge_command_sha256 = %q\n", profile.CredentialBridgeCommandSHA256)
+			}
 			if !(profile.Provider == "zai" && profile.Entitlement == provider.EntitlementNativeAPI) {
 				fmt.Fprintf(w, "command = %q\n", profile.Command)
 			}

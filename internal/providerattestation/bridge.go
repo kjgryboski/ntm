@@ -68,6 +68,8 @@ func ValidateBridgePayload(payload []byte) error {
 		err = validateBridgeQualification(object)
 	case "ntm.provider-session.v2":
 		err = validateBridgeSession(object)
+	case "ntm.provider-codex-run.v1":
+		err = validateBridgeCodexRun(object)
 	default:
 		err = ErrBridgePayloadDenied
 	}
@@ -513,4 +515,222 @@ func validateBridgeSessionReceipt(object map[string]json.RawMessage) error {
 		return errors.New("session cancellation receipt fields are invalid")
 	}
 	return nil
+}
+
+// validateBridgeCodexRun accepts the deliberately redacted execution receipt
+// emitted for a Z.ai Coding Plan request through the isolated Codex runtime.
+// This validator is intentionally narrower than the in-process receipt type:
+// the Windows signing bridge must never become an oracle for prompts, raw
+// output/events, filesystem paths, session IDs, nonces, or credentials.
+func validateBridgeCodexRun(object map[string]json.RawMessage) error {
+	required := []string{
+		"schema_version", "success", "profile", "transport", "identity_sha256",
+		"config_sha256", "binary_sha256", "broker_command_sha256", "credential_bridge_sha256", "runtime_version", "broker_credential_sha256",
+		"operation_id_sha256", "binding_sha256", "receipt_state", "state", "admission", "receipt",
+	}
+	if err := bridgeAllowed(object, required, required...); err != nil {
+		return err
+	}
+	if schema, _ := bridgeString(object, "schema_version"); schema != "ntm.provider-codex-run.v1" {
+		return errors.New("Codex run schema mismatch")
+	}
+	if transport, _ := bridgeString(object, "transport"); transport != "zai_codex_runtime" {
+		return errors.New("Codex run transport mismatch")
+	}
+	for _, name := range []string{
+		"identity_sha256", "config_sha256", "binary_sha256", "broker_command_sha256", "credential_bridge_sha256", "broker_credential_sha256",
+		"operation_id_sha256", "binding_sha256",
+	} {
+		if !bridgeSHA256(object, name) {
+			return fmt.Errorf("invalid Codex run digest %q", name)
+		}
+	}
+	for _, name := range []string{"profile", "runtime_version", "receipt_state", "state"} {
+		if !bridgeSafeString(object, name, 256) {
+			return fmt.Errorf("invalid Codex run field %q", name)
+		}
+	}
+	var success bool
+	if json.Unmarshal(object["success"], &success) != nil {
+		return errors.New("Codex run success is not boolean")
+	}
+	if err := validateBridgeAdmission(object); err != nil {
+		return err
+	}
+	return validateBridgeCodexRunReceipt(object)
+}
+
+func validateBridgeCodexRunReceipt(object map[string]json.RawMessage) error {
+	receipt, ok := bridgeObject(object, "receipt")
+	if !ok {
+		return errors.New("Codex run receipt is not an object")
+	}
+	required := []string{
+		"adapter_version", "action", "requested_model", "resolved_model", "model_evidence",
+		"config_sha256", "binary_sha256", "broker_command_sha256", "credential_bridge_sha256", "policy_sha256", "runtime_version", "cwd_sha256",
+		"prompt_sha256", "session_id_sha256", "nonce_sha256", "output_sha256", "event_stream_sha256",
+		"stderr_sha256", "tool_events_sha256", "tool_event_count", "expected_tool_observed", "expected_tool_denied", "expected_file_observed", "usage", "exit_code", "stop_reason",
+		"provider_started", "process_started", "outcome_known", "completion_confirmed", "nonce_verified",
+		"model_verified", "lineage_verified", "zero_residuals", "cancellation", "started_at", "completed_at",
+	}
+	allowed := append(append([]string{}, required...), "parent_session_sha256", "expected_tool_sha256", "expected_file_sha256")
+	if err := bridgeAllowed(receipt, required, allowed...); err != nil {
+		return err
+	}
+	for _, name := range []string{
+		"config_sha256", "binary_sha256", "broker_command_sha256", "credential_bridge_sha256", "policy_sha256", "cwd_sha256", "prompt_sha256",
+		"session_id_sha256", "nonce_sha256", "output_sha256", "event_stream_sha256", "stderr_sha256", "tool_events_sha256",
+	} {
+		if !bridgeSHA256(receipt, name) {
+			return fmt.Errorf("invalid Codex receipt digest %q", name)
+		}
+	}
+	for _, name := range []string{"adapter_version", "requested_model", "runtime_version", "stop_reason"} {
+		if !bridgeSafeString(receipt, name, 4096) {
+			return fmt.Errorf("invalid Codex receipt field %q", name)
+		}
+	}
+	action, validAction := bridgeString(receipt, "action")
+	if !validAction || (action != "start" && action != "resume") {
+		return errors.New("Codex receipt action is invalid")
+	}
+	_, hasParent := receipt["parent_session_sha256"]
+	if action == "resume" && (!hasParent || !bridgeSHA256(receipt, "parent_session_sha256")) {
+		return errors.New("Codex resume receipt is missing its parent session digest")
+	}
+	if action == "start" && hasParent {
+		return errors.New("Codex start receipt must not include a parent session digest")
+	}
+	modelVerified := false
+	for _, name := range []string{
+		"provider_started", "process_started", "outcome_known", "completion_confirmed", "nonce_verified",
+		"model_verified", "lineage_verified", "zero_residuals",
+	} {
+		var value bool
+		if json.Unmarshal(receipt[name], &value) != nil {
+			return fmt.Errorf("Codex receipt field %q is not boolean", name)
+		}
+		if name == "model_verified" {
+			modelVerified = value
+		}
+	}
+	for _, name := range []string{"resolved_model", "model_evidence"} {
+		var value string
+		if json.Unmarshal(receipt[name], &value) != nil || len(value) > 4096 || strings.IndexFunc(value, func(r rune) bool {
+			return r < 0x20 || r == 0x7f
+		}) >= 0 {
+			return fmt.Errorf("invalid Codex receipt field %q", name)
+		}
+		if modelVerified && value == "" {
+			return fmt.Errorf("verified Codex receipt field %q is empty", name)
+		}
+		if !modelVerified && value != "" {
+			return fmt.Errorf("unqualified Codex receipt field %q must be empty", name)
+		}
+	}
+	if !bridgeNonnegativeInteger(receipt, "tool_event_count") {
+		return errors.New("Codex receipt tool event count is invalid")
+	}
+	var expectedObserved, expectedDenied bool
+	if json.Unmarshal(receipt["expected_tool_observed"], &expectedObserved) != nil || json.Unmarshal(receipt["expected_tool_denied"], &expectedDenied) != nil {
+		return errors.New("Codex expected-tool evidence is invalid")
+	}
+	_, hasExpectedTool := receipt["expected_tool_sha256"]
+	if hasExpectedTool && !bridgeSHA256(receipt, "expected_tool_sha256") {
+		return errors.New("Codex expected-tool digest is invalid")
+	}
+	if !hasExpectedTool && (expectedObserved || expectedDenied) || expectedDenied && !expectedObserved {
+		return errors.New("Codex expected-tool evidence is inconsistent")
+	}
+	var expectedFileObserved bool
+	if json.Unmarshal(receipt["expected_file_observed"], &expectedFileObserved) != nil {
+		return errors.New("Codex expected-file evidence is invalid")
+	}
+	_, hasExpectedFile := receipt["expected_file_sha256"]
+	if hasExpectedFile && !bridgeSHA256(receipt, "expected_file_sha256") {
+		return errors.New("Codex expected-file digest is invalid")
+	}
+	if !hasExpectedFile && expectedFileObserved {
+		return errors.New("Codex expected-file evidence is inconsistent")
+	}
+	if !bridgeInteger(receipt, "exit_code") {
+		return errors.New("Codex receipt exit code is invalid")
+	}
+	if err := validateBridgeCodexUsage(receipt); err != nil {
+		return err
+	}
+	if err := validateBridgeCodexCancellation(receipt); err != nil {
+		return err
+	}
+	for _, name := range []string{"started_at", "completed_at"} {
+		if !bridgeTimestamp(receipt, name) {
+			return fmt.Errorf("invalid Codex receipt timestamp %q", name)
+		}
+	}
+	return nil
+}
+
+func validateBridgeCodexUsage(receipt map[string]json.RawMessage) error {
+	usage, ok := bridgeObject(receipt, "usage")
+	if !ok {
+		return errors.New("Codex receipt usage is not an object")
+	}
+	if err := bridgeAllowed(usage, []string{"input_tokens", "cached_input_tokens", "output_tokens", "total_tokens"}, "input_tokens", "cached_input_tokens", "output_tokens", "total_tokens"); err != nil {
+		return err
+	}
+	for _, name := range []string{"input_tokens", "cached_input_tokens", "output_tokens", "total_tokens"} {
+		if !bridgeNonnegativeInteger(usage, name) {
+			return fmt.Errorf("Codex receipt usage %q is invalid", name)
+		}
+	}
+	return nil
+}
+
+func validateBridgeCodexCancellation(receipt map[string]json.RawMessage) error {
+	cancellation, ok := bridgeObject(receipt, "cancellation")
+	if !ok {
+		return errors.New("Codex receipt cancellation is not an object")
+	}
+	if err := bridgeAllowed(cancellation, []string{"provider_acknowledged", "local_termination", "residual_process_ids", "observed_at"}, "provider_acknowledged", "local_termination", "residual_process_ids", "observed_at"); err != nil {
+		return err
+	}
+	var acknowledged bool
+	var residuals []int64
+	if json.Unmarshal(cancellation["provider_acknowledged"], &acknowledged) != nil ||
+		!bridgeSafeString(cancellation, "local_termination", 256) ||
+		json.Unmarshal(cancellation["residual_process_ids"], &residuals) != nil || residuals == nil ||
+		!bridgeTimestamp(cancellation, "observed_at") {
+		return errors.New("Codex receipt cancellation is invalid")
+	}
+	for _, pid := range residuals {
+		if pid <= 0 {
+			return errors.New("Codex receipt residual process id is invalid")
+		}
+	}
+	return nil
+}
+
+func bridgeSafeString(object map[string]json.RawMessage, name string, maximum int) bool {
+	value, ok := bridgeString(object, name)
+	return ok && len(value) <= maximum && strings.IndexFunc(value, func(r rune) bool {
+		return r < 0x20 || r == 0x7f
+	}) < 0
+}
+
+func bridgeInteger(object map[string]json.RawMessage, name string) bool {
+	value, ok := object[name]
+	if !ok {
+		return false
+	}
+	var integer int64
+	return json.Unmarshal(value, &integer) == nil
+}
+
+func bridgeNonnegativeInteger(object map[string]json.RawMessage, name string) bool {
+	value, ok := object[name]
+	if !ok {
+		return false
+	}
+	var integer int64
+	return json.Unmarshal(value, &integer) == nil && integer >= 0
 }

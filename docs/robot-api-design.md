@@ -229,7 +229,7 @@ kept separate because executing model-edited code in the credential-bearing
 provider process would bypass tool-level path and network denies.
 
 Z.ai launch is provider-profile based, not a broad Claude-runtime target.
-`--spawn-zai` requires an exact `--provider-profile` whose immutable provider,
+`--spawn-zai` is deliberately the secondary Z.ai Claude-compatible pane lane and requires an exact `--provider-profile` whose immutable provider,
 account alias, model, endpoint, runtime, credential class, billing class,
 entitlement, and redacted configuration digest form one identity. Coding Plan
 profiles must use the official `https://api.z.ai/api/anthropic`
@@ -247,10 +247,20 @@ The current Coding Plan FAQ lists GLM-5.3 and GLM-5.3-Flash for all plan tiers,
 and the switching guide names `glm-5.3-flash` for Claude Code. Even a documented
 model is not evidence that the selected account/plan can call it, so the exact
 live probe remains mandatory.
-The `zai-readonly-ci` policy, endpoint, runtime, and configuration digest are
+The legacy `zai-readonly-ci` Claude-compatible lane remains secondary. Its policy, endpoint, runtime, and configuration digest are
 also profile-attested only: a Claude-compatible Z.ai TUI does not expose enough
 structured runtime evidence for NTM to independently prove per-invocation
 policy enforcement.
+
+The primary `zai_codex_runtime` is invoked through `ntm provider codex`
+commands, never by a fake tmux pane. It uses Codex `exec --json` under an isolated
+`CODEX_HOME`, pinned Z.ai Responses endpoint (`https://api.z.ai/api/v1`), and
+a config-manifest hash. It emits nonce/tool/completion receipts; local
+process-tree cancellation and zero-residual cleanup are explicitly local
+evidence. `codex exec resume` and `fork` are reachable provider surfaces, but
+NTM keeps the whole lane NO-GO for promotion until a signed live exact-identity
+qualification proves the required receipt semantics. No transport may silently fall back to Claude, OpenAI
+Codex, or the separately billed Z.ai native API lane.
 
 Capacity claims follow the transport boundary. Native Grok ACP calls have
 exact-identity request admission with independent concurrency/token buckets,
@@ -433,7 +443,10 @@ native controller-tools lane; it stores a create-only, self-digested and signed
 local receipt from a disposable repository. All Coding Plan checks must pass: `model_identity`,
 `workspace_edit`, `test_execution`, `secret_access_denied`, `push_denied`,
 `crash_recovery`, `cancellation`, `session_resumption`, and
-`zero_residual_cleanup`. **Hard NO-GO:** until doctor finds a current all-nine
+`zero_residual_cleanup`. The Codex transport adds `capacity_accounting`: it
+must either reconcile aggregate provider usage or conservatively reserve the
+full weekly subscription allowance after an unknown/cancelled turn. **Hard
+NO-GO:** until doctor finds a current all-ten Codex (or all-nine Claude bridge)
 live-pass receipt bound to the exact identity, transport, and policy, the lane
 is not ready for production coding. The native tools lane has its own nine-check
 matrix covering controller-owned structured tools, an in-flight local HTTP

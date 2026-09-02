@@ -37,6 +37,24 @@ var requiredChecks = []string{
 	"zero_residual_cleanup",
 }
 
+// codexRequiredChecks is deliberately a distinct matrix even though the
+// current Z.ai Codex qualification gate set matches the Claude-compatible
+// Coding Plan lane. Keeping the transport-specific declaration prevents a
+// future Codex adapter from silently inheriting a reduced or expanded set of
+// checks when either lane evolves.
+var codexRequiredChecks = []string{
+	"model_identity",
+	"workspace_edit",
+	"test_execution",
+	"secret_access_denied",
+	"push_denied",
+	"crash_recovery",
+	"cancellation",
+	"session_resumption",
+	"capacity_accounting",
+	"zero_residual_cleanup",
+}
+
 var nativeRequiredChecks = []string{
 	"exact_model_request_id",
 	"controller_tool_loop",
@@ -106,7 +124,7 @@ func (r *Receipt) Finalize() error {
 		if check.Name == "" || seen[check.Name].Name != "" {
 			return fmt.Errorf("qualification check names must be non-empty and unique")
 		}
-		if check.Provenance != "live" && check.Provenance != "local_authoritative" {
+		if !authoritativeProvenance(check.Provenance) {
 			return fmt.Errorf("qualification check %q has non-authoritative provenance %q", check.Name, check.Provenance)
 		}
 		if check.EvidenceSHA256 != "" && !isSHA256(check.EvidenceSHA256) {
@@ -172,7 +190,7 @@ func (r Receipt) Validate() error {
 	passed := len(r.Checks) == len(required)
 	for _, name := range required {
 		check, ok := seen[name]
-		if !ok || !check.Passed || !isSHA256(check.EvidenceSHA256) || (check.Provenance != "live" && check.Provenance != "local_authoritative") {
+		if !ok || !check.Passed || !isSHA256(check.EvidenceSHA256) || !authoritativeProvenance(check.Provenance) {
 			passed = false
 		}
 	}
@@ -188,6 +206,20 @@ func (r Receipt) Validate() error {
 		}
 	}
 	return nil
+}
+
+// authoritativeProvenance deliberately distinguishes provider evidence from
+// controller-owned checks and from the narrower, continuously observed local
+// process-tree cleanup claim. The latter is authoritative for processes NTM
+// observed beneath the launched root only; it is not provider-side
+// cancellation evidence and must never be described as such.
+func authoritativeProvenance(provenance string) bool {
+	switch provenance {
+	case "live", "local_authoritative", "local_observed_process_tree":
+		return true
+	default:
+		return false
+	}
 }
 
 // CanonicalPayload returns the finalized receipt bytes covered by the public
@@ -224,6 +256,8 @@ func requiredChecksForTransport(transport string) ([]string, error) {
 	switch transport {
 	case "zai_claude_runtime":
 		return requiredChecks, nil
+	case "zai_codex_runtime":
+		return codexRequiredChecks, nil
 	case "zai_native_api":
 		return nativeRequiredChecks, nil
 	default:
@@ -234,6 +268,11 @@ func requiredChecksForTransport(transport string) ([]string, error) {
 // NativeRequiredChecks returns a copy of the complete native qualification
 // matrix so the live adapter cannot silently omit a gate.
 func NativeRequiredChecks() []string { return append([]string(nil), nativeRequiredChecks...) }
+
+// CodexRequiredChecks returns the complete transport-specific Coding Plan
+// Codex matrix. Keeping this exported prevents the live CLI adapter from
+// re-declaring a potentially incomplete gate list.
+func CodexRequiredChecks() []string { return append([]string(nil), codexRequiredChecks...) }
 
 func (r Receipt) validateIdentityFields() error {
 	if strings.TrimSpace(r.Provider) == "" || strings.TrimSpace(r.Transport) == "" || strings.TrimSpace(r.RuntimeVersion) == "" {

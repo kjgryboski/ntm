@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -13,6 +14,45 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 )
+
+func TestLocalRunnerCleansObservedDescendantsAfterNormalExit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell fixture")
+	}
+	outcome, err := (LocalRunner{}).Run(context.Background(), Invocation{
+		Binary: "/bin/sh", Args: []string{"-c", "sleep 30 >/dev/null 2>&1 & sleep 0.05"},
+		Env: os.Environ(), Dir: t.TempDir(), OutputLimit: 1024,
+	})
+	if err != nil || !outcome.ProcessStarted || !outcome.ResidualCheckPerformed || !outcome.ProcessTreeTerminated || len(outcome.ResidualProcessIDs) != 0 {
+		t.Fatalf("outcome=%+v err=%v", outcome, err)
+	}
+}
+
+func TestObservedProcessStatusDoesNotTreatReusedPIDAsResidual(t *testing.T) {
+	observed, err := observeProcess(int32(os.Getpid()))
+	if err != nil {
+		t.Skipf("creation time is unavailable on this platform: %v", err)
+	}
+	observed.createdAt++ // Represents a PID that has since been recycled.
+	live, conclusive := observedProcessStatus(observed)
+	if live || !conclusive {
+		t.Fatalf("reused PID status = live:%v conclusive:%v", live, conclusive)
+	}
+	if residuals := residualObservedProcesses([]observedProcess{observed}); len(residuals) != 0 {
+		t.Fatalf("reused PID was reported as an observed-tree residual: %v", residuals)
+	}
+}
+
+func TestTerminatedProcessStatusRecognizesZombies(t *testing.T) {
+	for _, statuses := range [][]string{{"Z"}, {"zombie"}, {"sleeping", "Zombie"}} {
+		if !hasTerminatedProcessStatus(statuses) {
+			t.Fatalf("zombie statuses were not recognized: %q", statuses)
+		}
+	}
+	if hasTerminatedProcessStatus([]string{"running", "sleeping"}) {
+		t.Fatal("live statuses were treated as terminated")
+	}
+}
 
 func TestRunRejectsUnsafeOrNonLiveIdentity(t *testing.T) {
 	id := qualifiedIdentity(t)

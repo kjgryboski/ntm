@@ -54,6 +54,7 @@ type persistedAdmissionState struct {
 	CircuitOpenUntil    time.Time                 `json:"circuit_open_until"`
 	HalfOpenInFlight    bool                      `json:"half_open_in_flight"`
 	TerminalReason      ErrorClass                `json:"terminal_reason"`
+	SubscriptionUsage   []subscriptionUsageEvent  `json:"subscription_usage,omitempty"`
 }
 
 type persistedAdmissionFile struct {
@@ -249,7 +250,7 @@ func (s *LocalSharedStore) releaseLock(lockPath, ownerID string) error {
 
 func toPersisted(state admissionState) persistedAdmissionState {
 	state.running = len(state.leases)
-	return persistedAdmissionState{Running: state.running, Leases: state.leases, Tokens: state.tokens, LastRefill: state.lastRefill, ConsecutiveFailures: state.consecutiveFailures, NextRetry: state.nextRetry, CircuitOpenUntil: state.circuitOpenUntil, HalfOpenInFlight: state.halfOpenInFlight, TerminalReason: state.terminalReason}
+	return persistedAdmissionState{Running: state.running, Leases: state.leases, Tokens: state.tokens, LastRefill: state.lastRefill, ConsecutiveFailures: state.consecutiveFailures, NextRetry: state.nextRetry, CircuitOpenUntil: state.circuitOpenUntil, HalfOpenInFlight: state.halfOpenInFlight, TerminalReason: state.terminalReason, SubscriptionUsage: state.subscriptionUsage}
 }
 
 func fromPersisted(state persistedAdmissionState) admissionState {
@@ -257,7 +258,7 @@ func fromPersisted(state persistedAdmissionState) admissionState {
 	if leases == nil {
 		leases = make(map[string]admissionLease)
 	}
-	return admissionState{running: len(leases), leases: leases, tokens: state.Tokens, lastRefill: state.LastRefill, consecutiveFailures: state.ConsecutiveFailures, nextRetry: state.NextRetry, circuitOpenUntil: state.CircuitOpenUntil, halfOpenInFlight: state.HalfOpenInFlight, terminalReason: state.TerminalReason}
+	return admissionState{running: len(leases), leases: leases, tokens: state.Tokens, lastRefill: state.LastRefill, consecutiveFailures: state.ConsecutiveFailures, nextRetry: state.NextRetry, circuitOpenUntil: state.CircuitOpenUntil, halfOpenInFlight: state.HalfOpenInFlight, terminalReason: state.TerminalReason, subscriptionUsage: state.SubscriptionUsage}
 }
 
 func (s *LocalSharedStore) reclaimLeases(state *admissionState, now time.Time, _ time.Duration) {

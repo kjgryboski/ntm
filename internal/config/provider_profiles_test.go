@@ -66,6 +66,47 @@ func TestValidateProviderProfilesEnforcesZAITransportEntitlement(t *testing.T) {
 	}
 }
 
+func TestValidateProviderProfilesAcceptsOnlyIsolatedZaiCodexCodingPlan(t *testing.T) {
+	profile := validZAIProviderProfile()
+	profile.Model, profile.Endpoint, profile.Runtime, profile.Command = "glm-5.3", zai.OfficialCodexEndpoint, "codex", "/usr/bin/codex"
+	profile.Entitlement, profile.AutomationPolicy, profile.RuntimeHome = provider.EntitlementCodexResponses, provider.DefaultZAICodexAutomationPolicyName, "/tmp/zai-codex"
+	profile.BrokerCredentialID = "ntm.zai.coding_plan.kevin"
+	profile.RuntimeSHA256, profile.BrokerCommand, profile.BrokerCommandSHA256 = providerProfileTestHash, "/usr/bin/caam", providerProfileTestHash
+	profile.CredentialBridgeCommand, profile.CredentialBridgeCommandSHA256 = "/usr/bin/ntm-provider-bridge", providerProfileTestHash
+	profile.RuntimeVersion = "0.149.0"
+	if errs := ValidateProviderProfiles(map[string]ProviderProfileConfig{"zai-codex-plan": profile}); len(errs) != 0 {
+		t.Fatalf("Z.ai Codex profile errors = %v", errs)
+	}
+	profile.RuntimeHome = "relative-home"
+	joined := errorsString(ValidateProviderProfiles(map[string]ProviderProfileConfig{"zai-codex-plan": profile}))
+	if !strings.Contains(joined, "runtime_home dedicated to CODEX_HOME") {
+		t.Fatalf("runtime home error = %q", joined)
+	}
+}
+
+func TestValidateProviderProfilesRejectsInvalidCodingPlanBrokerCredentialID(t *testing.T) {
+	profile := validZAIProviderProfile()
+	profile.Model, profile.Endpoint, profile.Runtime, profile.Command = "glm-5.3", zai.OfficialCodexEndpoint, "codex", "/usr/bin/codex"
+	profile.Entitlement, profile.AutomationPolicy, profile.RuntimeHome = provider.EntitlementCodexResponses, provider.DefaultZAICodexAutomationPolicyName, "/tmp/zai-codex"
+	profile.RuntimeSHA256, profile.BrokerCommand, profile.BrokerCommandSHA256 = providerProfileTestHash, "/usr/bin/caam", providerProfileTestHash
+	profile.CredentialBridgeCommand, profile.CredentialBridgeCommandSHA256 = "/usr/bin/ntm-provider-bridge", providerProfileTestHash
+	profile.RuntimeVersion = "0.149.0"
+	joined := errorsString(ValidateProviderProfiles(map[string]ProviderProfileConfig{"zai-codex-plan": profile}))
+	if !strings.Contains(joined, "broker_credential_id") {
+		t.Fatalf("missing broker credential validation: %q", joined)
+	}
+	profile.BrokerCredentialID = "ntm.zai.coding_plan.kevin"
+	if errs := ValidateProviderProfiles(map[string]ProviderProfileConfig{"zai-codex-plan": profile}); len(errs) != 0 {
+		t.Fatalf("valid broker id rejected: %v", errs)
+	}
+	profile.Entitlement, profile.Runtime, profile.Endpoint = provider.EntitlementNativeAPI, "zai-api", zai.NativeChatCompletionsEndpoint
+	profile.CredentialClass, profile.BillingClass, profile.Command, profile.AutomationPolicy = provider.CredentialClassAPIKey, provider.BillingClassAPIUsage, "", provider.NativeZAINoToolsPolicyName
+	joined = errorsString(ValidateProviderProfiles(map[string]ProviderProfileConfig{"zai-native": profile}))
+	if !strings.Contains(joined, "only valid") {
+		t.Fatalf("native broker id was accepted: %q", joined)
+	}
+}
+
 func TestProviderProfileBindsValidatedImmutableIdentity(t *testing.T) {
 	profile := validZAIProviderProfile()
 	identity, err := profile.Identity()

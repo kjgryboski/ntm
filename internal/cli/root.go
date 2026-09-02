@@ -4470,7 +4470,7 @@ func init() {
 	rootCmd.Flags().BoolVar(&robotCapabilitiesCompact, "capability-compact", false, "Return a token-efficient --robot-capabilities command catalog")
 	rootCmd.Flags().BoolVar(&robotProviderCapabilities, "robot-provider-capabilities", false, "Get the redacted provider transport, policy, conformance, and configured-profile capability matrix (JSON; no provider calls)")
 	rootCmd.Flags().BoolVar(&robotProviderConformance, "robot-provider-conformance", false, "Run the synthetic offline provider conformance harness for one exact profile (JSON; no provider calls)")
-	rootCmd.Flags().StringVar(&robotProviderTransport, "provider-transport", "", "Declared transport for --robot-provider-conformance: xai_acp, xai_grok_tui, or zai_claude_runtime")
+	rootCmd.Flags().StringVar(&robotProviderTransport, "provider-transport", "", "Declared transport for --robot-provider-conformance: xai_acp, xai_grok_tui, zai_codex_runtime, zai_claude_runtime, or zai_native_api")
 	rootCmd.Flags().StringVar(&robotDocs, "robot-docs", "", "Get documentation for a topic (JSON). Topics: quickstart, commands, examples, exit-codes. Example: ntm --robot-docs=quickstart")
 	rootCmd.Flags().BoolVar(&robotPlan, "robot-plan", false, "Get bv execution plan with parallelizable tracks (JSON). Example: ntm --robot-plan")
 	rootCmd.Flags().BoolVar(&robotSnapshot, "robot-snapshot", false, "Unified state: sessions + beads + alerts + mail. Use --since for delta. Example: ntm --robot-snapshot")

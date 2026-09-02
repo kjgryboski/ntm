@@ -49,11 +49,48 @@ func TestReceiptFinalizeRequiresEveryLiveCheck(t *testing.T) {
 	}
 }
 
+func TestReceiptFinalizeRecognizesZaiCodexRuntimeMatrix(t *testing.T) {
+	completed := time.Unix(1_800_000_000, 0).UTC()
+	checks := make([]Check, 0, len(codexRequiredChecks))
+	for _, name := range codexRequiredChecks {
+		checks = append(checks, Check{Name: name, Passed: true, Provenance: "live", EvidenceSHA256: testHash("codex-" + name)})
+	}
+	receipt := Receipt{
+		Mode: ModeLive, Provider: "zai", Transport: "zai_codex_runtime",
+		IdentitySHA256: testHash("codex-identity"), PolicySHA256: testHash("codex-policy"), RuntimeVersion: "0.149.0",
+		StartedAt: completed.Add(-time.Minute), CompletedAt: completed, DisposableRepoHash: testHash("codex-repo"), Checks: checks,
+	}
+	if err := receipt.Finalize(); err != nil {
+		t.Fatalf("Finalize() error: %v", err)
+	}
+	if !receipt.Passed || receipt.Validate() != nil {
+		t.Fatalf("Codex receipt = %#v, validate=%v", receipt, receipt.Validate())
+	}
+}
+
 func TestReceiptRejectsSyntheticProvenance(t *testing.T) {
 	r := passingReceipt(t, time.Unix(1_800_000_000, 0).UTC())
 	r.Checks[0].Provenance = "synthetic"
 	if err := r.Finalize(); err == nil {
 		t.Fatal("Finalize() accepted synthetic provenance")
+	}
+}
+
+func TestReceiptAcceptsObservedLocalProcessTreeProvenance(t *testing.T) {
+	r := passingReceipt(t, time.Unix(1_800_000_000, 0).UTC())
+	for i := range r.Checks {
+		if r.Checks[i].Name == "zero_residual_cleanup" {
+			r.Checks[i].Provenance = "local_observed_process_tree"
+		}
+	}
+	if err := r.Finalize(); err != nil {
+		t.Fatalf("Finalize() rejected scoped authoritative provenance: %v", err)
+	}
+	if !r.Passed {
+		t.Fatal("scoped authoritative cleanup evidence must remain eligible to pass")
+	}
+	if err := r.Validate(); err != nil {
+		t.Fatalf("Validate() rejected scoped authoritative provenance: %v", err)
 	}
 }
 

@@ -46,6 +46,11 @@ const (
 	BillingClassCodingPlan    = "coding_plan"
 	BillingClassAPIUsage      = "api_usage"
 	EntitlementClaudeCompat   = "claude_compatible"
+	// EntitlementCodexResponses is the Z.ai Coding Plan lane exercised through
+	// the official Codex Responses-compatible endpoint. It is deliberately not
+	// interchangeable with either the Claude-compatible plan lane or a native
+	// pay-as-you-go API key.
+	EntitlementCodexResponses = "codex_responses"
 	EntitlementNativeAPI      = "native_api"
 	identityClassUnspecified  = "unspecified"
 )
@@ -217,6 +222,19 @@ func (i Identity) CapacityScope() CapacityScope {
 		return ""
 	}
 	return CapacityScope("provider:" + i.identitySHA256)
+}
+
+// SubscriptionCapacityScope groups identities that consume the same
+// non-secret commercial entitlement. It intentionally excludes model,
+// runtime, and configuration hash so model-specific lanes cannot each spend a
+// separate copy of one subscription's credits. Provider, account, endpoint,
+// credential class, billing class, and entitlement remain part of the scope:
+// this is never a cross-provider or pay-as-you-go fallback bucket.
+func (i Identity) SubscriptionCapacityScope() CapacityScope {
+	if !i.Valid() {
+		return ""
+	}
+	return CapacityScope("subscription:" + hashFields(i.provider, i.accountAlias, i.endpoint, i.credentialClass, i.billingClass, i.entitlement))
 }
 
 // CapacityScope is the stable, non-secret key for a provider/account/model

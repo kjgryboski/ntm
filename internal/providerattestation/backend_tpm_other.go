@@ -6,3 +6,7 @@ package providerattestation
 // Ed25519 path. The Linux backend may use the explicitly configured Windows
 // bridge for WSL; other platforms do not proxy TPM operations.
 func newNativeHardwareSigner() hardwareSigner { return nil }
+
+func NewPinnedWindowsBridge(string, string) (*Attestor, error) {
+	return nil, ErrProtectionUnavailable
+}

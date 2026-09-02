@@ -113,7 +113,8 @@ func zero(value []byte) {
 
 // windowsBridgeCredentialAllowed is a narrowing allowlist, not caller
 // authentication. The executable still runs under the current Windows user;
-// it only delegates exact configured Z.ai native-API credential identities.
+// it delegates either an exact configured native-API identity or a separately
+// named Z.ai Coding Plan Codex broker credential, never one as the other.
 func windowsBridgeCredentialAllowed(id string) bool {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -130,11 +131,17 @@ func windowsBridgeCredentialAllowed(id string) bool {
 		return false
 	}
 	for _, profile := range cfg.ProviderProfiles {
-		if strings.TrimSpace(profile.Provider) != "zai" || strings.TrimSpace(profile.Entitlement) != provider.EntitlementNativeAPI || strings.TrimSpace(profile.CredentialClass) != provider.CredentialClassAPIKey || strings.TrimSpace(profile.BillingClass) != provider.BillingClassAPIUsage || !profile.ExactTargetOnly {
+		if strings.TrimSpace(profile.Provider) != "zai" || !profile.ExactTargetOnly {
 			continue
 		}
 		identity, err := profile.Identity()
-		if err == nil && providercredential.CanonicalID(identity) == id {
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(profile.Entitlement) == provider.EntitlementNativeAPI && strings.TrimSpace(profile.CredentialClass) == provider.CredentialClassAPIKey && strings.TrimSpace(profile.BillingClass) == provider.BillingClassAPIUsage && providercredential.CanonicalID(identity) == id {
+			return true
+		}
+		if strings.TrimSpace(profile.Entitlement) == provider.EntitlementCodexResponses && strings.TrimSpace(profile.CredentialClass) == provider.CredentialClassCodingPlan && strings.TrimSpace(profile.BillingClass) == provider.BillingClassCodingPlan && strings.TrimSpace(profile.BrokerCredentialID) != "" && strings.TrimSpace(profile.BrokerCredentialID) == id {
 			return true
 		}
 	}

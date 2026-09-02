@@ -38,3 +38,56 @@ command = "/usr/local/libexec/ntm/grok-1.0.13"
 automation_policy = "grok-workspace-write-ci"
 exact_target_only = true
 probe_required = false
+
+# Primary Z.ai subscription lane. CAAM/the owner provisions the isolated
+# CODEX_HOME and its non-secret config.toml/models.json, then hashes that
+# manifest into config_sha256. Do not place a key in this file.
+[provider_profiles."zai-codex-kevin-v10"]
+provider = "zai"
+account_alias = "kevin"
+model = "glm-5.3"
+endpoint = "https://api.z.ai/api/v1"
+runtime = "codex"
+runtime_version = "0.149.0"
+credential_class = "coding_plan"
+billing_class = "coding_plan"
+entitlement = "codex_responses"
+config_sha256 = "3c4d0bd7ec1b2e852b2acfd5f7500988f57ba587a3331d742c3fa44719ef4c1e"
+command = "/home/kevin/.local/libexec/ntm/codex-0.149.0/codex-x86_64-unknown-linux-musl"
+runtime_sha256 = "bbc3341e44c9ead340ed9570c17be936e37870f570751a941699ffd04d672827"
+broker_command = "/home/kevin/.local/bin/caam-zai-codex-v14"
+broker_command_sha256 = "6cd9fad4fa68a291133014b6ea3c62283f1b6fa077a2aea7349609ea1c1a5472"
+credential_bridge_command = "/home/kevin/.local/libexec/ntm/bridge-zai-codex-v3/ntm-provider-bridge.exe"
+credential_bridge_command_sha256 = "1f0067ea3c9a56a1266c2c2594b3c6e7616470473d53443470bbe07c0389e21f"
+broker_credential_id = "ntm.zai.coding_plan.kevin"
+runtime_home = "/home/kevin/orch-homes/zai-codex-kevin-v10/.codex"
+automation_policy = "zai-codex-workspace-write-v1"
+exact_target_only = true
+probe_required = true
+
+# Explicit lower-cost bulk lane. It shares the same exact Coding Plan
+# subscription scope, but NTM accepts it only with --workload-class bulk and
+# holds it during the documented Singapore peak window. There is no automatic
+# model or provider failover.
+[provider_profiles."zai-codex-kevin-flash-v12"]
+provider = "zai"
+account_alias = "kevin"
+model = "glm-5.3-flash"
+endpoint = "https://api.z.ai/api/v1"
+runtime = "codex"
+runtime_version = "0.149.0"
+credential_class = "coding_plan"
+billing_class = "coding_plan"
+entitlement = "codex_responses"
+config_sha256 = "13adebb50d64fc55f21cda122c716c5eda3bd25dc7abb5920267d00d95793756"
+command = "/home/kevin/.local/libexec/ntm/codex-0.149.0/codex-x86_64-unknown-linux-musl"
+runtime_sha256 = "bbc3341e44c9ead340ed9570c17be936e37870f570751a941699ffd04d672827"
+broker_command = "/home/kevin/.local/bin/caam-zai-codex-v14"
+broker_command_sha256 = "6cd9fad4fa68a291133014b6ea3c62283f1b6fa077a2aea7349609ea1c1a5472"
+credential_bridge_command = "/home/kevin/.local/libexec/ntm/bridge-zai-codex-v3/ntm-provider-bridge.exe"
+credential_bridge_command_sha256 = "1f0067ea3c9a56a1266c2c2594b3c6e7616470473d53443470bbe07c0389e21f"
+broker_credential_id = "ntm.zai.coding_plan.kevin"
+runtime_home = "/home/kevin/orch-homes/zai-codex-kevin-flash-v12/.codex"
+automation_policy = "zai-codex-workspace-write-v1"
+exact_target_only = true
+probe_required = true

@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 )
 
@@ -19,6 +20,44 @@ type providerCredentialStoreFake struct {
 	getID   string
 	putID   string
 	deleted string
+}
+
+func TestProviderCredentialCodingPlanUsesConfiguredBrokerIDOnly(t *testing.T) {
+	profile := config.ProviderProfileConfig{
+		Provider: "zai", AccountAlias: "kevin", Model: "glm-5.3", Endpoint: "https://api.z.ai/api/v1", Runtime: "codex",
+		CredentialClass: provider.CredentialClassCodingPlan, BillingClass: provider.BillingClassCodingPlan, Entitlement: provider.EntitlementCodexResponses,
+		ConfigSHA256: strings.Repeat("a", 64), Command: "/usr/bin/codex", RuntimeHome: "/tmp/zai-codex", RuntimeVersion: "0.149.0", AutomationPolicy: provider.DefaultZAICodexAutomationPolicyName,
+		ExactTargetOnly: true, ProbeRequired: true, BrokerCredentialID: "ntm.zai.coding_plan.kevin",
+		RuntimeSHA256: strings.Repeat("b", 64), BrokerCommand: "/usr/bin/caam", BrokerCommandSHA256: strings.Repeat("c", 64),
+		CredentialBridgeCommand: "/usr/bin/ntm-provider-bridge", CredentialBridgeCommandSHA256: strings.Repeat("d", 64),
+	}
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := providerCredentialIDForProfile(profile, identity)
+	if err != nil || id != profile.BrokerCredentialID {
+		t.Fatalf("id=%q err=%v", id, err)
+	}
+	profile.BrokerCredentialID = ""
+	if _, err := providerCredentialIDForProfile(profile, identity); err == nil {
+		t.Fatal("missing broker id accepted")
+	}
+	// Native profiles retain the canonical identity-derived namespace.
+	native := providerNativeProfile()
+	nativeID, err := providerCredentialIDForProfile(native, mustIdentity(t, native))
+	if err != nil || !strings.HasPrefix(nativeID, "ntm.zai.native_api.") {
+		t.Fatalf("native id=%q err=%v", nativeID, err)
+	}
+}
+
+func mustIdentity(t *testing.T, profile config.ProviderProfileConfig) provider.Identity {
+	t.Helper()
+	id, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 func (f *providerCredentialStoreFake) Get(_ context.Context, id string) ([]byte, error) {

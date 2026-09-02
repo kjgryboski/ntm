@@ -87,7 +87,7 @@ func TestCapabilityMatrixPreservesEvidenceBoundaries(t *testing.T) {
 	}
 	for transport, capabilities := range matrix {
 		want := EvidenceSubmission
-		if transport == "xai_headless_session" || transport == "xai_acp" {
+		if transport == "xai_headless_session" || transport == "xai_acp" || transport == "zai_codex_runtime" {
 			want = EvidenceAuthoritative
 		}
 		if capabilities.Cleanup != want {
@@ -108,6 +108,9 @@ func TestCapabilityMatrixPreservesEvidenceBoundaries(t *testing.T) {
 	}
 	if got := matrix["zai_claude_runtime"]; !got.IdentityProbeRequired || got.Delivery != EvidenceSubmission || got.IdentityEvidence != IdentityEvidenceProfileAttested || got.CapacityControlScope != CapacityControlScopeLocalShared {
 		t.Fatalf("Z.ai Claude-runtime matrix = %+v", got)
+	}
+	if got := matrix["zai_codex_runtime"]; !got.IdentityProbeRequired || got.Launch != EvidenceAuthoritative || got.Delivery != EvidenceAuthoritative || got.Completion != EvidenceAuthoritative || got.CompletionAuthorityScope != EvidenceAuthorityScopeProvider || got.Cancellation != EvidenceAuthoritative || got.CancellationAuthorityScope != EvidenceAuthorityScopeLocalProcessTree || got.Resume != EvidenceAuthoritative || got.Cleanup != EvidenceAuthoritative || got.CleanupAuthorityScope != EvidenceAuthorityScopeLocalProcessTree || got.LaunchCapacityControl != EvidenceAuthoritative || got.RequestCapacityControl != EvidenceAuthoritative || got.CapacityControlScope != CapacityControlScopeLocalShared {
+		t.Fatalf("Z.ai Codex-runtime matrix = %+v", got)
 	}
 	if got := matrix["zai_native_api"]; !got.IdentityProbeRequired || got.Launch != EvidenceAuthoritative || got.Delivery != EvidenceAuthoritative || got.Completion != EvidenceAuthoritative || got.CompletionAuthorityScope != EvidenceAuthorityScopeProvider || got.LiveErrorFeedback != EvidenceAuthoritative || got.Cancellation != EvidenceUnavailable || got.CancellationAuthorityScope != EvidenceAuthorityScopeUnavailable || got.Resume != EvidenceUnavailable || got.Cleanup != EvidenceSubmission || got.CleanupAuthorityScope != EvidenceAuthorityScopeLocalClient || got.CapacityControlScope != CapacityControlScopeLocalShared {
 		t.Fatalf("Z.ai native API matrix = %+v", got)

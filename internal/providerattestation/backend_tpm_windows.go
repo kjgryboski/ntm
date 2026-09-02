@@ -58,6 +58,10 @@ type nativeTPMSigner struct{}
 
 func newNativeHardwareSigner() hardwareSigner { return nativeTPMSigner{} }
 
+func NewPinnedWindowsBridge(string, string) (*Attestor, error) {
+	return nil, ErrProtectionUnavailable
+}
+
 func (nativeTPMSigner) EnsureKey(ctx context.Context, name string) (KeyMetadata, error) {
 	if ctx == nil || ctx.Err() != nil {
 		return KeyMetadata{}, ErrProtectionUnavailable

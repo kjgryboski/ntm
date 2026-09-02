@@ -227,7 +227,7 @@ func qualifiedZAIProfile() config.ProviderProfileConfig {
 		Entitlement:             provider.EntitlementClaudeCompat,
 		ConfigSHA256:            hash,
 		Command:                 "claude",
-		AutomationPolicy:        "zai-readonly-ci",
+		AutomationPolicy:        provider.DefaultZAIAutomationPolicyName,
 		ExactTargetOnly:         true,
 		ProbeRequired:           true,
 		ModelProbeState:         "qualified",
@@ -284,12 +284,36 @@ func TestGetSpawnZAIRequiresExactQualifiedProviderProfile(t *testing.T) {
 		t.Fatalf("GetSpawn(live fake) output=%+v err=%v", out, err)
 	}
 	if gotType != "zai" || !strings.Contains(gotCommand, "ANTHROPIC_BASE_URL='https://api.z.ai/api/anthropic'") || !strings.Contains(gotCommand, "--restricted") || !strings.Contains(gotCommand, "--disallowedTools 'Bash,Edit,Write,NotebookEdit'") {
-		t.Fatalf("Z.ai launch=(%q,%q), want NTM-compiled restricted command", gotType, gotCommand)
+		t.Fatalf("Z.ai launch=(%q,%q), want NTM-compiled restricted secondary Claude-compatible command", gotType, gotCommand)
 	}
 	if len(out.Agents) != 1 || out.Agents[0].ProviderIdentityHash != identity.Hash() || out.Agents[0].ProviderIdentityEvidence != provider.IdentityEvidenceProfileAttested || out.Agents[0].Admission == nil || out.Agents[0].Admission.CapacityControlScope != provider.CapacityControlScopeLocalShared {
 		t.Fatalf("Z.ai spawned agent identity=%+v", out.Agents)
 	}
 
+}
+
+func TestResolveZAISpawnProfileKeepsCodexOutOfPaneLane(t *testing.T) {
+	profile := qualifiedZAIProfile()
+	root := t.TempDir()
+	profile.Endpoint = "https://api.z.ai/api/v1"
+	profile.Runtime = "codex"
+	profile.Entitlement = provider.EntitlementCodexResponses
+	profile.AutomationPolicy = provider.DefaultZAICodexAutomationPolicyName
+	profile.RuntimeVersion = "0.149.0"
+	profile.Command = filepath.Join(root, "codex")
+	profile.RuntimeSHA256 = strings.Repeat("a", 64)
+	profile.BrokerCommand = filepath.Join(root, "caam")
+	profile.BrokerCommandSHA256 = strings.Repeat("b", 64)
+	profile.CredentialBridgeCommand = filepath.Join(root, "bridge")
+	profile.CredentialBridgeCommandSHA256 = strings.Repeat("c", 64)
+	profile.RuntimeHome = filepath.Join(root, "zai-codex", ".codex")
+	profile.BrokerCredentialID = "ntm.zai.coding_plan.test"
+	cfg := testSpawnConfig()
+	cfg.ProviderProfiles = map[string]config.ProviderProfileConfig{"zai-codex": profile}
+	_, _, err := resolveZAISpawnProfile(SpawnOptions{ZAICount: 1, ZAIProviderProfile: "zai-codex"}, cfg)
+	if err == nil || !strings.Contains(err.Error(), "secondary Claude-compatible pane lane") || !strings.Contains(err.Error(), "provider codex commands") {
+		t.Fatalf("Codex pane rejection=%v", err)
+	}
 }
 
 func TestGetSpawnZAIBlocksBeforeTmuxWithoutSuccessfulBoundProbe(t *testing.T) {

@@ -25,6 +25,24 @@ func TestRestrictedLaunchCommandRejectsNonOfficialEndpoint(t *testing.T) {
 	}
 }
 
+func TestRestrictedCodexLaunchCommandUsesIsolatedHomeAndBrokerAuth(t *testing.T) {
+	cmd, err := RestrictedCodexLaunchCommand("codex", OfficialCodexEndpoint, "glm-5.3", "/tmp/ntm-zai-codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"env -i", "CODEX_HOME='/tmp/ntm-zai-codex'", "'codex' --strict-config"} {
+		if !strings.Contains(cmd, want) {
+			t.Fatalf("command %q missing %q", cmd, want)
+		}
+	}
+	if strings.Contains(cmd, "ZAI_API_KEY") || strings.Contains(cmd, "ANTHROPIC_AUTH_TOKEN") {
+		t.Fatalf("Codex launch leaks credential transport: %q", cmd)
+	}
+	if _, err := RestrictedCodexLaunchCommand("codex", OfficialEndpoint, "glm-5.3", "relative"); err == nil {
+		t.Fatal("relative CODEX_HOME accepted")
+	}
+}
+
 func TestProbeArgsDisableEveryTool(t *testing.T) {
 	args := probeArgs("nonce", "glm-5.3-flash")
 	for _, flag := range []string{"--tools", "--allowedTools"} {

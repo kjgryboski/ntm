@@ -860,7 +860,7 @@ func buildCommandRegistry() []RobotCommandInfo {
 			Description: "Run the credential-free synthetic provider lifecycle/error-taxonomy harness for one exact profile and declared transport. This validates NTM's contract only; it does not qualify a live account or model.",
 			Parameters: []RobotParameter{
 				{Name: "provider-profile", Flag: "--provider-profile", Type: "string", Required: true, Description: "Exact configured provider profile"},
-				{Name: "provider-transport", Flag: "--provider-transport", Type: "string", Required: true, Description: "xai_acp, xai_grok_tui, or zai_claude_runtime"},
+				{Name: "provider-transport", Flag: "--provider-transport", Type: "string", Required: true, Description: "xai_acp, xai_grok_tui, zai_codex_runtime, zai_claude_runtime, or zai_native_api"},
 			},
 			Examples: []string{"ntm --robot-provider-conformance --provider-profile=xai-primary --provider-transport=xai_acp"},
 		},

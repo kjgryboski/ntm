@@ -2,6 +2,7 @@ package ratelimit
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -45,6 +46,280 @@ func TestAdmissionIsolatedByFullIdentityScope(t *testing.T) {
 	}
 	if got := c.Acquire(two); !got.Allowed {
 		t.Fatalf("distinct account must have an independent budget: %+v", got)
+	}
+}
+
+func subscriptionIdentity(t *testing.T, account, model, endpoint string) provider.Identity {
+	t.Helper()
+	id, err := provider.NewIdentityWithAuthorization("zai", account, model, endpoint, "codex", provider.CredentialClassCodingPlan, provider.BillingClassCodingPlan, provider.EntitlementCodexResponses, admissionConfigHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestSubscriptionAdmissionSharesPlanCreditsAcrossModelsButNotProviders(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultSubscriptionAdmissionConfig()
+	cfg.Exact.MaxConcurrent, cfg.Exact.TokenCapacity, cfg.Exact.TokensPerSecond = 2, 10, 10
+	cfg.MaxConcurrent, cfg.FiveHourCreditLimit, cfg.WeeklyCreditLimit, cfg.AdmissionReservation = 2, 1, 2, 1
+	controller, err := NewSubscriptionAdmissionController(cfg, "", func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	flash := subscriptionIdentity(t, "kevin", "glm-5.3-flash", "https://api.z.ai/api/v1")
+	hard := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	other := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.example.invalid/v1")
+	first := controller.Acquire(flash)
+	if !first.Allowed || !first.NoFailover {
+		t.Fatalf("first plan admission = %+v", first)
+	}
+	controller.Release(flash, first)
+	blocked := controller.Acquire(hard)
+	if blocked.Allowed || blocked.Reason != ErrorLongPeriodQuota || blocked.RetryAt == nil || !blocked.RetryAt.Equal(now.Add(5*time.Hour)) || !blocked.NoFailover {
+		t.Fatalf("same plan different model bypassed five-hour credits: %+v", blocked)
+	}
+	independent := controller.Acquire(other)
+	if !independent.Allowed {
+		t.Fatalf("different endpoint entitlement scope was incorrectly blocked: %+v", independent)
+	}
+	controller.Release(other, independent)
+	snapshot := controller.Snapshot(flash)
+	if snapshot.SubscriptionScopeSHA256 == "" || snapshot.FiveHourCreditsUsed != 1 || snapshot.FiveHourCreditsLimit != 1 || snapshot.FiveHourResetsAt == nil || !snapshot.FiveHourResetsAt.Equal(now.Add(5*time.Hour)) {
+		t.Fatalf("subscription snapshot = %+v", snapshot)
+	}
+}
+
+func TestSubscriptionAdmissionEnforcesWeeklyWindowAfterFiveHourReset(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultSubscriptionAdmissionConfig()
+	cfg.Exact.MaxConcurrent, cfg.Exact.TokenCapacity, cfg.Exact.TokensPerSecond = 2, 10, 10
+	cfg.FiveHourCreditLimit, cfg.WeeklyCreditLimit, cfg.AdmissionReservation = 1, 2, 1
+	controller, err := NewSubscriptionAdmissionController(cfg, "", func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	first := controller.Acquire(id)
+	if !first.Allowed {
+		t.Fatalf("first = %+v", first)
+	}
+	controller.Release(id, first)
+	now = now.Add(5 * time.Hour)
+	second := controller.Acquire(id)
+	if !second.Allowed {
+		t.Fatalf("second after five-hour reset = %+v", second)
+	}
+	controller.Release(id, second)
+	now = now.Add(5 * time.Hour)
+	weekly := controller.Acquire(id)
+	if weekly.Allowed || weekly.Reason != ErrorLongPeriodQuota || weekly.RetryAt == nil || !weekly.RetryAt.Equal(time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)) {
+		t.Fatalf("weekly limit = %+v", weekly)
+	}
+}
+
+func TestSubscriptionAdmissionSharesEntitlementWindowAcrossControllers(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	cfg := DefaultSubscriptionAdmissionConfig()
+	cfg.Exact.MaxConcurrent, cfg.Exact.TokenCapacity, cfg.Exact.TokensPerSecond = 2, 10, 10
+	cfg.FiveHourCreditLimit, cfg.WeeklyCreditLimit, cfg.AdmissionReservation = 1, 2, 1
+	path := filepath.Join(t.TempDir(), "subscription-capacity.json")
+	first, err := NewSubscriptionAdmissionController(cfg, path, func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewSubscriptionAdmissionController(cfg, path, func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	flash := subscriptionIdentity(t, "kevin", "glm-5.3-flash", "https://api.z.ai/api/v1")
+	hard := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	granted := first.Acquire(flash)
+	if !granted.Allowed {
+		t.Fatalf("first shared subscription decision = %+v", granted)
+	}
+	first.Release(flash, granted)
+	if blocked := second.Acquire(hard); blocked.Allowed || blocked.Reason != ErrorLongPeriodQuota || blocked.RetryAt == nil {
+		t.Fatalf("second controller bypassed shared subscription credits: %+v", blocked)
+	}
+}
+
+func TestDefaultSubscriptionAdmissionUsesDocumentedLiteFloorAndStatusProxy(t *testing.T) {
+	cfg := DefaultSubscriptionAdmissionConfig()
+	if cfg.FiveHourCreditLimit != 2000 || cfg.WeeklyCreditLimit != 10000 || cfg.AdmissionReservation <= 0 {
+		t.Fatalf("subscription defaults = %+v", cfg)
+	}
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	controller, err := NewSubscriptionAdmissionController(cfg, filepath.Join(t.TempDir(), "subscription-capacity.json"), func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := controller.CapacityStatus(); status.Scope != provider.CapacityControlScopeLocalShared {
+		t.Fatalf("subscription capacity status = %+v", status)
+	}
+	controller.RecordSuccess(subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1"))
+}
+
+func TestZAICodingPlanCreditsUsesResolvedModelAndSingaporeOffPeak(t *testing.T) {
+	peak := time.Date(2026, 9, 7, 7, 0, 0, 0, time.UTC) // Monday 15:00 Singapore
+	offPeak := peak.Add(4 * time.Hour)
+	usage := TokenUsage{InputTokens: 10_000, CachedInputTokens: 10_000, OutputTokens: 10_000}
+	credits, err := ZAICodingPlanCredits("glm-5.3", usage, peak)
+	if err != nil || math.Abs(credits-32.6) > 1e-9 {
+		t.Fatalf("peak glm-5.3 credits=%v err=%v", credits, err)
+	}
+	offPeakCredits, err := ZAICodingPlanCredits("glm-5.3", usage, offPeak)
+	if err != nil || math.Abs(offPeakCredits-16.3) > 1e-9 {
+		t.Fatalf("off-peak glm-5.3 credits=%v err=%v", offPeakCredits, err)
+	}
+	flash, err := ZAICodingPlanCredits("glm-5.3-flash", usage, peak)
+	if err != nil || math.Abs(flash-10.86) > 1e-9 {
+		t.Fatalf("flash credits=%v err=%v", flash, err)
+	}
+	if _, err := ZAICodingPlanCredits("requested-model", usage, peak); err == nil {
+		t.Fatal("unresolved/requested model was accepted")
+	}
+}
+
+func TestSubscriptionAdmissionReconcilesReservationAndUsesRollingFiveHourWindow(t *testing.T) {
+	now := time.Date(2026, 9, 7, 7, 0, 0, 0, time.UTC)
+	cfg := DefaultSubscriptionAdmissionConfig()
+	cfg.Exact.MaxConcurrent, cfg.Exact.TokenCapacity, cfg.Exact.TokensPerSecond = 2, 10, 10
+	cfg.FiveHourCreditLimit, cfg.WeeklyCreditLimit, cfg.AdmissionReservation = 1, 10, 0.01
+	controller, err := NewSubscriptionAdmissionController(cfg, "", func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	decision := controller.Acquire(id)
+	if !decision.Allowed {
+		t.Fatalf("reservation admission=%+v", decision)
+	}
+	if err := controller.RecordUsage(id, decision, "glm-5.3", TokenUsage{OutputTokens: 1000}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.RecordUsage(id, decision, "glm-5.3", TokenUsage{OutputTokens: 1000}, now); err == nil {
+		t.Fatal("duplicate reconciliation succeeded")
+	}
+	controller.Release(id, decision)
+	snapshot := controller.Snapshot(id)
+	if math.Abs(snapshot.FiveHourCreditsUsed-2.4) > 1e-9 || snapshot.LimitEvidence == "" || snapshot.ResetEvidence == "" {
+		t.Fatalf("reconciled snapshot=%+v", snapshot)
+	}
+	now = now.Add(5*time.Hour + time.Nanosecond)
+	if next := controller.Acquire(id); !next.Allowed {
+		t.Fatalf("rolling five-hour expiration did not release usage: %+v", next)
+	}
+}
+
+func TestSubscriptionAdmissionSnapshotReportsConfiguredScopeBeforeFirstUse(t *testing.T) {
+	now := time.Date(2026, 9, 7, 7, 0, 0, 0, time.UTC)
+	cfg := DefaultSubscriptionAdmissionConfig()
+	controller, err := NewSubscriptionAdmissionController(cfg, "", func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	snapshot := controller.Snapshot(id)
+	if snapshot.SubscriptionScopeSHA256 == "" || snapshot.FiveHourCreditsLimit != cfg.FiveHourCreditLimit || snapshot.WeeklyCreditsLimit != cfg.WeeklyCreditLimit || snapshot.LimitEvidence == "" || snapshot.ResetEvidence == "" {
+		t.Fatalf("pristine subscription snapshot=%+v", snapshot)
+	}
+}
+
+func TestSubscriptionAdmissionUnknownUsageConservativelyReservesWeeklyScope(t *testing.T) {
+	now := time.Date(2026, 9, 7, 7, 0, 0, 0, time.UTC)
+	cfg := DefaultSubscriptionAdmissionConfig()
+	cfg.Exact.MaxConcurrent, cfg.Exact.TokenCapacity, cfg.Exact.TokensPerSecond = 2, 10, 10
+	cfg.MaxConcurrent, cfg.FiveHourCreditLimit, cfg.WeeklyCreditLimit, cfg.AdmissionReservation = 2, 2, 9, 0.01
+	controller, err := NewSubscriptionAdmissionController(cfg, "", func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	decision := controller.Acquire(id)
+	if !decision.Allowed {
+		t.Fatalf("admission=%+v", decision)
+	}
+	if err := controller.RecordUnknownUsage(id, decision); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.RecordUnknownUsage(id, decision); err == nil {
+		t.Fatal("duplicate unknown reservation succeeded")
+	}
+	controller.Release(id, decision)
+	snapshot := controller.Snapshot(id)
+	if !snapshot.UnknownUsageReserved || snapshot.FiveHourCreditsUsed != cfg.WeeklyCreditLimit || snapshot.WeeklyCreditsUsed != cfg.WeeklyCreditLimit {
+		t.Fatalf("unknown reservation snapshot=%+v", snapshot)
+	}
+	if blocked := controller.Acquire(id); blocked.Allowed || blocked.Reason != ErrorLongPeriodQuota {
+		t.Fatalf("unknown dispatched usage did not block plan: %+v", blocked)
+	}
+	now = now.Add(5*time.Hour + time.Nanosecond)
+	if blocked := controller.Acquire(id); blocked.Allowed || blocked.Reason != ErrorLongPeriodQuota {
+		t.Fatalf("weekly unknown reservation expired with five-hour window: %+v", blocked)
+	}
+	now = now.Add(7*24*time.Hour + time.Nanosecond)
+	if allowed := controller.Acquire(id); !allowed.Allowed {
+		t.Fatalf("weekly unknown reservation did not expire: %+v", allowed)
+	}
+}
+
+func TestSubscriptionAdmissionCancelReservationRemovesOnlyUndispatchedEstimate(t *testing.T) {
+	now := time.Date(2026, 9, 7, 7, 0, 0, 0, time.UTC)
+	cfg := DefaultSubscriptionAdmissionConfig()
+	cfg.Exact.MaxConcurrent, cfg.Exact.TokenCapacity, cfg.Exact.TokensPerSecond = 2, 10, 10
+	cfg.MaxConcurrent, cfg.FiveHourCreditLimit, cfg.WeeklyCreditLimit, cfg.AdmissionReservation = 2, 2, 9, 0.01
+	controller, err := NewSubscriptionAdmissionController(cfg, "", func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	decision := controller.Acquire(id)
+	if !decision.Allowed {
+		t.Fatalf("admission=%+v", decision)
+	}
+	if err := controller.CancelReservation(id, decision); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.CancelReservation(id, decision); err == nil {
+		t.Fatal("duplicate cancellation succeeded")
+	}
+	controller.Release(id, decision)
+	snapshot := controller.Snapshot(id)
+	if snapshot.FiveHourCreditsUsed != 0 || snapshot.WeeklyCreditsUsed != 0 || snapshot.UnknownUsageReserved {
+		t.Fatalf("canceled reservation snapshot=%+v", snapshot)
+	}
+}
+
+func TestSubscriptionAdmissionMultipleUnknownTurnsReserveOneWeeklyCeiling(t *testing.T) {
+	now := time.Date(2026, 9, 7, 7, 0, 0, 0, time.UTC)
+	cfg := DefaultSubscriptionAdmissionConfig()
+	cfg.Exact.MaxConcurrent, cfg.Exact.TokenCapacity, cfg.Exact.TokensPerSecond = 2, 10, 10
+	cfg.MaxConcurrent, cfg.FiveHourCreditLimit, cfg.WeeklyCreditLimit, cfg.AdmissionReservation = 2, 20, 9, 0.01
+	controller, err := NewSubscriptionAdmissionController(cfg, "", func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	first := controller.Acquire(id)
+	if !first.Allowed {
+		t.Fatalf("first admission=%+v", first)
+	}
+	controller.Release(id, first)
+	second := controller.Acquire(id)
+	if !second.Allowed {
+		t.Fatalf("second admission=%+v", second)
+	}
+	controller.Release(id, second)
+	if err := controller.RecordUnknownUsage(id, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.RecordUnknownUsage(id, second); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := controller.Snapshot(id)
+	if !snapshot.UnknownUsageReserved || math.Abs(snapshot.WeeklyCreditsUsed-cfg.WeeklyCreditLimit) > 1e-9 {
+		t.Fatalf("multiple unknown reservation snapshot=%+v", snapshot)
 	}
 }
 

@@ -3,9 +3,11 @@ package ratelimit
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -99,6 +101,430 @@ type admissionState struct {
 	halfOpenInFlight    bool
 	terminalReason      ErrorClass
 	leases              map[string]admissionLease
+	subscriptionUsage   []subscriptionUsageEvent
+}
+
+type subscriptionUsageEvent struct {
+	LeaseID    string    `json:"lease_id"`
+	ObservedAt time.Time `json:"observed_at"`
+	Credits    float64   `json:"credits"`
+	Reconciled bool      `json:"reconciled"`
+	// Unknown records that a dispatched request could not be reconciled to
+	// provider-resolved model and token evidence. Its conservative reservation
+	// deliberately prevents additional spend in the same subscription scope.
+	Unknown bool `json:"unknown"`
+}
+
+// SubscriptionAdmissionConfig applies one exact-identity controller together
+// with a separate shared Coding Plan entitlement budget. Window credits are
+// consumed at admission, never refunded after dispatch.
+type SubscriptionAdmissionConfig struct {
+	Exact                AdmissionConfig
+	MaxConcurrent        int
+	FiveHourCreditLimit  float64
+	WeeklyCreditLimit    float64
+	AdmissionReservation float64
+	FiveHourWindow       time.Duration
+	WeeklyWindow         time.Duration
+}
+
+func DefaultSubscriptionAdmissionConfig() SubscriptionAdmissionConfig {
+	return SubscriptionAdmissionConfig{
+		Exact: DefaultAdmissionConfig(), MaxConcurrent: 1,
+		FiveHourCreditLimit: 2000, WeeklyCreditLimit: 10000, AdmissionReservation: 0.01,
+		FiveHourWindow: 5 * time.Hour, WeeklyWindow: 7 * 24 * time.Hour,
+	}
+}
+
+func (c SubscriptionAdmissionConfig) validate() error {
+	if err := c.Exact.validate(); err != nil {
+		return err
+	}
+	if c.MaxConcurrent < 1 || c.FiveHourCreditLimit <= 0 || c.WeeklyCreditLimit <= 0 || c.AdmissionReservation <= 0 || c.FiveHourWindow <= 0 || c.WeeklyWindow <= 0 {
+		return errors.New("subscription admission window values must be positive")
+	}
+	return nil
+}
+
+// SubscriptionDecision is the paired exact-identity and entitlement lease.
+// Callers must release the same value; NoFailover is always true because the
+// scope cannot choose another provider, account, or billing entitlement.
+type SubscriptionDecision struct {
+	Allowed    bool
+	Reason     ErrorClass
+	RetryAt    *time.Time
+	NoFailover bool
+	exact      Decision
+	plan       Decision
+}
+
+// SubscriptionCapacitySnapshot exposes non-secret window use/reset evidence.
+type SubscriptionCapacitySnapshot struct {
+	IdentityHash            string                        `json:"identity_hash"`
+	SubscriptionScopeSHA256 string                        `json:"subscription_scope_sha256"`
+	Exact                   AdmissionSnapshot             `json:"exact"`
+	PlanRunning             int                           `json:"plan_running"`
+	FiveHourCreditsUsed     float64                       `json:"five_hour_credits_used"`
+	FiveHourCreditsLimit    float64                       `json:"five_hour_credits_limit"`
+	FiveHourResetsAt        *time.Time                    `json:"five_hour_resets_at,omitempty"`
+	WeeklyCreditsUsed       float64                       `json:"weekly_credits_used"`
+	WeeklyCreditsLimit      float64                       `json:"weekly_credits_limit"`
+	WeeklyResetsAt          *time.Time                    `json:"weekly_resets_at,omitempty"`
+	Scope                   provider.CapacityControlScope `json:"scope"`
+	FallbackReason          string                        `json:"fallback_reason,omitempty"`
+	LimitEvidence           string                        `json:"limit_evidence,omitempty"`
+	ResetEvidence           string                        `json:"reset_evidence,omitempty"`
+	UnknownUsageReserved    bool                          `json:"unknown_usage_reserved"`
+}
+
+// TokenUsage contains provider-reported token counts. Callers must pass a
+// provider-resolved model to RecordUsage; requested model names are rejected.
+type TokenUsage struct {
+	InputTokens       int64
+	CachedInputTokens int64
+	OutputTokens      int64
+}
+
+// SubscriptionAdmissionController preserves the existing AdmissionController
+// API while requiring a paired plan lease for callers that opt into it.
+type SubscriptionAdmissionController struct {
+	exact  *AdmissionController
+	plan   *AdmissionController
+	config SubscriptionAdmissionConfig
+}
+
+func NewSubscriptionAdmissionController(config SubscriptionAdmissionConfig, storePath string, now func() time.Time, randFn func() float64) (*SubscriptionAdmissionController, error) {
+	if err := config.validate(); err != nil {
+		return nil, err
+	}
+	var exact, plan *AdmissionController
+	var err error
+	if storePath != "" {
+		exact, err = NewSharedAdmissionController(config.Exact, storePath, now, randFn)
+		if err != nil {
+			return nil, err
+		}
+		plan, err = NewSharedAdmissionController(config.Exact, storePath, now, randFn)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		exact, err = NewAdmissionController(config.Exact, now, randFn)
+		if err != nil {
+			return nil, err
+		}
+		plan, err = NewAdmissionController(config.Exact, now, randFn)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return &SubscriptionAdmissionController{exact: exact, plan: plan, config: config}, nil
+}
+
+func (c *SubscriptionAdmissionController) Acquire(identity provider.Identity) SubscriptionDecision {
+	if c == nil || c.exact == nil || c.plan == nil || !validIdentity(identity) || identity.SubscriptionCapacityScope() == "" {
+		return SubscriptionDecision{Reason: ErrorIdentityMismatch, NoFailover: true}
+	}
+	exact := c.exact.Acquire(identity)
+	if !exact.Allowed {
+		return SubscriptionDecision{Reason: exact.Reason, RetryAt: exact.RetryAt, NoFailover: true}
+	}
+	plan := c.acquirePlan(identity.SubscriptionCapacityScope())
+	if !plan.Allowed {
+		c.exact.Release(identity, exact)
+		return SubscriptionDecision{Reason: plan.Reason, RetryAt: plan.RetryAt, NoFailover: true}
+	}
+	return SubscriptionDecision{Allowed: true, NoFailover: true, exact: exact, plan: plan}
+}
+
+func (c *SubscriptionAdmissionController) Release(identity provider.Identity, decision SubscriptionDecision) {
+	if c == nil || !decision.Allowed || !validIdentity(identity) {
+		return
+	}
+	c.plan.releaseScope(identity.SubscriptionCapacityScope(), decision.plan)
+	c.exact.Release(identity, decision.exact)
+}
+
+// CapacityStatus reports shared only when both exact and subscription plan
+// controllers can coordinate through their local durable store.
+func (c *SubscriptionAdmissionController) CapacityStatus() CapacityStatus {
+	if c == nil || c.exact == nil || c.plan == nil {
+		return CapacityStatus{Scope: provider.CapacityControlScopeProcessLocal, FallbackReason: "subscription admission controller is unavailable"}
+	}
+	exact, plan := c.exact.CapacityStatus(), c.plan.CapacityStatus()
+	if exact.Scope == provider.CapacityControlScopeLocalShared && plan.Scope == provider.CapacityControlScopeLocalShared {
+		return exact
+	}
+	reason := exact.FallbackReason
+	if reason == "" {
+		reason = plan.FallbackReason
+	}
+	return CapacityStatus{Scope: provider.CapacityControlScopeProcessLocal, FallbackReason: reason}
+}
+
+// RecordSuccess mirrors the existing admission boundary for integrations that
+// only need to clear transient controller-local state after a verified run.
+func (c *SubscriptionAdmissionController) RecordSuccess(identity provider.Identity) {
+	if c == nil || !validIdentity(identity) {
+		return
+	}
+	c.exact.RecordSuccess(identity)
+	c.plan.recordSuccessScope(identity.SubscriptionCapacityScope())
+}
+
+// RecordUsage replaces one small admission reservation with provider-reported
+// Coding Plan credit usage. resolvedModel must come from the provider receipt,
+// never a configured/requested model. observedAt is retained only as a
+// controller-local rolling-window estimate.
+func (c *SubscriptionAdmissionController) RecordUsage(identity provider.Identity, decision SubscriptionDecision, resolvedModel string, usage TokenUsage, observedAt time.Time) error {
+	if c == nil || c.plan == nil || !decision.Allowed || !validIdentity(identity) || decision.plan.leaseID == "" || observedAt.IsZero() {
+		return errors.New("invalid subscription usage reconciliation")
+	}
+	credits, err := ZAICodingPlanCredits(resolvedModel, usage, observedAt)
+	if err != nil {
+		return err
+	}
+	scope := identity.SubscriptionCapacityScope()
+	updated := false
+	if !c.plan.withAuthoritativeState(scope, c.plan.now(), func(state *admissionState) {
+		for index := range state.subscriptionUsage {
+			event := &state.subscriptionUsage[index]
+			if event.LeaseID != decision.plan.leaseID {
+				continue
+			}
+			if event.Reconciled {
+				return
+			}
+			event.Credits, event.ObservedAt, event.Reconciled = credits, observedAt.UTC(), true
+			updated = true
+			return
+		}
+	}) {
+		return errors.New("shared subscription usage reconciliation is unavailable")
+	}
+	if !updated {
+		return errors.New("subscription usage reservation is unavailable or already reconciled")
+	}
+	return nil
+}
+
+// CancelReservation removes the small controller-local credit reservation for
+// an admitted operation that is authoritatively known not to have started the
+// provider process. Callers must not use it after ProcessStarted becomes true;
+// dispatched operations require RecordUsage or RecordUnknownUsage instead.
+func (c *SubscriptionAdmissionController) CancelReservation(identity provider.Identity, decision SubscriptionDecision) error {
+	if c == nil || c.plan == nil || !decision.Allowed || !validIdentity(identity) || decision.plan.leaseID == "" {
+		return errors.New("invalid subscription reservation cancellation")
+	}
+	scope := identity.SubscriptionCapacityScope()
+	removed := false
+	if !c.plan.withAuthoritativeState(scope, c.plan.now(), func(state *admissionState) {
+		for index := range state.subscriptionUsage {
+			event := state.subscriptionUsage[index]
+			if event.LeaseID != decision.plan.leaseID || event.Reconciled {
+				continue
+			}
+			state.subscriptionUsage = append(state.subscriptionUsage[:index], state.subscriptionUsage[index+1:]...)
+			removed = true
+			return
+		}
+	}) {
+		return errors.New("shared subscription reservation cancellation is unavailable")
+	}
+	if !removed {
+		return errors.New("subscription usage reservation is unavailable or already reconciled")
+	}
+	return nil
+}
+
+// RecordUnknownUsage replaces an admission reservation after a request was
+// dispatched but cannot be authoritatively reconciled. It reserves the full
+// documented weekly limit for that exact subscription scope. This deliberately
+// fails closed: a later operation cannot spend the plan on the strength of the
+// tiny normal admission reservation alone. The rolling window is explicit in
+// Snapshot, so this is a conservative local estimate rather than a claim about
+// the provider's authoritative remaining quota.
+func (c *SubscriptionAdmissionController) RecordUnknownUsage(identity provider.Identity, decision SubscriptionDecision) error {
+	if c == nil || c.plan == nil || !decision.Allowed || !validIdentity(identity) || decision.plan.leaseID == "" {
+		return errors.New("invalid unknown subscription usage reservation")
+	}
+	scope := identity.SubscriptionCapacityScope()
+	updated := false
+	if !c.plan.withAuthoritativeState(scope, c.plan.now(), func(state *admissionState) {
+		for index := range state.subscriptionUsage {
+			event := &state.subscriptionUsage[index]
+			if event.LeaseID != decision.plan.leaseID {
+				continue
+			}
+			if event.Reconciled {
+				return
+			}
+			// One or more unknown operations fail the whole subscription scope
+			// closed, but never multiply the documented weekly ceiling. Existing
+			// reconciled usage and other admission reservations count toward it.
+			var otherCredits float64
+			for otherIndex, other := range state.subscriptionUsage {
+				if otherIndex != index {
+					otherCredits += other.Credits
+				}
+			}
+			event.Credits = c.config.WeeklyCreditLimit - otherCredits
+			if event.Credits < 0 {
+				event.Credits = 0
+			}
+			event.ObservedAt = c.plan.now().UTC()
+			event.Reconciled = true
+			event.Unknown = true
+			updated = true
+			return
+		}
+	}) {
+		return errors.New("shared unknown subscription usage reservation is unavailable")
+	}
+	if !updated {
+		return errors.New("subscription usage reservation is unavailable or already reconciled")
+	}
+	return nil
+}
+
+var zaiSingapore = time.FixedZone("Asia/Singapore", 8*60*60)
+
+// ZAICodingPlanCredits implements the documented Coding Plan credit formula.
+// Lite-floor limits and off-peak scheduling are estimates; the provider's
+// resolved model is required so a transparent model remap is charged correctly.
+func ZAICodingPlanCredits(resolvedModel string, usage TokenUsage, observedAt time.Time) (float64, error) {
+	if observedAt.IsZero() || usage.InputTokens < 0 || usage.CachedInputTokens < 0 || usage.OutputTokens < 0 {
+		return 0, errors.New("invalid Z.ai Coding Plan usage")
+	}
+	var inputRate, cachedRate, outputRate float64
+	switch resolvedModel {
+	case "glm-5.3":
+		inputRate, cachedRate, outputRate = 6.9, 1.7, 24
+	case "glm-5.3-flash":
+		inputRate, cachedRate, outputRate = 2.3, 0.56, 8
+	default:
+		return 0, errors.New("provider-resolved model is not eligible for Z.ai Coding Plan credit accounting")
+	}
+	credits := (float64(usage.InputTokens)*inputRate + float64(usage.CachedInputTokens)*cachedRate + float64(usage.OutputTokens)*outputRate) / 10000
+	local := observedAt.In(zaiSingapore)
+	if local.Weekday() < time.Monday || local.Weekday() > time.Friday || local.Hour() < 14 || local.Hour() >= 18 {
+		credits *= 0.5
+	}
+	return credits, nil
+}
+
+func (c *SubscriptionAdmissionController) acquirePlan(scope provider.CapacityScope) Decision {
+	now := c.plan.now()
+	var decision Decision
+	var leaseID string
+	if !c.plan.withAcquireState(scope, now, func(state *admissionState) {
+		c.plan.reclaimLocalExpiredLeases(state, now)
+		if state.terminalReason != "" {
+			decision = Decision{Reason: state.terminalReason, NoFailover: true}
+			return
+		}
+		pruneSubscriptionUsage(state, now, c.config.WeeklyWindow)
+		fiveUsed, fiveReset := subscriptionUsageTotal(state.subscriptionUsage, now, c.config.FiveHourWindow)
+		weeklyUsed, weeklyReset := subscriptionUsageTotal(state.subscriptionUsage, now, c.config.WeeklyWindow)
+		if state.running >= c.config.MaxConcurrent {
+			decision = Decision{Reason: ErrorRateLimited, NoFailover: true}
+			return
+		}
+		if fiveUsed+c.config.AdmissionReservation > c.config.FiveHourCreditLimit {
+			decision = retryDecision(ErrorLongPeriodQuota, fiveReset)
+			return
+		}
+		if weeklyUsed+c.config.AdmissionReservation > c.config.WeeklyCreditLimit {
+			decision = retryDecision(ErrorLongPeriodQuota, weeklyReset)
+			return
+		}
+		leaseID = c.plan.newLeaseID()
+		if state.leases == nil {
+			state.leases = make(map[string]admissionLease)
+		}
+		state.leases[leaseID] = admissionLease{OwnerPID: c.plan.ownerPID, OwnerID: c.plan.ownerID, OperationID: leaseID, ExpiresAt: now.Add(c.plan.config.LeaseTTL)}
+		state.running = len(state.leases)
+		state.subscriptionUsage = append(state.subscriptionUsage, subscriptionUsageEvent{LeaseID: leaseID, ObservedAt: now.UTC(), Credits: c.config.AdmissionReservation})
+		decision = Decision{Allowed: true, NoFailover: true, leaseID: leaseID}
+	}) {
+		return Decision{Reason: ErrorUnknown, NoFailover: true}
+	}
+	if decision.Allowed {
+		c.plan.startLeaseRenewal(scope, leaseID)
+	}
+	return decision
+}
+
+func pruneSubscriptionUsage(state *admissionState, now time.Time, width time.Duration) {
+	cutoff := now.Add(-width)
+	kept := state.subscriptionUsage[:0]
+	for _, event := range state.subscriptionUsage {
+		if !event.ObservedAt.After(cutoff) {
+			continue
+		}
+		kept = append(kept, event)
+	}
+	state.subscriptionUsage = kept
+}
+
+func subscriptionUsageTotal(events []subscriptionUsageEvent, now time.Time, width time.Duration) (float64, time.Time) {
+	cutoff := now.Add(-width)
+	var total float64
+	var earliest time.Time
+	for _, event := range events {
+		if !event.ObservedAt.After(cutoff) {
+			continue
+		}
+		total += event.Credits
+		if earliest.IsZero() || event.ObservedAt.Before(earliest) {
+			earliest = event.ObservedAt
+		}
+	}
+	if earliest.IsZero() {
+		return total, now.UTC()
+	}
+	return total, earliest.Add(width).UTC()
+}
+
+func (c *SubscriptionAdmissionController) Snapshot(identity provider.Identity) SubscriptionCapacitySnapshot {
+	if c == nil || c.exact == nil || c.plan == nil {
+		return SubscriptionCapacitySnapshot{IdentityHash: identity.Hash(), Scope: provider.CapacityControlScopeProcessLocal, FallbackReason: "subscription admission controller is unavailable"}
+	}
+	snapshot := SubscriptionCapacitySnapshot{
+		Exact:                c.exact.Snapshot(identity),
+		IdentityHash:         identity.Hash(),
+		Scope:                c.exact.CapacityStatus().Scope,
+		FiveHourCreditsLimit: c.config.FiveHourCreditLimit,
+		WeeklyCreditsLimit:   c.config.WeeklyCreditLimit,
+		LimitEvidence:        "documented_zai_lite_floor_controller_local_estimate",
+		ResetEvidence:        "controller_local_rolling_window_estimate",
+	}
+	if !validIdentity(identity) {
+		return snapshot
+	}
+	scope := identity.SubscriptionCapacityScope()
+	snapshot.SubscriptionScopeSHA256 = strings.TrimPrefix(scope.String(), "subscription:")
+	state, ok, err := c.plan.subscriptionState(scope)
+	if err != nil {
+		snapshot.Scope, snapshot.FallbackReason = provider.CapacityControlScopeProcessLocal, err.Error()
+		return snapshot
+	}
+	if !ok {
+		return snapshot
+	}
+	now := c.plan.now()
+	pruneSubscriptionUsage(&state, now, c.config.WeeklyWindow)
+	fiveUsed, fiveReset := subscriptionUsageTotal(state.subscriptionUsage, now, c.config.FiveHourWindow)
+	weeklyUsed, weeklyReset := subscriptionUsageTotal(state.subscriptionUsage, now, c.config.WeeklyWindow)
+	snapshot.PlanRunning, snapshot.FiveHourCreditsUsed, snapshot.WeeklyCreditsUsed = state.running, fiveUsed, weeklyUsed
+	snapshot.FiveHourResetsAt, snapshot.WeeklyResetsAt = &fiveReset, &weeklyReset
+	for _, event := range state.subscriptionUsage {
+		if event.Unknown {
+			snapshot.UnknownUsageReserved = true
+			break
+		}
+	}
+	return snapshot
 }
 
 // AdmissionController isolates budgets by provider.Identity.CapacityScope.
@@ -251,6 +677,15 @@ func (c *AdmissionController) withState(scope provider.CapacityScope, now time.T
 // transaction must never spend local tokens or create a local lease: callers
 // use a successful acquisition as authority to contact the exact provider.
 func (c *AdmissionController) withAcquireState(scope provider.CapacityScope, now time.Time, fn func(*admissionState)) bool {
+	return c.withAuthoritativeState(scope, now, fn)
+}
+
+// withAuthoritativeState permits local state only when this controller was
+// deliberately created without a shared store. A configured store that cannot
+// be transacted is a fail-closed condition: reconciliation must not create a
+// divergent process-local accounting record after another process admitted the
+// same subscription.
+func (c *AdmissionController) withAuthoritativeState(scope provider.CapacityScope, now time.Time, fn func(*admissionState)) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.shared != nil {
@@ -335,7 +770,13 @@ func (c *AdmissionController) Release(identity provider.Identity, decision Decis
 	if !validIdentity(identity) || !decision.Allowed || decision.leaseID == "" {
 		return
 	}
-	scope := identity.CapacityScope()
+	c.releaseScope(identity.CapacityScope(), decision)
+}
+
+func (c *AdmissionController) releaseScope(scope provider.CapacityScope, decision Decision) {
+	if c == nil || scope == "" || !decision.Allowed || decision.leaseID == "" {
+		return
+	}
 	c.withState(scope, c.now(), func(state *admissionState) {
 		c.reclaimLocalExpiredLeases(state, c.now())
 		lease, ok := state.leases[decision.leaseID]
@@ -349,6 +790,28 @@ func (c *AdmissionController) Release(identity provider.Identity, decision Decis
 		delete(state.leases, decision.leaseID)
 		state.running = len(state.leases)
 	})
+}
+
+func (c *AdmissionController) subscriptionState(scope provider.CapacityScope) (admissionState, bool, error) {
+	if c == nil || scope == "" {
+		return admissionState{}, false, errors.New("subscription capacity scope is unavailable")
+	}
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.shared != nil && c.fallbackReason == "" {
+		state, ok, err := c.shared.snapshot(scope, now)
+		if err != nil {
+			c.fallbackReason = err.Error()
+			return admissionState{}, false, err
+		}
+		return state, ok, nil
+	}
+	state := c.states[scope]
+	if state == nil {
+		return admissionState{}, false, nil
+	}
+	return *state, true, nil
 }
 
 // RecordResult records the outcome of one acquired request. retryAfter is
@@ -403,7 +866,14 @@ func (c *AdmissionController) RecordSuccess(identity provider.Identity) {
 	if !validIdentity(identity) {
 		return
 	}
-	c.withState(identity.CapacityScope(), c.now(), func(state *admissionState) {
+	c.recordSuccessScope(identity.CapacityScope())
+}
+
+func (c *AdmissionController) recordSuccessScope(scope provider.CapacityScope) {
+	if c == nil || scope == "" {
+		return
+	}
+	c.withState(scope, c.now(), func(state *admissionState) {
 		state.consecutiveFailures = 0
 		state.nextRetry = time.Time{}
 		state.circuitOpenUntil = time.Time{}

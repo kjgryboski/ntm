@@ -25,11 +25,99 @@ import (
 const (
 	// ReadOnlyTools deliberately excludes Bash, Edit, Write, and every other
 	// mutation-capable tool. A future test-capable policy needs separate review.
-	ReadOnlyTools       = "Read,Glob,Grep,WebSearch"
-	maxProbeOutput      = 1 << 20
-	OfficialEndpoint    = "https://api.z.ai/api/anthropic"
-	DefaultProbeTimeout = 60 * time.Second
+	ReadOnlyTools    = "Read,Glob,Grep,WebSearch"
+	maxProbeOutput   = 1 << 20
+	OfficialEndpoint = "https://api.z.ai/api/anthropic"
+	// OfficialCodexEndpoint is the official Z.ai Coding Plan Responses API
+	// endpoint consumed by an isolated Codex runtime.
+	OfficialCodexEndpoint = "https://api.z.ai/api/v1"
+	DefaultProbeTimeout   = 60 * time.Second
 )
+
+// RestrictedCodexLaunchCommand compiles the primary Z.ai Coding Plan runtime.
+// The profile must name an isolated absolute CODEX_HOME. Credentials never
+// cross NTM's environment or argv boundary: the reviewed config uses Codex's
+// command-backed auth provider and is attested by ConfigSHA256. The generated
+// config is intentionally owned by CAAM/the operator rather than synthesized
+// from a secret here.
+func RestrictedCodexLaunchCommand(binary, endpoint, model, runtimeHome string) (string, error) {
+	if err := ValidateExecutable(binary); err != nil {
+		return "", err
+	}
+	if endpoint != OfficialCodexEndpoint {
+		return "", fmt.Errorf("endpoint must be %s", OfficialCodexEndpoint)
+	}
+	if model != strings.TrimSpace(model) || model == "" || hasControl(model) {
+		return "", errors.New("model must be a non-empty trimmed literal value")
+	}
+	if !filepath.IsAbs(runtimeHome) || hasControl(runtimeHome) {
+		return "", errors.New("runtime_home must be an absolute path")
+	}
+	q := shellQuote
+	launch := strings.Join([]string{"env", "-i", "PATH=\"$PATH\"", "HOME=\"$HOME\"", "TMPDIR=\"$TMPDIR\"", "LANG=\"$LANG\"", "TERM=\"$TERM\"", "CODEX_HOME=" + q(runtimeHome), q(binary), "--strict-config"}, " ")
+	return "exec " + launch, nil
+}
+
+// CodexProbe is a bounded structured no-write readiness check. A successful
+// result proves the isolated Codex process returned the nonce and records a
+// redacted session/output hash. Current Codex event schemas do not guarantee a
+// resolved-model echo, so this probe deliberately does not promote the
+// manifest model into runtime model evidence; production admission remains
+// NO-GO until a versioned model-evidence extractor is qualified. Resume stays
+// unavailable until a dedicated live lineage probe is added.
+func CodexProbe(ctx context.Context, binary, endpoint, model, runtimeHome string) (Receipt, error) {
+	if ctx == nil {
+		return Receipt{FailureClass: "invalid_context"}, errors.New("Z.ai Codex probe requires a context")
+	}
+	if _, err := RestrictedCodexLaunchCommand(binary, endpoint, model, runtimeHome); err != nil {
+		return Receipt{FailureClass: "invalid_identity"}, err
+	}
+	nonce, err := newNonce()
+	if err != nil {
+		return Receipt{FailureClass: "nonce_generation"}, err
+	}
+	cmd := exec.CommandContext(ctx, binary, "--strict-config", "exec", "--json", "--sandbox", "read-only", "Reply with this exact nonce and no other text: "+nonce)
+	cmd.Env = minimalCodexEnvironment(os.Environ(), endpoint, runtimeHome)
+	stdout, stderr := &boundedBuffer{limit: maxProbeOutput}, &boundedBuffer{limit: maxProbeOutput}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	runErr := cmd.Run()
+	output := append(append(append([]byte(nil), stdout.Bytes()...), '\n'), stderr.Bytes()...)
+	r := Receipt{NonceSHA256: hash([]byte(nonce)), OutputSHA256: hash(output), Model: model}
+	r.HTTPStatus, r.ProviderCode = structuredErrorStatus(output)
+	if r.HTTPStatus != 0 || r.ProviderCode != "" {
+		r.ProviderErrorClass = provider.ClassifyProviderError(r.HTTPStatus, r.ProviderCode)
+	}
+	if stdout.exceeded || stderr.exceeded {
+		r.FailureClass = "output_limit"
+		return r, errors.New("Z.ai Codex probe output exceeded redacted limit")
+	}
+	if runErr != nil {
+		r.FailureClass = classify(runErr)
+		return r, fmt.Errorf("Z.ai Codex probe failed: %s", r.FailureClass)
+	}
+	if !bytes.Contains(stdout.Bytes(), []byte(nonce)) {
+		r.FailureClass = "nonce_missing"
+		return r, errors.New("Z.ai Codex probe did not echo its nonce")
+	}
+	// Codex's structured events expose session/thread information but model
+	// echo support varies by CLI build. Hash the output as redacted session
+	// evidence, but never claim the requested model was runtime-confirmed.
+	r.SessionIDSHA256 = hash(stdout.Bytes())
+	r.FailureClass = "model_session_evidence_missing"
+	return r, errors.New("Z.ai Codex probe lacks versioned resolved-model evidence")
+}
+
+func minimalCodexEnvironment(in []string, endpoint, runtimeHome string) []string {
+	keep := map[string]bool{"PATH": true, "HOME": true, "USERPROFILE": true, "SystemRoot": true, "WINDIR": true, "TMP": true, "TEMP": true, "TMPDIR": true, "LANG": true, "LC_ALL": true, "TERM": true}
+	out := make([]string, 0, 16)
+	for _, item := range in {
+		key, _, _ := strings.Cut(item, "=")
+		if keep[key] {
+			out = append(out, item)
+		}
+	}
+	return append(out, "CODEX_HOME="+runtimeHome, "ZAI_BASE_URL="+endpoint)
+}
 
 // ValidateExecutable permits precisely argv[0], never a shell fragment.
 func ValidateExecutable(binary string) error {

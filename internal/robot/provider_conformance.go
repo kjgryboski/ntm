@@ -81,7 +81,7 @@ func validateConformanceTransportIdentity(transport string, identity provider.Id
 		if identity.Provider() != "xai" {
 			return fmt.Errorf("transport %q requires an xAI provider identity", transport)
 		}
-	case "zai_claude_runtime", "zai_native_api":
+	case "zai_claude_runtime", "zai_codex_runtime", "zai_native_api":
 		if identity.Provider() != "zai" {
 			return fmt.Errorf("transport %q requires a Z.ai provider identity", transport)
 		}
@@ -104,14 +104,14 @@ func (r syntheticProviderRuntime) Launch(_ context.Context, identity provider.Id
 }
 
 func (r syntheticProviderRuntime) Deliver(_ context.Context, _ string, nonce string) (provider.DeliveryObservation, error) {
-	completion := r.transport == "xai_acp" || r.transport == "xai_headless_session" || r.transport == "zai_native_api"
+	completion := r.transport == "xai_acp" || r.transport == "xai_headless_session" || r.transport == "zai_codex_runtime" || r.transport == "zai_native_api"
 	return provider.DeliveryObservation{Submitted: true, AcknowledgedNonce: nonce, CompletionAuthoritative: completion}, nil
 }
 
 func (r syntheticProviderRuntime) Cancel(context.Context, string) (provider.CancelObservation, error) {
 	return provider.CancelObservation{
 		Attempted:                   true,
-		Authoritative:               r.transport == "xai_headless_session",
+		Authoritative:               r.transport == "xai_headless_session" || r.transport == "zai_codex_runtime",
 		AgentACPAcknowledged:        r.transport == "xai_acp",
 		CloudInferenceStopConfirmed: false,
 	}, nil
@@ -122,7 +122,7 @@ func (syntheticProviderRuntime) Recover(context.Context, string) (provider.Recov
 }
 
 func (r syntheticProviderRuntime) Resume(context.Context, string) (provider.ResumeObservation, error) {
-	if r.transport == "xai_headless_session" {
+	if r.transport == "xai_headless_session" || r.transport == "zai_codex_runtime" {
 		return provider.ResumeObservation{Resumed: true, SameSessionID: true}, nil
 	}
 	return provider.ResumeObservation{}, nil
