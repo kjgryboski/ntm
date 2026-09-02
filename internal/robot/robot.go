@@ -7791,6 +7791,7 @@ func RefreshNormalizedProjection(ctx context.Context, store *state.Store, projec
 	aggregator.RegisterAdapter(adapters.NewWorkCoordinationAdapter(
 		adapters.DefaultWorkCoordinationAdapterConfig(resolvedProjectDir),
 	))
+	aggregator.RegisterAdapter(adapters.NewCAAMQuotaAdapter())
 
 	signals, err := aggregator.Collect(ctx)
 	if err != nil {
