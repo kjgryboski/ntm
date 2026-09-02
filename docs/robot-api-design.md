@@ -335,6 +335,65 @@ The native API may have structured completion, usage, tool-call, and error
 evidence, but provider-side cancellation and resume remain unavailable until
 their own authoritative receipts exist.
 
+Linux native credential operations use collection-scoped Secret Service D-Bus
+calls. Before an operation, NTM resolves the `default` alias and requires one
+unlocked persistent, non-session collection; it rejects `/`, the `session`
+collection, locks, prompts, alias changes, D-Bus failures, and duplicate items.
+It opens a plain Secret Service session and scopes `SearchItems`, `CreateItem`,
+`GetSecret`, and `Delete` to that validated collection. It never creates or
+unlocks a collection. This is a credential-storage boundary, not provider
+authorization or lifecycle authority.
+
+The optional `NTM_WINDOWS_PROVIDER_BRIDGE` exists only for WSL when that direct
+Linux collection is unavailable. It names an owner-configured absolute,
+WSL-visible `ntm-provider-bridge.exe` path and is invoked directly with one
+bounded JSON document—never through a shell. WSL sends an exact opaque
+credential ID and fresh nonce; the helper must echo that nonce and return the
+expected result shape. The WSL client rejects mismatches, unknown fields,
+oversized output, and all helper errors. It permits only `credential_get` and
+`credential_status`; WSL `set` and `remove` never use the bridge.
+
+The Windows helper itself reads only Windows Credential Manager entries whose
+canonical ID belongs to an exact configured native Z.ai profile with native-API
+entitlement, API-key credential class, API-usage billing class, and
+`exact_target_only=true`. That narrowing allowlist does not authenticate a
+same-user caller. A process running as the Windows user and allowed to launch
+the helper can request an allowlisted operation, so the bridge must not be
+treated as a cross-user or remote authorization boundary.
+
+On Windows, receipt signing uses a signing-only, non-exportable P-256 key in
+the Microsoft Platform Crypto Provider. The local verifier binds ECDSA P-256,
+the public key, the signature, and `hardware_non_exportable_local_controller`
+evidence. This is a local-controller claim: no TPM quote, key-attestation
+certificate chain, or remotely verifiable TPM provenance is produced. On other
+supported hosts, the receipt signer is an OS-protected, process-readable
+Ed25519 seed. The bridge signs only the fixed preflight payload and canonical
+receipt schemas `ntm.provider-native-run.v2`,
+`ntm.provider-qualification.v1`, and `ntm.provider-session.v2`; arbitrary
+signing requests are denied. These credential and receipt boundaries never
+convert local cancellation/cleanup observations into provider-side
+cancellation, provider resume, or Codex/Claude-equivalent lifecycle authority.
+
+Owner setup is explicit and does not claim activation:
+
+```powershell
+# Windows PowerShell, using the current NTM source and binary
+go build -trimpath -o "$env:USERPROFILE\.local\bin\ntm-provider-bridge.exe" .\cmd\ntm-provider-bridge
+.\ntm.exe provider credential set --profile=zai-native-no-tools --stdin
+.\ntm.exe provider attestation init
+```
+
+```bash
+# WSL, after the Windows-side exact profile and helper are ready
+export NTM_WINDOWS_PROVIDER_BRIDGE=/mnt/c/Users/YOU/.local/bin/ntm-provider-bridge.exe
+ntm provider credential status --profile=zai-native-no-tools
+ntm provider attestation init
+```
+
+The status commands only prove local storage and signing readiness. They are
+not a live Z.ai qualification, Grok activation, provider cancellation receipt,
+or provider resume receipt.
+
 The native no-tool path is an explicit one-shot operation, not a coding
 qualification or lifecycle substitute:
 

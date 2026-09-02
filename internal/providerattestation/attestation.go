@@ -1,27 +1,34 @@
 // Package providerattestation creates tamper-evident, redaction-safe
-// signatures for provider receipts. Private signing seeds live only in the OS
-// credential broker and are deliberately never fields of a receipt.
+// signatures for provider receipts. Windows uses a non-exportable TPM CNG key;
+// other supported hosts retain a private signing seed in the OS credential
+// broker. Neither private material form is a field of a receipt.
 package providerattestation
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"regexp"
 
 	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 )
 
 const (
-	AlgorithmEd25519        = "ed25519"
-	ProtectionOSProcessRead = providercredential.EvidenceOSProtectedProcessReadable
-	maxCanonicalPayload     = 4 << 20
+	AlgorithmEd25519                          = "ed25519"
+	AlgorithmECDSAP256SHA256                  = "ecdsa-p256-sha256"
+	ProtectionOSProcessRead                   = providercredential.EvidenceOSProtectedProcessReadable
+	ProtectionHardwareNoExportLocalController = providercredential.EvidenceHardwareNonExportableLocalController
+	maxCanonicalPayload                       = 4 << 20
 )
 
 var (
@@ -29,7 +36,8 @@ var (
 	ErrInvalidPayload        = errors.New("provider attestation payload is invalid")
 	ErrKeyNotInitialized     = errors.New("provider attestation key is not initialized; call EnsureKey explicitly")
 	ErrInvalidSignature      = errors.New("provider attestation signature is invalid")
-	ErrProtectionUnavailable = errors.New("provider attestation requires os_protected_process_readable storage")
+	ErrProtectionUnavailable = errors.New("provider attestation protected signing backend is unavailable")
+	ErrProtectionPolicy      = errors.New("provider attestation hardware key does not satisfy required local TPM signing policy")
 	keyNamePattern           = regexp.MustCompile(`^[a-z0-9][a-z0-9._:-]{0,127}$`)
 )
 
@@ -40,6 +48,14 @@ type CredentialStore interface {
 	Get(context.Context, string) ([]byte, error)
 	Put(context.Context, string, []byte) error
 	Status(context.Context, string) (providercredential.Status, error)
+}
+
+// hardwareSigner keeps private material inside a platform cryptographic
+// provider. It exists separately from CredentialStore because a non-exportable
+// TPM key must never be reduced to bytes for this package to handle.
+type hardwareSigner interface {
+	EnsureKey(context.Context, string) (KeyMetadata, error)
+	Sign(context.Context, string, []byte) (SignatureMetadata, error)
 }
 
 // BrokerStore adapts the native provider credential broker for normal use.
@@ -68,8 +84,9 @@ func (s BrokerStore) Status(ctx context.Context, id string) (providercredential.
 // Attestor uses a CredentialStore only while ensuring or signing.  It never
 // retains a seed or private key after the method returns.
 type Attestor struct {
-	store  CredentialStore
-	random io.Reader
+	store    CredentialStore
+	hardware hardwareSigner
+	random   io.Reader
 }
 
 func New(store CredentialStore) (*Attestor, error) {
@@ -79,17 +96,20 @@ func New(store CredentialStore) (*Attestor, error) {
 	return &Attestor{store: store, random: rand.Reader}, nil
 }
 
-// NewOSProtected constructs an attestor backed by providercredential's native
-// OS store. It is intentionally not described as hardware-backed or
-// non-exportable: a process running as the current user can read the seed.
+// NewOSProtected chooses the Windows TPM CNG signer when available at build
+// time. Other supported hosts use providercredential's native OS store and
+// are intentionally not described as hardware-backed or non-exportable.
 func NewOSProtected() *Attestor {
+	if hardware := newNativeHardwareSigner(); hardware != nil {
+		return &Attestor{hardware: hardware, random: rand.Reader}
+	}
 	attestor, _ := New(BrokerStore{Broker: providercredential.New()})
 	return attestor
 }
 
-// KeyMetadata is safe to persist with a receipt.  PublicKey is intentionally
+// KeyMetadata is safe to persist with a receipt. PublicKey is intentionally
 // included so another process can verify without reading the OS store; it is a
-// public Ed25519 key, never a seed or private key.
+// public verification key, never seed or private-key material.
 type KeyMetadata struct {
 	Algorithm          string                           `json:"algorithm"`
 	KeyID              string                           `json:"key_id"`
@@ -112,6 +132,9 @@ type SignatureMetadata struct {
 func (a *Attestor) EnsureKey(ctx context.Context, name string) (KeyMetadata, error) {
 	if err := validateInput(ctx, name, nil, false); err != nil {
 		return KeyMetadata{}, err
+	}
+	if a != nil && a.hardware != nil {
+		return a.hardware.EnsureKey(ctx, name)
 	}
 	id := storageID(name)
 	if err := a.requireProtection(ctx, id); err != nil {
@@ -150,6 +173,9 @@ func (a *Attestor) Sign(ctx context.Context, name string, canonicalPayload []byt
 	if err := validateInput(ctx, name, canonicalPayload, true); err != nil {
 		return SignatureMetadata{}, err
 	}
+	if a != nil && a.hardware != nil {
+		return a.hardware.Sign(ctx, name, canonicalPayload)
+	}
 	id := storageID(name)
 	if err := a.requireProtection(ctx, id); err != nil {
 		return SignatureMetadata{}, err
@@ -175,7 +201,21 @@ func (a *Attestor) Sign(ctx context.Context, name string, canonicalPayload []byt
 // does not contact the credential store and therefore can run on a verifier
 // host that has never had access to the signing seed.
 func Verify(canonicalPayload []byte, signature SignatureMetadata) error {
-	if len(canonicalPayload) == 0 || len(canonicalPayload) > maxCanonicalPayload || signature.Algorithm != AlgorithmEd25519 || signature.ProtectionEvidence != ProtectionOSProcessRead || signature.PayloadSHA256 != digest(canonicalPayload) {
+	if len(canonicalPayload) == 0 || len(canonicalPayload) > maxCanonicalPayload || signature.PayloadSHA256 != digest(canonicalPayload) {
+		return ErrInvalidSignature
+	}
+	switch signature.Algorithm {
+	case AlgorithmEd25519:
+		return verifyEd25519(canonicalPayload, signature)
+	case AlgorithmECDSAP256SHA256:
+		return verifyECDSAP256(canonicalPayload, signature)
+	default:
+		return ErrInvalidSignature
+	}
+}
+
+func verifyEd25519(canonicalPayload []byte, signature SignatureMetadata) error {
+	if signature.ProtectionEvidence != ProtectionOSProcessRead {
 		return ErrInvalidSignature
 	}
 	public, err := base64.RawURLEncoding.DecodeString(signature.PublicKey)
@@ -184,6 +224,30 @@ func Verify(canonicalPayload []byte, signature SignatureMetadata) error {
 	}
 	encoded, err := base64.RawURLEncoding.DecodeString(signature.Signature)
 	if err != nil || len(encoded) != ed25519.SignatureSize || !ed25519.Verify(ed25519.PublicKey(public), canonicalPayload, encoded) {
+		return ErrInvalidSignature
+	}
+	return nil
+}
+
+func verifyECDSAP256(canonicalPayload []byte, signature SignatureMetadata) error {
+	if signature.ProtectionEvidence != ProtectionHardwareNoExportLocalController {
+		return ErrInvalidSignature
+	}
+	der, err := base64.RawURLEncoding.DecodeString(signature.PublicKey)
+	if err != nil || digest(der) != signature.PublicKeySHA256 || signature.KeyID != "ecdsa-p256:"+digest(der) {
+		return ErrInvalidSignature
+	}
+	parsed, err := x509.ParsePKIXPublicKey(der)
+	public, ok := parsed.(*ecdsa.PublicKey)
+	if err != nil || !ok || public.Curve != elliptic.P256() {
+		return ErrInvalidSignature
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(signature.Signature)
+	if err != nil || len(raw) != 64 {
+		return ErrInvalidSignature
+	}
+	digestValue := sha256.Sum256(canonicalPayload)
+	if !ecdsa.Verify(public, digestValue[:], new(big.Int).SetBytes(raw[:32]), new(big.Int).SetBytes(raw[32:])) {
 		return ErrInvalidSignature
 	}
 	return nil

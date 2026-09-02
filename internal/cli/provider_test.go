@@ -19,6 +19,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
+	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/providertelemetry"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
@@ -660,8 +661,26 @@ func providerTestDeps(t *testing.T, now time.Time, receipt providerqualification
 		capacitySnapshot: func(identity provider.Identity) ratelimit.AdmissionSnapshot {
 			return ratelimit.AdmissionSnapshot{IdentityHash: identity.Hash(), Scope: provider.CapacityControlScopeLocalShared, Tokens: 1}
 		},
-		attestationPreflight: func(context.Context) error { return nil },
-		admission:            admission,
+		attestationPreflight: func(context.Context) (providerattestation.SignatureMetadata, error) {
+			return providerattestation.SignatureMetadata{KeyMetadata: providerattestation.KeyMetadata{Algorithm: providerattestation.AlgorithmEd25519, ProtectionEvidence: providerattestation.ProtectionOSProcessRead}}, nil
+		},
+		admission: admission,
+	}
+}
+
+func TestDiagnoseProviderReceiptAttestationReportsHardwareProtection(t *testing.T) {
+	metadata := providerattestation.KeyMetadata{
+		Algorithm:          providerattestation.AlgorithmECDSAP256SHA256,
+		KeyID:              "ecdsa-p256:" + providerTestHash("public"),
+		PublicKey:          "public-verification-material",
+		PublicKeySHA256:    providerTestHash("public"),
+		ProtectionEvidence: providerattestation.ProtectionHardwareNoExportLocalController,
+	}
+	check := diagnoseProviderReceiptAttestation(t.Context(), func(context.Context) (providerattestation.SignatureMetadata, error) {
+		return providerattestation.SignatureMetadata{KeyMetadata: metadata}, nil
+	})
+	if check.Status != providerDoctorPass || check.Provenance != "hardware_local_controller" || !strings.Contains(check.Summary, "hardware-backed non-exportable") || check.Evidence != digestSafeJSON(metadata) {
+		t.Fatalf("hardware attestation check=%+v", check)
 	}
 }
 
@@ -781,8 +800,10 @@ func TestProviderDoctorCanonicalizesGrokRuntimeBeforeOnlineDispatch(t *testing.T
 			capacitySnapshot: func(provider.Identity) ratelimit.AdmissionSnapshot {
 				return ratelimit.AdmissionSnapshot{IdentityHash: identity.Hash(), Scope: provider.CapacityControlScopeLocalShared, Tokens: 1}
 			},
-			attestationPreflight: func(context.Context) error { return nil },
-			admission:            admission,
+			attestationPreflight: func(context.Context) (providerattestation.SignatureMetadata, error) {
+				return providerattestation.SignatureMetadata{KeyMetadata: providerattestation.KeyMetadata{Algorithm: providerattestation.AlgorithmEd25519, ProtectionEvidence: providerattestation.ProtectionOSProcessRead}}, nil
+			},
+			admission: admission,
 		}
 	}
 

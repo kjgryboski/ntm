@@ -60,16 +60,21 @@ func signProviderReceiptPayload(ctx context.Context, payload []byte) (providerat
 }
 
 func preflightProviderReceiptSigner(ctx context.Context, sign func(context.Context, []byte) (providerattestation.SignatureMetadata, error)) error {
+	_, err := preflightProviderReceiptSignerMetadata(ctx, sign)
+	return err
+}
+
+func preflightProviderReceiptSignerMetadata(ctx context.Context, sign func(context.Context, []byte) (providerattestation.SignatureMetadata, error)) (providerattestation.SignatureMetadata, error) {
 	if sign == nil {
-		return errors.New("provider receipt attestor is unavailable")
+		return providerattestation.SignatureMetadata{}, errors.New("provider receipt attestor is unavailable")
 	}
 	payload := []byte("ntm.provider-receipt-attestation-preflight.v1")
 	signature, err := sign(ctx, payload)
 	if err != nil {
-		return err
+		return providerattestation.SignatureMetadata{}, err
 	}
 	if err := providerattestation.Verify(payload, signature); err != nil {
-		return errors.New("provider receipt attestation preflight verification failed")
+		return providerattestation.SignatureMetadata{}, errors.New("provider receipt attestation preflight verification failed")
 	}
-	return nil
+	return signature, nil
 }

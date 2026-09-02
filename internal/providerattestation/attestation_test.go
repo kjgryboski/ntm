@@ -3,6 +3,12 @@ package providerattestation
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -189,6 +195,94 @@ func TestEnsureKeyRandomFailureAndInputLimits(t *testing.T) {
 	tooLarge := make([]byte, maxCanonicalPayload+1)
 	if _, err := attestor.Sign(t.Context(), "grok.primary", tooLarge); !errors.Is(err, ErrInvalidPayload) {
 		t.Fatalf("large payload error=%v", err)
+	}
+}
+
+type fakeHardwareSigner struct {
+	private *ecdsa.PrivateKey
+	ensures int
+	signs   int
+}
+
+func (s *fakeHardwareSigner) EnsureKey(_ context.Context, _ string) (KeyMetadata, error) {
+	s.ensures++
+	der, err := x509.MarshalPKIXPublicKey(&s.private.PublicKey)
+	if err != nil {
+		return KeyMetadata{}, err
+	}
+	return KeyMetadata{Algorithm: AlgorithmECDSAP256SHA256, KeyID: "ecdsa-p256:" + digest(der), PublicKey: base64.RawURLEncoding.EncodeToString(der), PublicKeySHA256: digest(der), ProtectionEvidence: ProtectionHardwareNoExportLocalController}, nil
+}
+
+func TestTPMKeyPropertiesRequireExactLocalControllerPolicy(t *testing.T) {
+	valid := tpmKeyProperties{Algorithm: ncryptECDSAP256Algorithm, ExportPolicy: 0, KeyUsage: ncryptAllowSigning}
+	if err := validateTPMKeyProperties(valid); err != nil {
+		t.Fatalf("valid properties rejected: %v", err)
+	}
+	platformReported := valid
+	platformReported.Algorithm = ncryptECDSAAlgorithm
+	if err := validateTPMKeyProperties(platformReported); err != nil {
+		t.Fatalf("platform-reported ECDSA family rejected: %v", err)
+	}
+	for name, altered := range map[string]tpmKeyProperties{
+		"algorithm":     {Algorithm: "RSA", ExportPolicy: 0, KeyUsage: ncryptAllowSigning},
+		"export policy": {Algorithm: ncryptECDSAP256Algorithm, ExportPolicy: 1, KeyUsage: ncryptAllowSigning},
+		"key usage":     {Algorithm: ncryptECDSAP256Algorithm, ExportPolicy: 0, KeyUsage: ncryptAllowSigning | 4},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateTPMKeyProperties(altered); !errors.Is(err, ErrProtectionPolicy) {
+				t.Fatalf("properties=%+v error=%v", altered, err)
+			}
+		})
+	}
+	if err := validateTPMProviderName(msPlatformCryptoProvider); err != nil {
+		t.Fatalf("platform provider rejected: %v", err)
+	}
+	if err := validateTPMProviderName("Microsoft Software Key Storage Provider"); !errors.Is(err, ErrProtectionPolicy) {
+		t.Fatalf("software provider accepted: %v", err)
+	}
+}
+
+func (s *fakeHardwareSigner) Sign(_ context.Context, _ string, payload []byte) (SignatureMetadata, error) {
+	s.signs++
+	metadata, err := s.EnsureKey(context.Background(), "test")
+	if err != nil {
+		return SignatureMetadata{}, err
+	}
+	hash := sha256.Sum256(payload)
+	r, ss, err := ecdsa.Sign(rand.Reader, s.private, hash[:])
+	if err != nil {
+		return SignatureMetadata{}, err
+	}
+	raw := make([]byte, 64)
+	r.FillBytes(raw[:32])
+	ss.FillBytes(raw[32:])
+	return SignatureMetadata{KeyMetadata: metadata, PayloadSHA256: digest(payload), Signature: base64.RawURLEncoding.EncodeToString(raw)}, nil
+}
+
+func TestHardwareSignerUsesECDSAP256VerificationWithoutSeedStore(t *testing.T) {
+	private, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hardware := &fakeHardwareSigner{private: private}
+	attestor := &Attestor{hardware: hardware}
+	if metadata, err := attestor.EnsureKey(t.Context(), "zai.native"); err != nil || metadata.ProtectionEvidence != ProtectionHardwareNoExportLocalController || metadata.Algorithm != AlgorithmECDSAP256SHA256 {
+		t.Fatalf("EnsureKey metadata=%+v err=%v", metadata, err)
+	}
+	payload := []byte("canonical TPM-backed receipt")
+	signature, err := attestor.Sign(t.Context(), "zai.native", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(payload, signature); err != nil {
+		t.Fatalf("hardware receipt verification failed: %v", err)
+	}
+	if hardware.ensures == 0 || hardware.signs != 1 {
+		t.Fatalf("ensure=%d sign=%d", hardware.ensures, hardware.signs)
+	}
+	signature.ProtectionEvidence = ProtectionOSProcessRead
+	if err := Verify(payload, signature); !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("weaker protection evidence accepted: %v", err)
 	}
 }
 

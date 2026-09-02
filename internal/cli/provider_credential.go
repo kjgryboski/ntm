@@ -169,7 +169,7 @@ func runProviderCredential(cmd *cobra.Command, action string, opts providerCrede
 }
 
 func providerCredentialID(identity provider.Identity) string {
-	return "ntm." + identity.Provider() + "." + identity.Entitlement() + "." + identity.Hash()
+	return providercredential.CanonicalID(identity)
 }
 
 func trimOneLineEnding(value []byte) []byte {

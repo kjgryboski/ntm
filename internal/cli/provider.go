@@ -24,6 +24,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
+	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
 	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
@@ -232,7 +233,7 @@ type providerDoctorDependencies struct {
 	capacityStatus       func() ratelimit.CapacityStatus
 	capacitySnapshot     func(provider.Identity) ratelimit.AdmissionSnapshot
 	credentialStatus     func(context.Context, string) (providercredential.Status, error)
-	attestationPreflight func(context.Context) error
+	attestationPreflight func(context.Context) (providerattestation.SignatureMetadata, error)
 	admission            providerDoctorAdmission
 }
 
@@ -271,8 +272,8 @@ func defaultProviderDoctorDependencies() providerDoctorDependencies {
 			return admission.Snapshot(identity)
 		},
 		credentialStatus: providerCredentialDeps.store.Status,
-		attestationPreflight: func(ctx context.Context) error {
-			return preflightProviderReceiptSigner(ctx, signProviderReceiptPayload)
+		attestationPreflight: func(ctx context.Context) (providerattestation.SignatureMetadata, error) {
+			return preflightProviderReceiptSignerMetadata(ctx, signProviderReceiptPayload)
 		},
 		admission: admission,
 	}
@@ -1067,14 +1068,21 @@ func diagnoseNativeProviderCredential(ctx context.Context, identity provider.Ide
 	return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorPass, Provenance: "os_credential_broker", Summary: "exact native API credential is present in OS-protected storage", Evidence: digestSafeJSON(status)}
 }
 
-func diagnoseProviderReceiptAttestation(ctx context.Context, preflight func(context.Context) error) providerDoctorCheck {
+func diagnoseProviderReceiptAttestation(ctx context.Context, preflight func(context.Context) (providerattestation.SignatureMetadata, error)) providerDoctorCheck {
 	if preflight == nil {
-		return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorFail, Provenance: "os_credential_broker", Summary: "provider receipt signing preflight is unavailable", Remediation: "Run ntm provider attestation init on a supported OS credential backend"}
+		return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorFail, Provenance: "local_attestation", Summary: "provider receipt signing preflight is unavailable", Remediation: "Run ntm provider attestation init on a supported local attestation backend"}
 	}
-	if err := preflight(ctx); err != nil {
-		return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorFail, Provenance: "os_credential_broker", Summary: "provider receipt signing key is absent or unavailable", Evidence: safeErrorDigest(err), Remediation: "Run ntm provider attestation init before live provider execution"}
+	signature, err := preflight(ctx)
+	if err != nil {
+		return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorFail, Provenance: "local_attestation", Summary: "provider receipt signing key is absent or unavailable", Evidence: safeErrorDigest(err), Remediation: "Run ntm provider attestation init before live provider execution"}
 	}
-	return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorPass, Provenance: "os_credential_broker", Summary: "OS-protected receipt signing key produced a locally verifiable signature", Evidence: sha256StringCLI("ntm.provider-receipt-attestation-preflight.v1")}
+	provenance := "os_credential_broker"
+	summary := "OS-protected process-readable receipt key produced a locally verifiable signature"
+	if signature.ProtectionEvidence == providerattestation.ProtectionHardwareNoExportLocalController {
+		provenance = "hardware_local_controller"
+		summary = "hardware-backed non-exportable local-controller key produced a locally verifiable signature"
+	}
+	return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorPass, Provenance: provenance, Summary: summary, Evidence: digestSafeJSON(signature.KeyMetadata)}
 }
 
 func diagnoseQualification(identity provider.Identity, transport, policySHA string, opts providerCommandOptions, deps providerDoctorDependencies, checks []providerDoctorCheck) (providerDoctorQualification, []providerDoctorCheck) {

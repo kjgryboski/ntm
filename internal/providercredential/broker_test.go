@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/ntm/internal/provider"
 )
 
 type backendFake struct {
@@ -74,5 +77,16 @@ func TestBrokerReturnsUnavailableWithoutFallback(t *testing.T) {
 	status, err := b.Status(t.Context(), "provider:abc")
 	if err != nil || status != unavailableStatus() {
 		t.Fatalf("status = %+v, %v", status, err)
+	}
+}
+
+func TestCanonicalIDBindsTheCompleteProviderIdentity(t *testing.T) {
+	identity, err := provider.NewIdentityWithAuthorization("zai", "account", "model", "https://api.z.ai/api/paas/v4/chat/completions", "zai-api", provider.CredentialClassAPIKey, provider.BillingClassAPIUsage, provider.EntitlementNativeAPI, strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "ntm.zai.native_api." + identity.Hash()
+	if got := CanonicalID(identity); got != want {
+		t.Fatalf("CanonicalID=%q want=%q", got, want)
 	}
 }

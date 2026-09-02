@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+
+	"github.com/Dicklesworthstone/ntm/internal/provider"
 )
 
 var (
@@ -34,6 +36,12 @@ type EvidenceGrade string
 const (
 	EvidenceUnavailable                EvidenceGrade = "unavailable"
 	EvidenceOSProtectedProcessReadable EvidenceGrade = "os_protected_process_readable"
+	// EvidenceHardwareNonExportableLocalController means NTM's local Windows
+	// controller re-checked a non-exportable TPM signing-key policy before use.
+	// It is local evidence, not remotely attestable provenance, and does not
+	// prevent another same-user process from requesting a signature if Windows
+	// permits it.
+	EvidenceHardwareNonExportableLocalController EvidenceGrade = "hardware_non_exportable_local_controller"
 )
 
 // Backend identifies the native store, not a credential value or location.
@@ -147,4 +155,10 @@ func validateSecret(secret []byte) error {
 
 func unavailableStatus() Status {
 	return Status{Backend: BackendUnavailable, Available: false, Present: false, Evidence: EvidenceUnavailable}
+}
+
+// CanonicalID is the sole credential-broker identifier derivation for an
+// immutable provider identity. It contains no credential material.
+func CanonicalID(identity provider.Identity) string {
+	return "ntm." + identity.Provider() + "." + identity.Entitlement() + "." + identity.Hash()
 }

@@ -488,10 +488,58 @@ session operation:
 ntm provider attestation init
 ```
 
-The signing seed is held in the supported OS credential store and receipts are
-publicly verifiable Ed25519 envelopes. This is OS-protected, process-readable
-storage—not a claim that the key is hardware-backed or non-exportable to every
-process running as the same user.
+On Linux, native Z.ai API credentials use the Secret Service directly, not a
+`secret-tool` subprocess. NTM resolves the `default` collection for each
+operation and refuses to use an unset alias, the ephemeral `session`
+collection, a locked collection, a prompt, or ambiguous matching items. It
+never creates/unlocks a collection or changes an alias. Establish and unlock a
+password-protected persistent collection through the owner’s desktop/PAM
+keyring flow before running `ntm provider credential set --stdin`; NTM will
+otherwise fail closed.
+
+On Windows, the current-user TPM path uses a Microsoft Platform Crypto Provider
+P-256 signing key with no export policy and signing-only usage. Receipt
+verification proves the signature and its declared local-controller evidence;
+it is **not** remotely verifiable TPM provenance. NTM does not emit a TPM quote,
+attestation certificate chain, or remote hardware proof. A same-Windows-user
+process permitted to launch the bridge can request the bridge’s narrow allowed
+operations, so non-exportability does not make the bridge an authorization
+boundary against that user.
+
+WSL may opt into that Windows current-user store only when direct persistent
+Secret Service access is unavailable. Build the helper from the reviewed source
+with the current Windows NTM checkout, then set an explicit WSL-visible path:
+
+```powershell
+# Windows PowerShell, from the NTM checkout
+go build -trimpath -o "$env:USERPROFILE\.local\bin\ntm-provider-bridge.exe" .\cmd\ntm-provider-bridge
+.\ntm.exe provider credential set --profile=zai-native-no-tools --stdin
+.\ntm.exe provider attestation init
+```
+
+```bash
+# WSL: only after the Windows profile above is configured and the helper exists
+export NTM_WINDOWS_PROVIDER_BRIDGE=/mnt/c/Users/YOU/.local/bin/ntm-provider-bridge.exe
+ntm provider credential status --profile=zai-native-no-tools
+ntm provider attestation init
+```
+
+The bridge is invoked directly, never through a shell. It accepts only one
+nonce-bound JSON request and permits WSL only to read credential status or one
+credential; WSL provisioning and removal remain fail-closed. Windows also
+allows those bridge reads only for exact configured Z.ai native-API profiles
+whose identity has `provider=zai`, native-API entitlement, API-key credential
+class, API-usage billing class, and `exact_target_only=true`. It is an
+allowlist, not caller authentication. No generic credential, Coding Plan key,
+or arbitrary profile can be requested through the bridge.
+
+Receipt signing has a fixed bridge allowlist: the attestation preflight and
+canonical receipt schemas `ntm.provider-native-run.v2`,
+`ntm.provider-qualification.v1`, and `ntm.provider-session.v2`. The bridge
+will not sign arbitrary payloads. Non-Windows receipts use an OS-protected,
+process-readable Ed25519 seed; Windows TPM receipts use ECDSA P-256. Neither
+receipt type upgrades local evidence into provider-side cancellation, provider
+resume, or remotely attested hardware provenance.
 
 The native no-tool API lane is an explicit single-request operation, not a
 substitute for Claude-compatible coding qualification. After configuring a

@@ -338,7 +338,7 @@ func providerSessionAttestationPreflightWithSigner(ctx context.Context, sign fun
 	if sign == nil {
 		return errors.New("provider session receipt attestor is unavailable")
 	}
-	payload := []byte("ntm.provider-session.attestation-preflight.v1")
+	payload := []byte(providerattestation.ProviderAttestationPreflight)
 	signature, err := sign(ctx, payload)
 	if err != nil {
 		return err
