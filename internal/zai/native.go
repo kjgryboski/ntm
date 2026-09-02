@@ -59,9 +59,10 @@ type NativeReceipt struct {
 }
 
 type NativeUsage struct {
-	InputTokens  *int64 `json:"input_tokens,omitempty"`
-	OutputTokens *int64 `json:"output_tokens,omitempty"`
-	TotalTokens  *int64 `json:"total_tokens,omitempty"`
+	InputTokens       *int64 `json:"input_tokens,omitempty"`
+	OutputTokens      *int64 `json:"output_tokens,omitempty"`
+	TotalTokens       *int64 `json:"total_tokens,omitempty"`
+	CachedInputTokens *int64 `json:"cached_input_tokens,omitempty"`
 }
 type NativeCancellation struct {
 	ProviderAcknowledged bool `json:"provider_acknowledged"`
@@ -329,10 +330,17 @@ type nativeUsage struct {
 	PromptTokens     *int64 `json:"prompt_tokens"`
 	CompletionTokens *int64 `json:"completion_tokens"`
 	TotalTokens      *int64 `json:"total_tokens"`
+	PromptDetails    *struct {
+		CachedTokens *int64 `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
 }
 
 func (u nativeUsage) hasNegativeCounter() bool {
-	for _, value := range []*int64{u.PromptTokens, u.CompletionTokens, u.TotalTokens} {
+	values := []*int64{u.PromptTokens, u.CompletionTokens, u.TotalTokens}
+	if u.PromptDetails != nil {
+		values = append(values, u.PromptDetails.CachedTokens)
+	}
+	for _, value := range values {
 		if value != nil && *value < 0 {
 			return true
 		}
@@ -341,7 +349,11 @@ func (u nativeUsage) hasNegativeCounter() bool {
 }
 
 func (u nativeUsage) canonical() NativeUsage {
-	return NativeUsage{InputTokens: u.PromptTokens, OutputTokens: u.CompletionTokens, TotalTokens: u.TotalTokens}
+	result := NativeUsage{InputTokens: u.PromptTokens, OutputTokens: u.CompletionTokens, TotalTokens: u.TotalTokens}
+	if u.PromptDetails != nil {
+		result.CachedInputTokens = u.PromptDetails.CachedTokens
+	}
+	return result
 }
 
 type nativeError struct {

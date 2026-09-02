@@ -870,8 +870,8 @@ func validateProviderProfile(name string, profile ProviderProfileConfig) []error
 		if profile.Entitlement == provider.EntitlementClaudeCompat && strings.TrimSpace(profile.AutomationPolicy) != provider.DefaultZAIAutomationPolicyName {
 			errs = append(errs, fmt.Errorf("provider_profiles.%s Z.ai profiles must use automation_policy = %q", target, provider.DefaultZAIAutomationPolicyName))
 		}
-		if profile.Entitlement == provider.EntitlementNativeAPI && strings.TrimSpace(profile.AutomationPolicy) != provider.NativeZAINoToolsPolicyName {
-			errs = append(errs, fmt.Errorf("provider_profiles.%s native Z.ai profiles must use automation_policy = %q", target, provider.NativeZAINoToolsPolicyName))
+		if profile.Entitlement == provider.EntitlementNativeAPI && strings.TrimSpace(profile.AutomationPolicy) != provider.NativeZAINoToolsPolicyName && strings.TrimSpace(profile.AutomationPolicy) != provider.NativeZAIToolsPolicyName {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s native Z.ai profiles must use automation_policy = %q or %q", target, provider.NativeZAINoToolsPolicyName, provider.NativeZAIToolsPolicyName))
 		}
 		if profile.Entitlement == provider.EntitlementClaudeCompat && zai.ValidateExecutable(profile.Command) != nil {
 			err := zai.ValidateExecutable(profile.Command)

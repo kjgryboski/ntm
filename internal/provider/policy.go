@@ -11,3 +11,8 @@ const DefaultZAIAutomationPolicyName = "zai-readonly-ci"
 // provider tool call; this stable name prevents a profile from implying a
 // broader policy than the compiled transport actually supports.
 const NativeZAINoToolsPolicyName = "zai-native-no-tools-v1"
+
+// NativeZAIToolsPolicyName identifies the controller-owned function-calling
+// lane. The provider may propose only compiled tool schemas; NTM performs all
+// filesystem and verification effects through its bounded brokers.
+const NativeZAIToolsPolicyName = "zai-native-tools-v1"

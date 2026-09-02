@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -16,23 +15,32 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
+	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
+	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
+	"github.com/Dicklesworthstone/ntm/internal/providertelemetry"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/zai"
 )
 
 const (
-	providerNativeRunSchema      = "ntm.provider-native-run.v1"
+	providerNativeRunSchema      = "ntm.provider-native-run.v2"
 	providerNativeAdapterVersion = "zai-native-http-v1"
 	providerNativeRunTimeout     = 2 * time.Minute
 	providerNativeOperationScope = "provider:zai-native-http"
 )
 
 type providerNativeRunOptions struct {
-	profile     string
-	prompt      string
-	operationID string
-	live        bool
+	profile          string
+	prompt           string
+	operationID      string
+	live             bool
+	tools            bool
+	worktree         string
+	revision         string
+	commands         []string
+	qualificationDir string
+	qualificationAge time.Duration
 }
 
 // providerNativeOperationLedger is deliberately the existing durable
@@ -54,25 +62,35 @@ type providerNativeAdmission interface {
 }
 
 type providerNativeRunDependencies struct {
-	loadConfig func() *config.Config
-	lookupEnv  func(string) (string, bool)
-	newNonce   func() (string, error)
-	run        func(context.Context, zai.NativeHTTPClient, zai.NativeRequest) (zai.NativeReceipt, error)
-	client     zai.NativeHTTPClient
-	admission  providerNativeAdmission
-	openLedger func() (providerNativeOperationLedger, func() error, error)
-	now        func() time.Time
+	loadConfig         func() *config.Config
+	credential         providerCredentialStore
+	newNonce           func() (string, error)
+	run                func(context.Context, zai.NativeHTTPClient, zai.NativeRequest) (zai.NativeReceipt, error)
+	runTools           func(context.Context, zai.NativeHTTPClient, zai.NativeToolRequest) (zai.NativeToolReceipt, error)
+	newController      func(context.Context, providerNativeRunOptions) (providerNativeToolController, error)
+	sign               func(context.Context, []byte) (providerattestation.SignatureMetadata, error)
+	recordTelemetry    func(context.Context, providertelemetry.Observation) (providertelemetry.Observation, error)
+	qualificationStore func(string, string) (providerqualification.Receipt, string, error)
+	client             zai.NativeHTTPClient
+	admission          providerNativeAdmission
+	openLedger         func() (providerNativeOperationLedger, func() error, error)
+	now                func() time.Time
 }
 
 var providerNativeRunDeps = providerNativeRunDependencies{
-	loadConfig: loadSelectedConfigOrDefault,
-	lookupEnv:  os.LookupEnv,
-	newNonce:   providerNativeNonce,
-	run:        zai.RunNative,
-	client:     zai.DefaultNativeHTTPClient(),
-	admission:  ratelimit.DefaultAdmissionController(),
-	openLedger: openProviderNativeLedger,
-	now:        func() time.Time { return time.Now().UTC() },
+	loadConfig:         loadSelectedConfigOrDefault,
+	credential:         providerCredentialDeps.store,
+	newNonce:           providerNativeNonce,
+	run:                zai.RunNative,
+	runTools:           zai.RunNativeTools,
+	newController:      newProviderNativeController,
+	sign:               signProviderReceiptPayload,
+	recordTelemetry:    recordProviderTelemetryDefault,
+	qualificationStore: providerqualification.LoadLatest,
+	client:             zai.DefaultNativeHTTPClient(),
+	admission:          ratelimit.DefaultAdmissionController(),
+	openLedger:         openProviderNativeLedger,
+	now:                func() time.Time { return time.Now().UTC() },
 }
 
 type providerNativeAdmissionEvidence struct {
@@ -86,28 +104,34 @@ type providerNativeAdmissionEvidence struct {
 // providerNativeRunOutput deliberately contains no prompt, nonce, API key, or
 // raw provider body. zai.NativeReceipt keeps identifiers hash-bound as well.
 type providerNativeRunOutput struct {
-	SchemaVersion      string                          `json:"schema_version"`
-	Success            bool                            `json:"success"`
-	Profile            string                          `json:"profile"`
-	Transport          string                          `json:"transport"`
-	IdentitySHA256     string                          `json:"identity_sha256"`
-	AdapterVersion     string                          `json:"adapter_version"`
-	OperationID        string                          `json:"operation_id"`
-	BindingSHA256      string                          `json:"binding_sha256"`
-	ReceiptState       string                          `json:"receipt_state"`
-	Replayed           bool                            `json:"replayed"`
-	State              string                          `json:"state"`
-	Admission          providerNativeAdmissionEvidence `json:"admission"`
-	Receipt            zai.NativeReceipt               `json:"receipt"`
-	ProviderErrorClass provider.ErrorClass             `json:"provider_error_class,omitempty"`
-	ErrorSHA256        string                          `json:"error_sha256,omitempty"`
+	SchemaVersion       string                                 `json:"schema_version"`
+	Success             bool                                   `json:"success"`
+	Profile             string                                 `json:"profile"`
+	Transport           string                                 `json:"transport"`
+	IdentitySHA256      string                                 `json:"identity_sha256"`
+	AdapterVersion      string                                 `json:"adapter_version"`
+	Tools               bool                                   `json:"tools"`
+	QualificationSHA256 string                                 `json:"qualification_receipt_sha256,omitempty"`
+	OperationID         string                                 `json:"operation_id"`
+	BindingSHA256       string                                 `json:"binding_sha256"`
+	ReceiptState        string                                 `json:"receipt_state"`
+	Replayed            bool                                   `json:"replayed"`
+	State               string                                 `json:"state"`
+	Admission           providerNativeAdmissionEvidence        `json:"admission"`
+	Receipt             zai.NativeReceipt                      `json:"receipt"`
+	ToolReceipt         *zai.NativeToolReceipt                 `json:"tool_receipt,omitempty"`
+	Controller          *providerNativeControllerReceipt       `json:"controller,omitempty"`
+	ProviderErrorClass  provider.ErrorClass                    `json:"provider_error_class,omitempty"`
+	ErrorSHA256         string                                 `json:"error_sha256,omitempty"`
+	Telemetry           providerTelemetryEvidence              `json:"telemetry"`
+	Attestation         *providerattestation.SignatureMetadata `json:"attestation,omitempty"`
 }
 
 func newProviderNativeRunCmd() *cobra.Command {
-	opts := providerNativeRunOptions{}
+	opts := providerNativeRunOptions{qualificationAge: 24 * time.Hour}
 	cmd := &cobra.Command{
 		Use:   "run",
-		Short: "Run one nonce-bound no-tool native Z.ai request",
+		Short: "Run one nonce-bound native Z.ai request",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runProviderNative(cmd, opts, providerNativeRunDeps)
@@ -117,6 +141,12 @@ func newProviderNativeRunCmd() *cobra.Command {
 	cmd.Flags().StringVar(&opts.prompt, "prompt", "", "Prompt to execute (required; never retained)")
 	cmd.Flags().StringVar(&opts.operationID, "operation-id", "", "Durable idempotency key required for --live; ambiguous operations are never automatically replayed")
 	cmd.Flags().BoolVar(&opts.live, "live", false, "Explicitly authorize one real native Z.ai API request")
+	cmd.Flags().BoolVar(&opts.tools, "tools", false, "Enable controller-owned workspace tools for a separately qualified tools profile")
+	cmd.Flags().StringVar(&opts.worktree, "worktree", "", "Exact linked disposable worktree used by --tools")
+	cmd.Flags().StringVar(&opts.revision, "revision", "", "Exact current Git revision used by --tools")
+	cmd.Flags().StringSliceVar(&opts.commands, "verify-commands", nil, "Fixed approved verifier IDs used by --tools")
+	cmd.Flags().StringVar(&opts.qualificationDir, "qualification-store", "", "Override native tools qualification receipt directory")
+	cmd.Flags().DurationVar(&opts.qualificationAge, "max-qualification-age", opts.qualificationAge, "Maximum age of the signed native tools qualification")
 	return cmd
 }
 
@@ -131,7 +161,7 @@ func runProviderNative(cmd *cobra.Command, opts providerNativeRunOptions, deps p
 	if !validProviderNativeOperationID(opID) {
 		return errors.New("provider run requires --operation-id with 1-128 letters, digits, dot, colon, underscore, or hyphen")
 	}
-	if deps.loadConfig == nil || deps.lookupEnv == nil || deps.newNonce == nil || deps.run == nil || deps.client == nil || deps.admission == nil || deps.openLedger == nil || deps.now == nil {
+	if deps.loadConfig == nil || deps.credential == nil || deps.newNonce == nil || deps.client == nil || deps.admission == nil || deps.openLedger == nil || deps.now == nil || deps.sign == nil || deps.recordTelemetry == nil || !opts.tools && deps.run == nil || opts.tools && (deps.runTools == nil || deps.newController == nil || deps.qualificationStore == nil) {
 		return errors.New("provider native run dependencies are incomplete")
 	}
 	cfg := deps.loadConfig()
@@ -146,21 +176,40 @@ func runProviderNative(cmd *cobra.Command, opts providerNativeRunOptions, deps p
 	if err != nil {
 		return err
 	}
-	if identity.Provider() != "zai" || identity.Entitlement() != provider.EntitlementNativeAPI || identity.CredentialClass() != provider.CredentialClassAPIKey || identity.BillingClass() != provider.BillingClassAPIUsage || identity.Runtime() != "zai-api" || identity.Endpoint() != zai.NativeChatCompletionsEndpoint || profile.Command != "" || profile.AutomationPolicy != provider.NativeZAINoToolsPolicyName || !profile.ExactTargetOnly || !profile.ProbeRequired || profile.RuntimeVersion != providerNativeAdapterVersion {
+	expectedPolicy := provider.NativeZAINoToolsPolicyName
+	if opts.tools {
+		expectedPolicy = provider.NativeZAIToolsPolicyName
+	}
+	if identity.Provider() != "zai" || identity.Entitlement() != provider.EntitlementNativeAPI || identity.CredentialClass() != provider.CredentialClassAPIKey || identity.BillingClass() != provider.BillingClassAPIUsage || identity.Runtime() != "zai-api" || identity.Endpoint() != zai.NativeChatCompletionsEndpoint || profile.Command != "" || profile.AutomationPolicy != expectedPolicy || !profile.ExactTargetOnly || !profile.ProbeRequired || profile.RuntimeVersion != providerNativeAdapterVersion {
 		return errors.New("provider run requires an exact pinned Z.ai native_api profile")
 	}
-	key, keyPresent := deps.lookupEnv("ZAI_NATIVE_API_KEY")
-	if !keyPresent || strings.TrimSpace(key) == "" {
-		return errors.New("provider run requires ZAI_NATIVE_API_KEY; other provider credentials are not accepted")
+	if opts.tools && (strings.TrimSpace(opts.worktree) == "" || strings.TrimSpace(opts.revision) == "" || len(opts.commands) == 0 || opts.qualificationAge <= 0) {
+		return errors.New("provider run --tools requires an exact --worktree, --revision, and --verify-commands manifest")
 	}
+	qualificationSHA256 := ""
+	if opts.tools {
+		qualificationSHA256, err = requireProviderNativeToolsQualification(identity, opts, deps)
+		if err != nil {
+			return err
+		}
+	}
+	if err := preflightProviderReceiptSigner(providerCommandContext(cmd), deps.sign); err != nil {
+		return fmt.Errorf("provider run requires an initialized receipt signing key before dispatch: %w", err)
+	}
+	keyBytes, credentialErr := deps.credential.Get(providerCommandContext(cmd), providerCredentialID(identity))
+	if credentialErr != nil || len(keyBytes) == 0 {
+		return errors.New("provider run requires the exact native Z.ai credential in OS-protected storage")
+	}
+	defer zeroProviderSecret(keyBytes)
+	key := string(keyBytes)
 	status := deps.admission.CapacityStatus()
 	if status.Scope != provider.CapacityControlScopeLocalShared {
 		return errors.New("provider run requires the cross-process local shared capacity store")
 	}
 	logicalPrompt := strings.TrimSpace(opts.prompt)
-	binding := providerNativeBindingHash(identity, logicalPrompt)
+	binding := providerNativeBindingHashForPolicy(identity, logicalPrompt, expectedPolicy, providerNativeToolManifestBinding(opts))
 	requestID := providerNativeRequestID(binding, opID)
-	output := providerNativeRunOutput{SchemaVersion: providerNativeRunSchema, Profile: opts.profile, Transport: "zai_native_api", IdentitySHA256: identity.Hash(), AdapterVersion: providerNativeAdapterVersion, OperationID: opID, BindingSHA256: binding, ReceiptState: "not_claimed", State: "preflight"}
+	output := providerNativeRunOutput{SchemaVersion: providerNativeRunSchema, Profile: opts.profile, Transport: "zai_native_api", IdentitySHA256: identity.Hash(), AdapterVersion: providerNativeAdapterVersion, Tools: opts.tools, QualificationSHA256: qualificationSHA256, OperationID: opID, BindingSHA256: binding, ReceiptState: "not_claimed", State: "preflight"}
 	ledger, closeLedger, err := deps.openLedger()
 	if err != nil || ledger == nil {
 		output.State, output.ReceiptState = "ledger_unavailable", "claim_failed"
@@ -229,7 +278,29 @@ func runProviderNative(cmd *cobra.Command, opts providerNativeRunOptions, deps p
 	}
 	prompt := logicalPrompt + "\n\nWhen finished, return this exact acknowledgement token on its own line and no other final text: " + nonce
 	runCtx, cancel := context.WithTimeout(providerCommandContext(cmd), providerNativeRunTimeout)
-	receipt, runErr := deps.run(runCtx, deps.client, zai.NativeRequest{Endpoint: identity.Endpoint(), Model: identity.Model(), Prompt: prompt, ExpectedNonce: nonce, ExpectedRequestID: requestID, NativeAPIKey: key, ExplicitOptIn: true, AllowTools: false})
+	var receipt zai.NativeReceipt
+	var runErr error
+	if opts.tools {
+		controller, controllerErr := deps.newController(runCtx, opts)
+		if controllerErr != nil {
+			cancel()
+			_ = ledger.ReleaseSendOperation(claimed.OperationID, claimed.SessionName)
+			return finishProviderNative(cmd, output, controllerErr)
+		}
+		toolReceipt, toolErr := deps.runTools(runCtx, deps.client, zai.NativeToolRequest{
+			NativeRequest: zai.NativeRequest{Endpoint: identity.Endpoint(), Model: identity.Model(), Prompt: prompt, ExpectedNonce: nonce, ExpectedRequestID: requestID, NativeAPIKey: key, ExplicitOptIn: true, AllowTools: true},
+			Tools:         providerNativeToolDefinitions(), Executor: controller,
+		})
+		output.ToolReceipt = &toolReceipt
+		controllerReceipt := controller.Receipt()
+		output.Controller = &controllerReceipt
+		receipt, runErr = toolReceipt.NativeReceipt, toolErr
+		if runErr == nil && !controller.CompletedVerification() {
+			runErr = errors.New("native Z.ai tool run completed without a revision-bound controller verification after its last write")
+		}
+	} else {
+		receipt, runErr = deps.run(runCtx, deps.client, zai.NativeRequest{Endpoint: identity.Endpoint(), Model: identity.Model(), Prompt: prompt, ExpectedNonce: nonce, ExpectedRequestID: requestID, NativeAPIKey: key, ExplicitOptIn: true, AllowTools: false})
+	}
 	cancel()
 	output.Receipt = receipt
 	if runErr != nil {
@@ -238,10 +309,17 @@ func runProviderNative(cmd *cobra.Command, opts providerNativeRunOptions, deps p
 		// evidence. Local cancellation, DNS, TLS, and client/protocol failures
 		// must not permanently poison the exact identity as "unknown".
 		providerFailureObserved := receipt.ErrorCode != "" || receipt.HTTPStatus != 0 && (receipt.HTTPStatus < http.StatusOK || receipt.HTTPStatus >= http.StatusMultipleChoices)
+		circuitDecision := ratelimit.Decision{NoFailover: true}
+		circuitState := "unchanged"
 		if providerFailureObserved {
-			deps.admission.RecordResult(identity, class, 0)
+			circuitDecision = deps.admission.RecordResult(identity, class, 0)
+			circuitState = "terminal"
+			if circuitDecision.RetryAt != nil {
+				circuitState = "retry_scheduled"
+			}
 		}
 		output.ProviderErrorClass, output.ErrorSHA256 = class, safeErrorDigest(runErr)
+		output.Telemetry = recordProviderTelemetryEvidence(providerCommandContext(cmd), deps.recordTelemetry, providerNativeTelemetryObservation(identity, expectedPolicy, receipt, class, circuitState, circuitDecision, deps.now()))
 		if !providerFailureObserved {
 			// The request might have reached the provider. Keep the claim
 			// in-progress forever rather than risking a duplicate paid run.
@@ -249,6 +327,11 @@ func runProviderNative(cmd *cobra.Command, opts providerNativeRunOptions, deps p
 			return finishProviderNative(cmd, output, runErr)
 		}
 		output.State, output.ReceiptState = "provider_failure", "completed"
+		if signErr := sealProviderNativeOutput(providerCommandContext(cmd), &output, deps.sign); signErr != nil {
+			output.State, output.ReceiptState = "outcome_unknown", "attestation_failed"
+			output.ErrorSHA256 = safeErrorDigest(signErr)
+			return finishProviderNative(cmd, output, errors.New("native Z.ai provider response was received but its receipt could not be attested; do not redispatch"))
+		}
 		if persistErr := completeProviderNativeOperation(ledger, claimed, output, deps.now()); persistErr != nil {
 			output.State, output.ReceiptState = "outcome_unknown", "persistence_failed"
 			output.ErrorSHA256 = safeErrorDigest(persistErr)
@@ -258,6 +341,12 @@ func runProviderNative(cmd *cobra.Command, opts providerNativeRunOptions, deps p
 	}
 	deps.admission.RecordSuccess(identity)
 	output.Success, output.State, output.ReceiptState = true, "completed", "completed"
+	output.Telemetry = recordProviderTelemetryEvidence(providerCommandContext(cmd), deps.recordTelemetry, providerNativeTelemetryObservation(identity, expectedPolicy, receipt, "", "closed", decision, deps.now()))
+	if signErr := sealProviderNativeOutput(providerCommandContext(cmd), &output, deps.sign); signErr != nil {
+		output.Success, output.State, output.ReceiptState = false, "outcome_unknown", "attestation_failed"
+		output.ErrorSHA256 = safeErrorDigest(signErr)
+		return finishProviderNative(cmd, output, errors.New("native Z.ai request completed but its receipt could not be attested; do not redispatch"))
+	}
 	if persistErr := completeProviderNativeOperation(ledger, claimed, output, deps.now()); persistErr != nil {
 		output.Success, output.State, output.ReceiptState = false, "outcome_unknown", "persistence_failed"
 		output.ErrorSHA256 = safeErrorDigest(persistErr)
@@ -317,9 +406,13 @@ func validProviderNativeOperationID(value string) bool {
 }
 
 func providerNativeBindingHash(identity provider.Identity, prompt string) string {
+	return providerNativeBindingHashForPolicy(identity, prompt, provider.NativeZAINoToolsPolicyName, "")
+}
+
+func providerNativeBindingHashForPolicy(identity provider.Identity, prompt, policy, extra string) string {
 	fields := []string{
 		"ntm.zai-native.binding.v1", identity.Hash(), sha256StringCLI(strings.TrimSpace(prompt)),
-		sha256StringCLI(provider.NativeZAINoToolsPolicyName), sha256StringCLI(providerNativeAdapterVersion),
+		sha256StringCLI(policy), sha256StringCLI(providerNativeAdapterVersion), sha256StringCLI(extra),
 	}
 	return sha256StringCLI(strings.Join(fields, "\x00"))
 }
@@ -335,6 +428,15 @@ func providerNativeRequestID(binding, operationID string) string {
 }
 
 func validRecordedProviderNativeOutput(output providerNativeRunOutput, operationID, binding, profile, identitySHA256 string) bool {
+	if output.Attestation == nil {
+		return false
+	}
+	payload, err := canonicalProviderNativeOutput(output)
+	if err != nil || providerattestation.Verify(payload, *output.Attestation) != nil {
+		return false
+	}
+	toolsEvidenceValid := !output.Tools && output.QualificationSHA256 == "" && output.ToolReceipt == nil && output.Controller == nil ||
+		output.Tools && validProviderNativeDigest(output.QualificationSHA256) && output.ToolReceipt != nil && output.Controller != nil
 	return output.SchemaVersion == providerNativeRunSchema &&
 		output.Transport == "zai_native_api" &&
 		output.AdapterVersion == providerNativeAdapterVersion &&
@@ -342,8 +444,94 @@ func validRecordedProviderNativeOutput(output providerNativeRunOutput, operation
 		output.BindingSHA256 == binding &&
 		output.Profile == profile &&
 		output.IdentitySHA256 == identitySHA256 &&
+		toolsEvidenceValid &&
+		validProviderTelemetryEvidence(output.Telemetry) &&
 		output.ReceiptState == "completed" &&
 		(output.State == "completed" || output.State == "provider_failure")
+}
+
+func requireProviderNativeToolsQualification(identity provider.Identity, opts providerNativeRunOptions, deps providerNativeRunDependencies) (string, error) {
+	receipt, _, err := deps.qualificationStore(opts.qualificationDir, identity.Hash())
+	if err != nil {
+		return "", errors.New("provider run --tools requires a current signed native tools qualification receipt")
+	}
+	if err := receipt.Validate(); err != nil {
+		return "", fmt.Errorf("provider run --tools qualification receipt is invalid: %w", err)
+	}
+	if receipt.Attestation == nil || !receipt.Passed || receipt.Provider != "zai" || receipt.Transport != "zai_native_api" || receipt.IdentitySHA256 != identity.Hash() || receipt.PolicySHA256 != providerNativeToolsPolicySHA256() || receipt.RuntimeVersion != providerNativeAdapterVersion {
+		return "", errors.New("provider run --tools qualification does not bind the exact identity, transport, policy, adapter, and complete live matrix")
+	}
+	now := deps.now().UTC()
+	if receipt.CompletedAt.After(now) || now.Sub(receipt.CompletedAt) > opts.qualificationAge {
+		return "", errors.New("provider run --tools qualification receipt is future-dated or stale")
+	}
+	return receipt.ReceiptSHA256, nil
+}
+
+func validProviderNativeDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func providerNativeTelemetryObservation(identity provider.Identity, policyName string, receipt zai.NativeReceipt, class provider.ErrorClass, circuitState string, decision ratelimit.Decision, observedAt time.Time) providertelemetry.Observation {
+	completedAt := receipt.CompletedAt
+	if completedAt.IsZero() {
+		completedAt = observedAt.UTC()
+	}
+	return providerTelemetryObservation(providerTelemetryObservationInput{
+		Identity: identity, Model: identity.Model(), Transport: "zai_native_api", Adapter: providerNativeAdapterVersion,
+		Runtime: identity.Runtime(), PolicySHA256: agentlessNativePolicySHA256(policyName), FixtureVersion: "zai-native-v4-v1",
+		StartedAt: receipt.StartedAt, CompletedAt: completedAt,
+		InputTokens: nativeUsageValue(receipt.Usage.InputTokens), OutputTokens: nativeUsageValue(receipt.Usage.OutputTokens), CachedTokens: nativeUsageValue(receipt.Usage.CachedInputTokens),
+		ProviderError: class, QuotaState: providerTelemetryQuotaState(class), CircuitState: circuitState, CircuitOpenUntil: decision.RetryAt, NoFailover: decision.NoFailover,
+	})
+}
+
+func agentlessNativePolicySHA256(policyName string) string {
+	switch policyName {
+	case provider.NativeZAIToolsPolicyName:
+		return providerNativeToolsPolicySHA256()
+	default:
+		return providerNativeNoToolsPolicySHA256()
+	}
+}
+
+func nativeUsageValue(value *int64) int64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func sealProviderNativeOutput(ctx context.Context, output *providerNativeRunOutput, sign func(context.Context, []byte) (providerattestation.SignatureMetadata, error)) error {
+	if output == nil || sign == nil {
+		return errors.New("native provider receipt attestor is unavailable")
+	}
+	payload, err := canonicalProviderNativeOutput(*output)
+	if err != nil {
+		return err
+	}
+	signature, err := sign(ctx, payload)
+	if err != nil {
+		return err
+	}
+	if err := providerattestation.Verify(payload, signature); err != nil {
+		return errors.New("native provider receipt attestation verification failed")
+	}
+	output.Attestation = &signature
+	return nil
+}
+
+func canonicalProviderNativeOutput(output providerNativeRunOutput) ([]byte, error) {
+	output.Attestation = nil
+	return json.Marshal(output)
 }
 
 func completeProviderNativeOperation(ledger providerNativeOperationLedger, claimed *state.SendOperation, output providerNativeRunOutput, completedAt time.Time) error {

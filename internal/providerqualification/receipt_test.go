@@ -1,12 +1,16 @@
 package providerqualification
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"io/fs"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
+	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 )
 
 func testHash(value string) string {
@@ -50,6 +54,47 @@ func TestReceiptRejectsSyntheticProvenance(t *testing.T) {
 	r.Checks[0].Provenance = "synthetic"
 	if err := r.Finalize(); err == nil {
 		t.Fatal("Finalize() accepted synthetic provenance")
+	}
+}
+
+type qualificationAttestationStore struct{ seed []byte }
+
+func (s *qualificationAttestationStore) Get(context.Context, string) ([]byte, error) {
+	if len(s.seed) == 0 {
+		return nil, providercredential.ErrNotFound
+	}
+	return append([]byte(nil), s.seed...), nil
+}
+func (s *qualificationAttestationStore) Put(_ context.Context, _ string, value []byte) error {
+	s.seed = append([]byte(nil), value...)
+	return nil
+}
+func (s *qualificationAttestationStore) Status(context.Context, string) (providercredential.Status, error) {
+	return providercredential.Status{Available: true, Present: len(s.seed) != 0, Evidence: providercredential.EvidenceOSProtectedProcessReadable}, nil
+}
+
+func TestReceiptValidateAcceptsItsAttachedAttestation(t *testing.T) {
+	receipt := passingReceipt(t, time.Unix(1_800_000_000, 0).UTC())
+	attestor, err := providerattestation.New(&qualificationAttestationStore{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := attestor.EnsureKey(t.Context(), "qualification-test"); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := receipt.CanonicalPayload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature, err := attestor.Sign(t.Context(), "qualification-test", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := receipt.AttachAttestation(signature); err != nil {
+		t.Fatal(err)
+	}
+	if err := receipt.Validate(); err != nil {
+		t.Fatalf("attached qualification attestation failed validation: %v", err)
 	}
 }
 

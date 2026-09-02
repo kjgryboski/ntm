@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -37,14 +38,25 @@ const (
 // SessionRequest never includes credentials.  ExpectedNonce is included in
 // the outgoing prompt by the caller, but only its hash is retained below.
 type SessionRequest struct {
-	Action        SessionAction
-	SessionID     string
-	Prompt        string
-	CWD           string
+	Action    SessionAction
+	SessionID string
+	Prompt    string
+	CWD       string
+	// Worktree identifies the already-created worktree this session is bound
+	// to. It is receipt context only: lifecycle resume/fork must never create
+	// or delete a worktree as a side effect. An omitted value binds to CWD.
+	Worktree      string
 	Binary        string
 	Model         string
 	ExpectedNonce string
 	PolicyArgs    []string
+	// These are non-secret, immutable attestation digests supplied by the
+	// adapter that owns the corresponding configuration discovery. Empty
+	// values mean the adapter did not attest that source; malformed values are
+	// rejected rather than being silently re-hashed as a different fact.
+	PolicySHA256 string
+	ConfigSHA256 string
+	BinarySHA256 string
 }
 
 // SessionReceipt is deliberately redacted.  A CLI-reported session ID is
@@ -52,8 +64,14 @@ type SessionRequest struct {
 // discovery mechanism.
 type SessionReceipt struct {
 	Action               SessionAction       `json:"action"`
+	Fork                 bool                `json:"fork"`
 	ParentSessionSHA256  string              `json:"parent_session_sha256"`
 	ChildSessionSHA256   string              `json:"child_session_sha256,omitempty"`
+	CWDSHA256            string              `json:"cwd_sha256"`
+	WorktreeSHA256       string              `json:"worktree_sha256"`
+	PolicySHA256         string              `json:"policy_sha256"`
+	ConfigSHA256         string              `json:"config_sha256,omitempty"`
+	BinarySHA256         string              `json:"binary_sha256,omitempty"`
 	NonceSHA256          string              `json:"nonce_sha256,omitempty"`
 	LineageBound         bool                `json:"lineage_bound"`
 	ProviderAcknowledged bool                `json:"provider_acknowledged"`
@@ -90,6 +108,24 @@ func BuildSessionSpec(req SessionRequest) (StartSpec, SessionReceipt, error) {
 	if req.Binary == "" {
 		req.Binary = "grok"
 	}
+	if err := validateLifecyclePath("cwd", req.CWD); err != nil {
+		return StartSpec{}, SessionReceipt{}, err
+	}
+	if strings.TrimSpace(req.Worktree) == "" {
+		req.Worktree = req.CWD
+	}
+	if err := validateLifecyclePath("worktree", req.Worktree); err != nil {
+		return StartSpec{}, SessionReceipt{}, err
+	}
+	for name, value := range map[string]string{
+		"policy SHA-256": req.PolicySHA256,
+		"config SHA-256": req.ConfigSHA256,
+		"binary SHA-256": req.BinarySHA256,
+	} {
+		if err := validateOptionalLifecycleDigest(name, value); err != nil {
+			return StartSpec{}, SessionReceipt{}, err
+		}
+	}
 	if len(req.PolicyArgs) == 0 {
 		req.PolicyArgs = defaultReadOnlyAutomationPolicyArgs()
 	}
@@ -108,7 +144,27 @@ func BuildSessionSpec(req SessionRequest) (StartSpec, SessionReceipt, error) {
 	if req.Action == SessionFork {
 		args = append(args, "--fork-session")
 	}
-	receipt := SessionReceipt{Action: req.Action, ParentSessionSHA256: lifecycleHash(req.SessionID), NonceSHA256: lifecycleHash(req.ExpectedNonce)}
+	policyHash := req.PolicySHA256
+	if policyHash == "" {
+		// This is a hash of the exact, validated per-invocation policy args. It
+		// is not a claim about a managed requirements file; adapters with that
+		// stronger evidence pass PolicySHA256 explicitly.
+		policyHash = lifecycleFieldsHash(req.PolicyArgs...)
+	}
+	receipt := SessionReceipt{
+		Action:              req.Action,
+		Fork:                req.Action == SessionFork,
+		ParentSessionSHA256: lifecycleHash(req.SessionID),
+		CWDSHA256:           lifecycleHash(filepath.Clean(req.CWD)),
+		WorktreeSHA256:      lifecycleHash(filepath.Clean(req.Worktree)),
+		PolicySHA256:        policyHash,
+		ConfigSHA256:        req.ConfigSHA256,
+		BinarySHA256:        req.BinarySHA256,
+		NonceSHA256:         lifecycleHash(req.ExpectedNonce),
+	}
+	if err := validateSessionLineageContext(receipt); err != nil {
+		return StartSpec{}, SessionReceipt{}, err
+	}
 	return StartSpec{Binary: req.Binary, Args: args, CWD: req.CWD}, receipt, nil
 }
 
@@ -117,8 +173,14 @@ func BuildSessionSpec(req SessionRequest) (StartSpec, SessionReceipt, error) {
 // nonce to the returned child session.  Empty and same-ID fork results are not
 // evidence of a fork.
 func BindSessionLineage(receipt SessionReceipt, childSessionID string, nonceAcknowledged bool) (SessionReceipt, error) {
+	if err := validateSessionLineageContext(receipt); err != nil {
+		return receipt, err
+	}
 	if strings.TrimSpace(childSessionID) == "" {
 		return receipt, errors.New("Grok lifecycle completion omitted child session id")
+	}
+	if len(childSessionID) > 4096 || strings.IndexFunc(childSessionID, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+		return receipt, errors.New("Grok lifecycle completion returned an invalid child session id")
 	}
 	childHash := lifecycleHash(childSessionID)
 	if receipt.Action == SessionFork && childHash == receipt.ParentSessionSHA256 {
@@ -139,6 +201,71 @@ func lifecycleHash(value string) string {
 	}
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
+}
+
+func lifecycleFieldsHash(values ...string) string {
+	h := sha256.New()
+	for _, value := range values {
+		_, _ = io.WriteString(h, value)
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func validateLifecyclePath(name, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 4096 || strings.IndexFunc(value, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+		return fmt.Errorf("Grok lifecycle %s is invalid", name)
+	}
+	return nil
+}
+
+func validateOptionalLifecycleDigest(name, value string) error {
+	if value == "" {
+		return nil
+	}
+	if len(value) != sha256.Size*2 || strings.IndexFunc(value, func(r rune) bool {
+		return !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f'))
+	}) >= 0 {
+		return fmt.Errorf("Grok lifecycle %s must be 64 lowercase hexadecimal characters", name)
+	}
+	return nil
+}
+
+// validateSessionLineageContext prevents callers from binding a returned
+// session ID to a receipt whose action, workspace, or execution policy is
+// incomplete. Session identifiers and filesystem locations remain hashed so
+// the durable receipt is useful for equality checks without becoming a
+// discovery index.
+func validateSessionLineageContext(receipt SessionReceipt) error {
+	if receipt.Action != SessionResume && receipt.Action != SessionFork {
+		return errors.New("Grok lifecycle receipt has an invalid action")
+	}
+	if receipt.Fork != (receipt.Action == SessionFork) {
+		return errors.New("Grok lifecycle receipt fork flag does not match action")
+	}
+	for name, value := range map[string]string{
+		"parent session SHA-256": receipt.ParentSessionSHA256,
+		"cwd SHA-256":            receipt.CWDSHA256,
+		"worktree SHA-256":       receipt.WorktreeSHA256,
+		"policy SHA-256":         receipt.PolicySHA256,
+	} {
+		if value == "" {
+			return fmt.Errorf("Grok lifecycle receipt omitted %s", name)
+		}
+		if err := validateOptionalLifecycleDigest(name, value); err != nil {
+			return err
+		}
+	}
+	for name, value := range map[string]string{
+		"config SHA-256": receipt.ConfigSHA256,
+		"binary SHA-256": receipt.BinarySHA256,
+	} {
+		if err := validateOptionalLifecycleDigest(name, value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // CancellationReceipt keeps local termination separate from any provider

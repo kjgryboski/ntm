@@ -285,7 +285,8 @@ model_probe_state = "unprobed"
 model_probe_receipt_sha256 = ""
 ```
 
-The separately billed native no-tool lane uses a different profile and key:
+The separately billed native lanes use a different identity and OS-brokered
+API credential. The no-tool profile is:
 
 ```toml
 [provider_profiles.zai-native-no-tools]
@@ -304,6 +305,12 @@ automation_policy = "zai-native-no-tools-v1"
 exact_target_only = true
 probe_required = true
 ```
+
+For controller-owned coding tools, use the same immutable native identity
+fields with `automation_policy = "zai-native-tools-v1"`. That policy exposes
+only bounded list/read/write operations in a linked disposable worktree and a
+fixed isolated verification manifest; it never exposes an arbitrary provider
+shell, credential paths, network access, or Git push.
 
 For the Claude-compatible Z.ai lane, the selected profile must use the official
 `https://api.z.ai/api/anthropic` endpoint and `claude-code` runtime. Its
@@ -426,7 +433,8 @@ Run `ntm provider doctor --profile=PROFILE` for the read-only report, or add
 `--online` for one bounded, no-tool identity/model probe. Doctor checks the
 exact identity, pinned runtime, authorization presence, managed-policy digest
 and ownership, local shared capacity/circuit state, lifecycle evidence, and,
-for the Z.ai Claude-compatible coding lane, a stored qualification receipt.
+for each Z.ai coding lane, a stored signed qualification receipt for that
+transport and policy.
 The online probe and offline conformance harness are not coding qualification;
 for provider-native no-tool transports, the online probe is instead one of the
 capability-scoped readiness gates.
@@ -449,8 +457,9 @@ the write policy) a linked disposable worktree. These commands additionally
 require a root-owned matching requirements document, a canonical
 system-authoritative Grok executable, a reviewed runtime-version pin with no
 drift, and the cross-process local shared capacity store. They emit
-nonce-bound receipts that bind identity, policy, working-directory hash,
-admission, action, and child-session lineage without echoing the provider
+signed nonce-bound receipts that bind identity, policy, configuration and
+binary hashes, worktree/working-directory hashes, admission, action,
+child-session lineage, and redacted telemetry without echoing the provider
 session ID or preserving the prompt. Cancellation and cleanup are authoritative
 only for the locally observed process tree; they are not provider-side
 cancellation acknowledgements. Arbitrary provider output, raw tool arguments,
@@ -464,12 +473,25 @@ refused.
 
 Z.ai has two separate authorization lanes. The Claude-compatible Coding Plan
 lane uses only the deliberately Z.ai-scoped `ZAI_API_KEY`, remapped to the
-Claude-compatible child token; it is the only lane
-accepted by live qualification. A native Z.ai API profile is a different
-immutable credential/billing/entitlement identity and requires
-`ZAI_NATIVE_API_KEY`; Coding Plan credentials are not accepted for it. Native
-API structured completion, usage, and error records do not confer native
-cancellation or resume evidence.
+Claude-compatible child token. A native Z.ai API profile is a different
+immutable credential/billing/entitlement identity. Its separately authorized
+key is provisioned with `ntm provider credential set --profile=PROFILE --stdin`
+and read only from the OS credential broker; native execution does not fall
+back to environment variables. Coding Plan credentials are not accepted for
+the native lane. Native API structured completion, usage, and error records do
+not confer provider-side cancellation or resume evidence.
+
+Initialize receipt signing explicitly before any live native request or Grok
+session operation:
+
+```bash
+ntm provider attestation init
+```
+
+The signing seed is held in the supported OS credential store and receipts are
+publicly verifiable Ed25519 envelopes. This is OS-protected, process-readable
+storage—not a claim that the key is hardware-backed or non-exportable to every
+process running as the same user.
 
 The native no-tool API lane is an explicit single-request operation, not a
 substitute for Claude-compatible coding qualification. After configuring a
@@ -483,34 +505,59 @@ ntm provider run --profile=zai-native-no-tools --operation-id=YOUR_UNIQUE_OPERAT
 Its redacted receipt binds the operation, exact identity, and request outcome.
 NTM derives a non-secret `request_id` from that durable binding, sends it in
 the API body, and requires the stream itself to echo the exact value; response
-headers alone are not completion evidence. This does not establish
+headers alone are not completion evidence. Signed receipts also bind redacted
+latency/token/cache/error/circuit telemetry. This does not establish
 provider-side cancellation, resume, or coding-policy authority. Do not use a
 Coding Plan credential in this lane, and do not infer a live Z.ai qualification
 from this command.
 
-Run the live suite explicitly in its disposable repository:
+The controller-tools lane additionally requires an exact linked disposable
+worktree, its current revision, and a fixed verifier manifest:
+
+```bash
+ntm provider run --profile=zai-native-tools --operation-id=YOUR_UNIQUE_OPERATION_ID \
+  --prompt='bounded coding task' --tools --worktree=/exact/disposable/worktree \
+  --revision=EXACT_GIT_COMMIT --verify-commands=go-test --live
+```
+
+The model can request structured tool calls, but NTM validates their schemas,
+serializes controller writes with optimistic hash checks and a final pre-commit
+recheck, and runs approved tests through a credential-cleared,
+network-isolated controller broker. The write check protects cooperating NTM
+operations; it is not an OS-wide lock against unrelated host processes.
+
+Run the applicable live suite explicitly in its disposable repository:
 
 ```bash
 ntm provider qualify --profile=zai-team-model --live
+ntm provider qualify --profile=zai-native-tools --live
 ```
 
-This suite creates a create-only, self-digested local receipt bound to the exact identity,
+Each suite creates a create-only, self-digested and signed local receipt bound to the exact identity,
 transport, policy digest, runtime version, and disposable-repository hash. Its
-nine mandatory live checks are model identity, workspace edit, test execution,
+mandatory Coding Plan checks are model identity, workspace edit, test execution,
 secret-access denial, push denial, crash recovery, cancellation, session
-resumption, and zero-residual cleanup. It is supported only on Linux: without
+resumption, and zero-residual cleanup. The native tools matrix separately proves
+the exact model/request ID, controller tool loop, edit, isolated verification,
+protected-path and shell/push denial, cancellation of an in-flight local HTTP
+request context, no-replay outcome handling, and local sandbox-process cleanup.
+It does not claim provider-side cancellation, deletion of the retained
+qualification repository, or provider-authoritative cleanup. Isolated verification is supported only on Linux: without
 an explicitly injected test verifier, NTM rejects non-Linux hosts during
 preflight, before it creates the disposable repository or calls the provider,
 because the production test verifier relies on Bubblewrap namespace isolation.
-The native no-tool API lane above is separate and is not a workaround or
-substitute. **Hard NO-GO:** do not treat a provider
-Z.ai Claude-compatible lane as ready for production coding until `ntm provider doctor --profile=PROFILE`
-reports a current pass for all nine checks bound to that exact identity,
-transport, and policy. No live qualification is claimed by this document.
-The receipt is not signed and is not tamper-evident against the same local
-account. Test execution is performed by NTM after an exact repository-delta
+The native no-tool API lane above remains separate and is not a workaround or
+substitute. **Hard NO-GO:** do not treat either coding lane as ready until
+`ntm provider doctor --profile=PROFILE` reports a current signed pass bound to
+that exact identity, transport, and policy. No live qualification is claimed
+by this document. Test execution is performed by NTM after an exact repository-delta
 check, inside a cleared-environment Bubblewrap network/PID/filesystem sandbox,
-not by trusting model-authored output or a provider-run shell command.
+not by trusting model-authored output or a provider-run shell command. The
+sandbox starts from an empty root and mounts only system runtime directories,
+the selected Go toolchain when applicable, and the linked worktree; host homes,
+credential paths, and dependency caches are not mounted. Projects that need
+third-party packages must make them available in the worktree (for example by
+vendoring them), because verification cannot download dependencies.
 
 Managed-policy discovery and a configuration digest are configuration
 attestation. They can prove the local controller saw a matching policy file and

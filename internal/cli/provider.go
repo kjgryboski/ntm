@@ -24,6 +24,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
+	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/zai"
@@ -223,14 +224,16 @@ type providerDoctorDependencies struct {
 	// readRequirements securely binds content and metadata to the same open
 	// file descriptor. Production sets it; unit tests may inject the older
 	// readFile/stat pair to exercise report assembly without privileged files.
-	readRequirements    func(string) ([]byte, os.FileInfo, error)
-	inspectGrok         func(context.Context, string, string) (providerGrokInspection, error)
-	probeGrokBypassLock func(context.Context, string) (providerGrokBypassProbe, error)
-	onlineProbe         func(context.Context, config.ProviderProfileConfig, provider.Identity) (providerDoctorLiveEvidence, error)
-	qualificationStore  func(string, string) (providerqualification.Receipt, string, error)
-	capacityStatus      func() ratelimit.CapacityStatus
-	capacitySnapshot    func(provider.Identity) ratelimit.AdmissionSnapshot
-	admission           providerDoctorAdmission
+	readRequirements     func(string) ([]byte, os.FileInfo, error)
+	inspectGrok          func(context.Context, string, string) (providerGrokInspection, error)
+	probeGrokBypassLock  func(context.Context, string) (providerGrokBypassProbe, error)
+	onlineProbe          func(context.Context, config.ProviderProfileConfig, provider.Identity) (providerDoctorLiveEvidence, error)
+	qualificationStore   func(string, string) (providerqualification.Receipt, string, error)
+	capacityStatus       func() ratelimit.CapacityStatus
+	capacitySnapshot     func(provider.Identity) ratelimit.AdmissionSnapshot
+	credentialStatus     func(context.Context, string) (providercredential.Status, error)
+	attestationPreflight func(context.Context) error
+	admission            providerDoctorAdmission
 }
 
 type providerQualificationDependencies struct {
@@ -240,6 +243,8 @@ type providerQualificationDependencies struct {
 	lookupEnv  func(string) (string, bool)
 	run        func(context.Context, providerqualification.Options) providerqualification.Receipt
 	store      func(string, providerqualification.Receipt) (string, error)
+	sign       func(context.Context, *providerqualification.Receipt) error
+	preflight  func(context.Context) error
 	admission  providerDoctorAdmission
 }
 
@@ -265,6 +270,10 @@ func defaultProviderDoctorDependencies() providerDoctorDependencies {
 		capacitySnapshot: func(identity provider.Identity) ratelimit.AdmissionSnapshot {
 			return admission.Snapshot(identity)
 		},
+		credentialStatus: providerCredentialDeps.store.Status,
+		attestationPreflight: func(ctx context.Context) error {
+			return preflightProviderReceiptSigner(ctx, signProviderReceiptPayload)
+		},
 		admission: admission,
 	}
 }
@@ -278,7 +287,11 @@ var providerQualificationDeps = providerQualificationDependencies{
 	lookupEnv:  os.LookupEnv,
 	run:        providerqualification.Run,
 	store:      providerqualification.Store,
-	admission:  ratelimit.DefaultAdmissionController(),
+	sign:       signProviderQualificationReceipt,
+	preflight: func(ctx context.Context) error {
+		return preflightProviderReceiptSigner(ctx, signProviderReceiptPayload)
+	},
+	admission: ratelimit.DefaultAdmissionController(),
 }
 
 func newProviderCmd() *cobra.Command {
@@ -286,7 +299,7 @@ func newProviderCmd() *cobra.Command {
 		Use:   "provider",
 		Short: "Inspect and qualify exact AI provider lanes",
 	}
-	cmd.AddCommand(newProviderDoctorCmd(), newProviderQualifyCmd(), newProviderSessionCmd(), newProviderNativeRunCmd(), newProviderCapabilitiesCmd(), newProviderPolicyCmd())
+	cmd.AddCommand(newProviderDoctorCmd(), newProviderQualifyCmd(), newProviderSessionCmd(), newProviderNativeRunCmd(), newProviderVerifyCmd(), newProviderCredentialCmd(), newProviderAttestationCmd(), newProviderCapabilitiesCmd(), newProviderPolicyCmd(), newProviderTelemetryCmd())
 	return cmd
 }
 
@@ -295,10 +308,11 @@ func newProviderQualifyCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "qualify",
 		Short: "Run the live Z.ai Coding Plan qualification suite",
-		Long: `Run all mandatory checks against one exact Z.ai Claude-compatible Coding Plan profile.
+		Long: `Run all mandatory checks against one exact Z.ai provider profile.
 
 This command is intentionally live-only and retains its disposable repository.
-It never accepts a native Z.ai API credential for this compatibility lane.`,
+Coding Plan and native API credentials remain separate; native tool qualification
+requires the controller-owned tools policy and OS-protected credential broker.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runProviderQualification(cmd, opts, providerQualificationDeps)
@@ -322,7 +336,7 @@ func runProviderQualification(cmd *cobra.Command, opts providerQualificationOpti
 	if opts.timeout <= 0 || opts.suiteTimeout <= 0 {
 		return errors.New("provider qualification timeouts must be positive")
 	}
-	if deps.loadConfig == nil || deps.lookPath == nil || deps.version == nil || deps.lookupEnv == nil || deps.run == nil || deps.store == nil || deps.admission == nil {
+	if deps.loadConfig == nil || deps.lookPath == nil || deps.version == nil || deps.lookupEnv == nil || deps.run == nil || deps.store == nil || deps.sign == nil || deps.preflight == nil || deps.admission == nil {
 		return errors.New("provider qualification dependencies are incomplete")
 	}
 
@@ -342,8 +356,14 @@ func runProviderQualification(cmd *cobra.Command, opts providerQualificationOpti
 	if err != nil {
 		return err
 	}
+	if transport == "zai_native_api" {
+		return runProviderNativeQualification(cmd, opts, profile, identity, providerNativeQualificationDeps)
+	}
 	if transport != "zai_claude_runtime" {
-		return errors.New("the live qualification suite accepts only the Z.ai Claude-compatible Coding Plan lane")
+		return errors.New("the live qualification suite accepts only exact Z.ai Coding Plan or native API profiles")
+	}
+	if err := deps.preflight(providerCommandContext(cmd)); err != nil {
+		return fmt.Errorf("provider qualification requires an initialized receipt signing key before dispatch: %w", err)
 	}
 	credential, credentialPresent := deps.lookupEnv("ZAI_API_KEY")
 	credentialPresent = credentialPresent && strings.TrimSpace(credential) != ""
@@ -391,6 +411,9 @@ func runProviderQualification(cmd *cobra.Command, opts providerQualificationOpti
 	suiteCancel()
 	if err := receipt.Validate(); err != nil {
 		return fmt.Errorf("live qualification produced an invalid receipt: %w", err)
+	}
+	if err := deps.sign(commandCtx, &receipt); err != nil {
+		return fmt.Errorf("sign live qualification receipt: %w", err)
 	}
 	path, err := deps.store(opts.qualificationDir, receipt)
 	if err != nil {
@@ -744,7 +767,11 @@ func buildProviderDoctorReport(ctx context.Context, cfg *config.Config, opts pro
 	report.Policy = policy
 	report.Checks = append(report.Checks, policyCheck)
 	authCheck := diagnoseProviderAuthPresence(identity, deps.lookupEnv)
+	if identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI {
+		authCheck = diagnoseNativeProviderCredential(ctx, identity, deps.credentialStatus)
+	}
 	report.Checks = append(report.Checks, authCheck)
+	report.Checks = append(report.Checks, diagnoseProviderReceiptAttestation(ctx, deps.attestationPreflight))
 	report.Capacity, report.Checks = diagnoseProviderCapacity(identity, deps, report.Checks)
 
 	if opts.online {
@@ -809,7 +836,14 @@ func buildProviderDoctorReport(ctx context.Context, cfg *config.Config, opts pro
 func diagnoseProviderPolicy(ctx context.Context, inspectionCWD string, profile config.ProviderProfileConfig, identity provider.Identity, deps providerDoctorDependencies) (providerDoctorPolicy, providerDoctorCheck) {
 	result := providerDoctorPolicy{Name: profile.AutomationPolicy, ManagedRequirementsState: "not_applicable", RuntimeInspectionState: "not_applicable", BypassLockProbeState: "not_applicable"}
 	if identity.Provider() != "xai" {
-		result.SHA256 = identity.ConfigSHA256()
+		switch {
+		case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI && profile.AutomationPolicy == provider.NativeZAIToolsPolicyName:
+			result.SHA256 = providerNativeToolsPolicySHA256()
+		case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI:
+			result.SHA256 = providerNativeNoToolsPolicySHA256()
+		default:
+			result.SHA256 = identity.ConfigSHA256()
+		}
 		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorPass, Provenance: "config_validated", Summary: "provider policy is bound by the reviewed profile manifest", Evidence: result.SHA256}
 	}
 	binary := profile.Command
@@ -1006,10 +1040,7 @@ func diagnoseProviderAuthPresence(identity provider.Identity, lookup func(string
 	}
 	switch {
 	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI:
-		if present("ZAI_NATIVE_API_KEY") {
-			return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorPass, Provenance: "live_local", Summary: "separate native API credential is present"}
-		}
-		return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorFail, Provenance: "live_local", Summary: "separate native API credential is absent", Remediation: "Authorize and export ZAI_NATIVE_API_KEY; Coding Plan credentials are not accepted"}
+		return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorFail, Provenance: "os_credential_broker", Summary: "native API credential status requires the OS-protected broker", Remediation: "Run ntm provider credential status for this exact profile"}
 	case identity.Provider() == "zai":
 		if present("ZAI_API_KEY") {
 			return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorPass, Provenance: "live_local", Summary: "Claude-compatible Coding Plan credential is present"}
@@ -1022,9 +1053,34 @@ func diagnoseProviderAuthPresence(identity provider.Identity, lookup func(string
 	}
 }
 
+func diagnoseNativeProviderCredential(ctx context.Context, identity provider.Identity, statusFn func(context.Context, string) (providercredential.Status, error)) providerDoctorCheck {
+	if statusFn == nil {
+		return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorFail, Provenance: "os_credential_broker", Summary: "OS-protected credential broker is unavailable", Remediation: "Install a supported native credential store and provision this exact profile"}
+	}
+	status, err := statusFn(ctx, providerCredentialID(identity))
+	if err != nil || !status.Available {
+		return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorFail, Provenance: "os_credential_broker", Summary: "OS-protected credential broker is unavailable", Evidence: safeErrorDigest(err), Remediation: "Install a supported native credential store and run ntm provider credential set --stdin for this exact profile"}
+	}
+	if !status.Present || status.Evidence != providercredential.EvidenceOSProtectedProcessReadable {
+		return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorFail, Provenance: "os_credential_broker", Summary: "exact native API credential is absent or insufficiently protected", Evidence: digestSafeJSON(status), Remediation: "Provision the exact native profile with ntm provider credential set --stdin"}
+	}
+	return providerDoctorCheck{ID: "auth_presence", Status: providerDoctorPass, Provenance: "os_credential_broker", Summary: "exact native API credential is present in OS-protected storage", Evidence: digestSafeJSON(status)}
+}
+
+func diagnoseProviderReceiptAttestation(ctx context.Context, preflight func(context.Context) error) providerDoctorCheck {
+	if preflight == nil {
+		return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorFail, Provenance: "os_credential_broker", Summary: "provider receipt signing preflight is unavailable", Remediation: "Run ntm provider attestation init on a supported OS credential backend"}
+	}
+	if err := preflight(ctx); err != nil {
+		return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorFail, Provenance: "os_credential_broker", Summary: "provider receipt signing key is absent or unavailable", Evidence: safeErrorDigest(err), Remediation: "Run ntm provider attestation init before live provider execution"}
+	}
+	return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorPass, Provenance: "os_credential_broker", Summary: "OS-protected receipt signing key produced a locally verifiable signature", Evidence: sha256StringCLI("ntm.provider-receipt-attestation-preflight.v1")}
+}
+
 func diagnoseQualification(identity provider.Identity, transport, policySHA string, opts providerCommandOptions, deps providerDoctorDependencies, checks []providerDoctorCheck) (providerDoctorQualification, []providerDoctorCheck) {
 	result := providerDoctorQualification{State: "missing", PolicySHA256: policySHA}
-	if transport != "zai_claude_runtime" {
+	qualificationRequired := transport == "zai_claude_runtime" || transport == "zai_native_api" && policySHA == providerNativeToolsPolicySHA256()
+	if !qualificationRequired {
 		result.State = "not_required"
 		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorPass, Provenance: "capability_registry", Summary: "the nine-check coding qualification is not applicable to this no-tool/provider-native transport; online identity and capability-specific gates still apply"})
 		return result, checks
@@ -1045,6 +1101,9 @@ func diagnoseQualification(identity provider.Identity, transport, policySHA stri
 		}
 	}
 	switch {
+	case receipt.Attestation == nil:
+		result.State = "unsigned"
+		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "live_receipt", Summary: "qualification receipt is not cryptographically attested", Evidence: receipt.ReceiptSHA256, Remediation: "Initialize provider receipt signing and run a fresh live qualification"})
 	case receipt.Transport != transport || receipt.IdentitySHA256 != identity.Hash() || receipt.PolicySHA256 != policySHA:
 		result.State = "identity_or_policy_mismatch"
 		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "live_receipt", Summary: "qualification receipt does not bind this exact identity, transport, and policy", Evidence: receipt.ReceiptSHA256})
@@ -1119,7 +1178,7 @@ func providerDoctorReady(report providerDoctorReport) bool {
 	if report.Mode != "online" || report.Runtime.Drift != "none" || report.Capacity.Scope != provider.CapacityControlScopeLocalShared {
 		return false
 	}
-	if report.Transport == "zai_claude_runtime" && (!report.Qualification.Passed || report.Qualification.State != "current_pass") {
+	if (report.Transport == "zai_claude_runtime" || report.Transport == "zai_native_api" && report.Policy.Name == provider.NativeZAIToolsPolicyName) && (!report.Qualification.Passed || report.Qualification.State != "current_pass") {
 		return false
 	}
 	// A Claude-compatible Z.ai pane can be admission-controlled only while NTM
@@ -1193,10 +1252,14 @@ func runProviderDoctorOnlineProbe(ctx context.Context, profile config.ProviderPr
 		}
 		return providerDoctorLiveEvidence{ModelVerified: receipt.ModelSessionEvidence && receipt.Model == identity.Model(), AuthVerified: receipt.ModelSessionEvidence, SHA256: digest}, nil
 	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI:
-		key := strings.TrimSpace(os.Getenv("ZAI_NATIVE_API_KEY"))
+		keyBytes, credentialErr := providerCredentialDeps.store.Get(ctx, providerCredentialID(identity))
+		if credentialErr != nil || len(keyBytes) == 0 {
+			return providerDoctorLiveEvidence{}, errors.New("native Z.ai credential is unavailable from OS-protected storage")
+		}
+		defer zeroProviderSecret(keyBytes)
 		receipt, probeErr := zai.RunNative(ctx, zai.DefaultNativeHTTPClient(), zai.NativeRequest{
 			Endpoint: identity.Endpoint(), Model: identity.Model(), Prompt: "Reply with this exact nonce and no other text: " + nonce,
-			ExpectedNonce: nonce, ExpectedRequestID: providerDoctorNativeProbeRequestID(identity, nonce), NativeAPIKey: key, ExplicitOptIn: true, AllowTools: false,
+			ExpectedNonce: nonce, ExpectedRequestID: providerDoctorNativeProbeRequestID(identity, nonce), NativeAPIKey: string(keyBytes), ExplicitOptIn: true, AllowTools: false,
 		})
 		digest := digestSafeJSON(receipt)
 		if probeErr != nil {

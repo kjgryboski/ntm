@@ -20,6 +20,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
+	"github.com/Dicklesworthstone/ntm/internal/providertelemetry"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 )
 
@@ -72,7 +73,9 @@ func TestProviderQualificationRequiresExplicitLiveOptIn(t *testing.T) {
 			called = true
 			return providerqualification.Receipt{}
 		},
-		store: func(string, providerqualification.Receipt) (string, error) { return "", nil },
+		store:     func(string, providerqualification.Receipt) (string, error) { return "", nil },
+		sign:      func(context.Context, *providerqualification.Receipt) error { return nil },
+		preflight: func(context.Context) error { return nil },
 	}
 	err := runProviderQualification(&cobra.Command{}, providerQualificationOptions{profile: "zai-qualified", timeout: time.Second, suiteTimeout: time.Second}, deps)
 	if err == nil || called {
@@ -191,6 +194,8 @@ func TestProviderQualificationStoresFailedLiveReceiptWithoutPromoting(t *testing
 			}
 			return "/redacted/failed-receipt.json", nil
 		},
+		sign:      func(context.Context, *providerqualification.Receipt) error { return nil },
+		preflight: func(context.Context) error { return nil },
 		admission: qualificationAdmission,
 	}
 	err = runProviderQualification(cmd, providerQualificationOptions{profile: "zai-qualified", live: true, timeout: time.Second, suiteTimeout: time.Minute}, deps)
@@ -323,6 +328,7 @@ func providerSessionTestDeps(t *testing.T, profile config.ProviderProfileConfig,
 	if !ok {
 		t.Fatal("missing policy requirements")
 	}
+	signer := newProviderNativeTestSigner()
 	return providerSessionDependencies{
 		loadConfig: func() *config.Config {
 			return &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{"grok-qualified": profile}}
@@ -345,7 +351,18 @@ func providerSessionTestDeps(t *testing.T, profile config.ProviderProfileConfig,
 			return providerTestGrokBypassProbe(), nil
 		},
 		isLinkedWorktree: func(context.Context, string) (bool, error) { return true, nil },
-		runner:           providerSessionRunnerFake{}, admission: admission,
+		attestationPreflight: func(ctx context.Context) error {
+			return providerSessionAttestationPreflightWithSigner(ctx, signer)
+		},
+		sign:       signer,
+		hashBinary: func(string) (string, error) { return providerTestHash("grok-binary"), nil },
+		recordTelemetry: func(_ context.Context, observation providertelemetry.Observation) (providertelemetry.Observation, error) {
+			observation.SchemaVersion = providertelemetry.SchemaVersion
+			observation.ID = "22222222222222222222222222222222"
+			return observation, nil
+		},
+		runner: providerSessionRunnerFake{}, admission: admission,
+		now: func() time.Time { return time.Unix(1_800_000_000, 0).UTC() },
 	}
 }
 
@@ -463,10 +480,14 @@ func TestProviderSessionUsesSharedAdmissionAndReturnsOnlyHashedLineage(t *testin
 	runCalls := 0
 	deps.run = func(_ context.Context, _ grok.LifecycleRunner, request grok.SessionRequest) (grok.SessionReceipt, error) {
 		runCalls++
-		if request.ExpectedNonce == "" || !strings.Contains(request.Prompt, request.ExpectedNonce) || request.SessionID != "raw-parent-session" {
+		if request.ExpectedNonce == "" || !strings.Contains(request.Prompt, request.ExpectedNonce) || request.SessionID != "raw-parent-session" || request.Worktree != request.CWD || request.PolicySHA256 == "" || request.ConfigSHA256 == "" || request.BinarySHA256 == "" {
 			t.Fatalf("request=%+v", request)
 		}
-		return grok.SessionReceipt{Action: request.Action, LineageBound: true, ProviderAcknowledged: true, CompletionConfirmed: true, ParentSessionSHA256: providerTestHash("parent"), ChildSessionSHA256: providerTestHash("child"), NonceSHA256: providerTestHash("nonce")}, nil
+		return grok.SessionReceipt{
+			Action: request.Action, Fork: request.Action == grok.SessionFork, LineageBound: true, ProviderAcknowledged: true, CompletionConfirmed: true,
+			ParentSessionSHA256: providerTestHash("parent"), ChildSessionSHA256: providerTestHash("child"), NonceSHA256: providerTestHash("nonce"),
+			CWDSHA256: sha256StringCLI(request.CWD), WorktreeSHA256: sha256StringCLI(request.Worktree), PolicySHA256: request.PolicySHA256, ConfigSHA256: request.ConfigSHA256, BinarySHA256: request.BinarySHA256,
+		}, nil
 	}
 	cmd := &cobra.Command{}
 	var output bytes.Buffer
@@ -477,6 +498,38 @@ func TestProviderSessionUsesSharedAdmissionAndReturnsOnlyHashedLineage(t *testin
 	}
 	if strings.Contains(output.String(), "raw-parent-session") || strings.Contains(output.String(), "sensitive prompt") {
 		t.Fatalf("output leaked raw inputs: %q", output.String())
+	}
+}
+
+func TestProviderSessionAttestationPreflightBlocksDispatchBeforeAdmission(t *testing.T) {
+	profile := providerTestGrokProfile(agent.DefaultGrokAutomationPolicyName)
+	admission := &providerSessionAdmissionFake{decision: ratelimit.Decision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	deps := providerSessionTestDeps(t, profile, admission)
+	deps.attestationPreflight = func(context.Context) error { return errors.New("key unavailable") }
+	deps.run = func(context.Context, grok.LifecycleRunner, grok.SessionRequest) (grok.SessionReceipt, error) {
+		t.Fatal("attestation preflight dispatched Grok")
+		return grok.SessionReceipt{}, nil
+	}
+	err := runProviderSession(&cobra.Command{}, grok.SessionResume, providerSessionOptions{profile: "grok-qualified", sessionID: "parent", prompt: "bounded", cwd: t.TempDir(), timeout: time.Second}, deps)
+	if err == nil || admission.acquires != 0 || admission.releases != 0 {
+		t.Fatalf("err=%v admission=%+v", err, admission)
+	}
+}
+
+func TestProviderSessionOutputSignatureBindsCompletedReceipt(t *testing.T) {
+	output := providerSessionOutput{
+		SchemaVersion: providerSessionSchema, Success: true, Dispatched: true, Profile: "grok-qualified", Transport: "xai_headless_session",
+		IdentitySHA256: providerTestHash("identity"), Policy: agent.DefaultGrokAutomationPolicyName,
+		PolicySHA256: providerTestHash("policy"), ConfigSHA256: providerTestHash("config"), BinarySHA256: providerTestHash("binary"), CWD_SHA256: providerTestHash("cwd"), WorktreeSHA256: providerTestHash("worktree"),
+		Telemetry: providerTelemetryEvidence{State: providerTelemetryStateRecorded, ObservationID: "11111111111111111111111111111111", ObservationSHA256: providerTestHash("observation")},
+		Receipt:   grok.SessionReceipt{Action: grok.SessionResume, CompletionConfirmed: true, ProviderAcknowledged: true, LineageBound: true, ParentSessionSHA256: providerTestHash("parent"), ChildSessionSHA256: providerTestHash("child"), NonceSHA256: providerTestHash("nonce"), CWDSHA256: providerTestHash("cwd"), WorktreeSHA256: providerTestHash("worktree"), PolicySHA256: providerTestHash("policy"), ConfigSHA256: providerTestHash("config"), BinarySHA256: providerTestHash("binary")},
+	}
+	if err := sealProviderSessionOutput(t.Context(), &output, newProviderNativeTestSigner()); err != nil || !validProviderSessionOutput(output) {
+		t.Fatalf("sealed completed receipt valid=%v err=%v output=%+v", validProviderSessionOutput(output), err, output)
+	}
+	output.Receipt.ChildSessionSHA256 = providerTestHash("tampered-child")
+	if validProviderSessionOutput(output) {
+		t.Fatal("tampered completed session receipt was accepted")
 	}
 }
 
@@ -543,7 +596,34 @@ func providerTestReceipt(t *testing.T, identity provider.Identity, at time.Time)
 	if err := receipt.Finalize(); err != nil {
 		t.Fatalf("Finalize() error: %v", err)
 	}
+	payload, err := receipt.CanonicalPayload()
+	if err != nil {
+		t.Fatalf("CanonicalPayload() error: %v", err)
+	}
+	signature, err := newProviderNativeTestSigner()(context.Background(), payload)
+	if err != nil {
+		t.Fatalf("sign test qualification receipt: %v", err)
+	}
+	if err := receipt.AttachAttestation(signature); err != nil {
+		t.Fatalf("AttachAttestation() error: %v", err)
+	}
 	return receipt
+}
+
+func TestProviderDoctorRejectsUnsignedQualificationReceipt(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	profile := providerTestProfile()
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := providerTestReceipt(t, identity, now)
+	receipt.Attestation = nil
+	deps := providerTestDeps(t, now, receipt)
+	result, checks := diagnoseQualification(identity, "zai_claude_runtime", providerqualification.QualificationPolicySHA256(), providerCommandOptions{qualificationAge: 24 * time.Hour}, deps, nil)
+	if result.State != "unsigned" || len(checks) != 1 || checks[0].Status != providerDoctorFail {
+		t.Fatalf("unsigned qualification was accepted: result=%+v checks=%+v", result, checks)
+	}
 }
 
 func providerTestDeps(t *testing.T, now time.Time, receipt providerqualification.Receipt) providerDoctorDependencies {
@@ -580,7 +660,8 @@ func providerTestDeps(t *testing.T, now time.Time, receipt providerqualification
 		capacitySnapshot: func(identity provider.Identity) ratelimit.AdmissionSnapshot {
 			return ratelimit.AdmissionSnapshot{IdentityHash: identity.Hash(), Scope: provider.CapacityControlScopeLocalShared, Tokens: 1}
 		},
-		admission: admission,
+		attestationPreflight: func(context.Context) error { return nil },
+		admission:            admission,
 	}
 }
 
@@ -700,7 +781,8 @@ func TestProviderDoctorCanonicalizesGrokRuntimeBeforeOnlineDispatch(t *testing.T
 			capacitySnapshot: func(provider.Identity) ratelimit.AdmissionSnapshot {
 				return ratelimit.AdmissionSnapshot{IdentityHash: identity.Hash(), Scope: provider.CapacityControlScopeLocalShared, Tokens: 1}
 			},
-			admission: admission,
+			attestationPreflight: func(context.Context) error { return nil },
+			admission:            admission,
 		}
 	}
 

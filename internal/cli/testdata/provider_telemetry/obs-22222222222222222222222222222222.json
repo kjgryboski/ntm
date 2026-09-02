@@ -1,0 +1,21 @@
+{
+  "schema_version": "ntm.provider-telemetry.v1",
+  "id": "22222222222222222222222222222222",
+  "observed_at": "2026-09-02T12:00:00Z",
+  "identity_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "model": "glm-5.3",
+  "transport": "zai_native_api",
+  "adapter": "native_http",
+  "runtime": "api-v4",
+  "policy_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "compatibility_fixture_version": "zai-native-v4-v1",
+  "latency_micros": 2500,
+  "input_tokens": 10,
+  "output_tokens": 3,
+  "cached_tokens": 0,
+  "cost_micros": 12,
+  "provider_error_class": "none",
+  "quota": {"state": "unknown"},
+  "circuit": {"state": "closed", "failure_count": 0},
+  "no_failover": true
+}

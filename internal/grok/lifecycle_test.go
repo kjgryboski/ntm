@@ -20,12 +20,41 @@ func TestBuildSessionSpecResumeAndFork(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if receipt.ParentSessionSHA256 == "" || receipt.NonceSHA256 == "" || spec.Binary != "grok" {
+		if receipt.ParentSessionSHA256 == "" || receipt.NonceSHA256 == "" || receipt.CWDSHA256 == "" || receipt.WorktreeSHA256 == "" || receipt.PolicySHA256 == "" || receipt.Fork != (action == SessionFork) || spec.Binary != "grok" {
 			t.Fatalf("bad receipt/spec: %+v %+v", receipt, spec)
 		}
 		if action == SessionFork && !sameStrings(spec.Args[len(spec.Args)-1:], []string{"--fork-session"}) {
 			t.Fatalf("fork args: %#v", spec.Args)
 		}
+	}
+}
+
+func TestBuildSessionSpecBindsExplicitNonSecretAttestationDigests(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	digest := strings.Repeat("a", 64)
+	_, receipt, err := BuildSessionSpec(SessionRequest{
+		Action: SessionFork, SessionID: "parent", Prompt: nonce, CWD: "/repo", Worktree: "/worktrees/child",
+		ExpectedNonce: nonce, PolicySHA256: digest, ConfigSHA256: strings.Repeat("b", 64), BinarySHA256: strings.Repeat("c", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.PolicySHA256 != digest || receipt.ConfigSHA256 != strings.Repeat("b", 64) || receipt.BinarySHA256 != strings.Repeat("c", 64) {
+		t.Fatalf("attestation digests not retained: %+v", receipt)
+	}
+	if receipt.CWDSHA256 == receipt.WorktreeSHA256 {
+		t.Fatalf("distinct cwd/worktree context collapsed: %+v", receipt)
+	}
+}
+
+func TestBuildSessionSpecRejectsMalformedAttestationDigest(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	_, _, err := BuildSessionSpec(SessionRequest{
+		Action: SessionResume, SessionID: "parent", Prompt: nonce, CWD: "/repo", ExpectedNonce: nonce,
+		ConfigSHA256: "ABCDEF",
+	})
+	if err == nil || !strings.Contains(err.Error(), "config SHA-256") {
+		t.Fatalf("malformed digest accepted: %v", err)
 	}
 }
 
@@ -188,7 +217,13 @@ func TestExecuteSessionCancellationInterruptsWaitAfterParserEOF(t *testing.T) {
 }
 
 func TestBindSessionLineageRequiresNonceAndNewForkID(t *testing.T) {
-	r := SessionReceipt{Action: SessionFork, ParentSessionSHA256: lifecycleHash("parent")}
+	_, r, err := BuildSessionSpec(SessionRequest{
+		Action: SessionFork, SessionID: "parent", Prompt: "NTM_ACK_0123456789abcdef0123456789abcdef", CWD: "/repo",
+		ExpectedNonce: "NTM_ACK_0123456789abcdef0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := BindSessionLineage(r, "parent", true); err == nil {
 		t.Fatal("same fork session accepted")
 	}
@@ -198,6 +233,39 @@ func TestBindSessionLineageRequiresNonceAndNewForkID(t *testing.T) {
 	got, err := BindSessionLineage(r, "child", true)
 	if err != nil || !got.LineageBound || !got.ProviderAcknowledged {
 		t.Fatalf("lineage: %+v %v", got, err)
+	}
+}
+
+func TestBindSessionLineageFailsClosedWhenImmutableContextIsMissingOrInconsistent(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	_, r, err := BuildSessionSpec(SessionRequest{Action: SessionResume, SessionID: "parent", Prompt: nonce, CWD: "/repo", ExpectedNonce: nonce})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.CWDSHA256 = ""
+	if _, err := BindSessionLineage(r, "child", true); err == nil || !strings.Contains(err.Error(), "cwd SHA-256") {
+		t.Fatalf("missing cwd context accepted: %v", err)
+	}
+
+	_, r, err = BuildSessionSpec(SessionRequest{Action: SessionResume, SessionID: "parent", Prompt: nonce, CWD: "/repo", ExpectedNonce: nonce})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Fork = true
+	if _, err := BindSessionLineage(r, "child", true); err == nil || !strings.Contains(err.Error(), "fork flag") {
+		t.Fatalf("inconsistent fork context accepted: %v", err)
+	}
+}
+
+func TestBindSessionLineageAllowsResumeToRetainTheSameSession(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	_, receipt, err := BuildSessionSpec(SessionRequest{Action: SessionResume, SessionID: "parent", Prompt: nonce, CWD: "/repo", ExpectedNonce: nonce})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := BindSessionLineage(receipt, "parent", true)
+	if err != nil || !bound.LineageBound || bound.ChildSessionSHA256 != bound.ParentSessionSHA256 {
+		t.Fatalf("resume did not retain parent lineage: %+v %v", bound, err)
 	}
 }
 

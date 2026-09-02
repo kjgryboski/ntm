@@ -14,6 +14,9 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
+	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
+	"github.com/Dicklesworthstone/ntm/internal/providercredential"
+	"github.com/Dicklesworthstone/ntm/internal/providertelemetry"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/zai"
@@ -105,19 +108,49 @@ func providerNativeDeps(profile config.ProviderProfileConfig, admission *provide
 		loadConfig: func() *config.Config {
 			return &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{"zai-native": profile}}
 		},
-		lookupEnv: func(name string) (string, bool) {
-			if name == "ZAI_NATIVE_API_KEY" {
-				return "native-only-test-key", true
-			}
-			return "", false
+		credential: &providerCredentialStoreFake{secret: []byte("native-only-test-key"), status: providercredential.Status{Backend: providercredential.BackendLinuxSecretTool, Available: true, Present: true, Evidence: providercredential.EvidenceOSProtectedProcessReadable}},
+		newNonce:   func() (string, error) { return "NTM_ACK_0123456789abcdef0123456789abcdef", nil },
+		sign:       newProviderNativeTestSigner(),
+		recordTelemetry: func(_ context.Context, observation providertelemetry.Observation) (providertelemetry.Observation, error) {
+			observation.SchemaVersion = providertelemetry.SchemaVersion
+			observation.ID = "11111111111111111111111111111111"
+			return observation, nil
 		},
-		newNonce:  func() (string, error) { return "NTM_ACK_0123456789abcdef0123456789abcdef", nil },
 		client:    providerNativeHTTPClientFake{},
 		admission: admission,
 		openLedger: func() (providerNativeOperationLedger, func() error, error) {
 			return ledger, func() error { return nil }, nil
 		},
 		now: func() time.Time { return time.Unix(1, 0).UTC() },
+	}
+}
+
+type providerNativeAttestationStoreFake struct{ seed []byte }
+
+func (s *providerNativeAttestationStoreFake) Get(context.Context, string) ([]byte, error) {
+	if len(s.seed) == 0 {
+		return nil, providercredential.ErrNotFound
+	}
+	return append([]byte(nil), s.seed...), nil
+}
+func (s *providerNativeAttestationStoreFake) Put(_ context.Context, _ string, value []byte) error {
+	s.seed = append([]byte(nil), value...)
+	return nil
+}
+func (s *providerNativeAttestationStoreFake) Status(context.Context, string) (providercredential.Status, error) {
+	return providercredential.Status{Backend: providercredential.BackendLinuxSecretTool, Available: true, Present: len(s.seed) != 0, Evidence: providercredential.EvidenceOSProtectedProcessReadable}, nil
+}
+
+func newProviderNativeTestSigner() func(context.Context, []byte) (providerattestation.SignatureMetadata, error) {
+	attestor, err := providerattestation.New(&providerNativeAttestationStoreFake{})
+	if err != nil {
+		panic(err)
+	}
+	if _, err := attestor.EnsureKey(context.Background(), "ntm.provider.receipts.v1"); err != nil {
+		panic(err)
+	}
+	return func(ctx context.Context, payload []byte) (providerattestation.SignatureMetadata, error) {
+		return attestor.Sign(ctx, "ntm.provider.receipts.v1", payload)
 	}
 }
 
@@ -135,24 +168,41 @@ func TestProviderNativeRunRequiresLiveOptIn(t *testing.T) {
 	}
 }
 
-func TestProviderNativeRunAcceptsOnlyNativeCredential(t *testing.T) {
+func TestProviderNativeRunAcceptsOnlyExactBrokerCredential(t *testing.T) {
 	admission := &providerNativeAdmissionFake{status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
 	deps := providerNativeDeps(providerNativeProfile(), admission)
-	var requested []string
-	deps.lookupEnv = func(name string) (string, bool) {
-		requested = append(requested, name)
-		if name == "ZAI_API_KEY" || name == "ANTHROPIC_AUTH_TOKEN" {
-			return "wrong-lane-key", true
-		}
-		return "", false
-	}
+	store := &providerCredentialStoreFake{}
+	deps.credential = store
 	deps.run = func(context.Context, zai.NativeHTTPClient, zai.NativeRequest) (zai.NativeReceipt, error) {
 		t.Fatal("credential separation dispatched request")
 		return zai.NativeReceipt{}, nil
 	}
 	err := runProviderNative(&cobra.Command{}, providerNativeRunOptions{profile: "zai-native", prompt: "p", operationID: "native-credential", live: true}, deps)
-	if err == nil || len(requested) != 1 || requested[0] != "ZAI_NATIVE_API_KEY" || admission.acquires != 0 {
-		t.Fatalf("err=%v requested=%v admission=%+v", err, requested, admission)
+	identity, identityErr := providerNativeProfile().Identity()
+	if identityErr != nil {
+		t.Fatal(identityErr)
+	}
+	if err == nil || store.getID != providerCredentialID(identity) || admission.acquires != 0 {
+		t.Fatalf("err=%v requested=%q admission=%+v", err, store.getID, admission)
+	}
+}
+
+func TestProviderNativeRunRequiresSignerBeforeCredentialOrDispatch(t *testing.T) {
+	admission := &providerNativeAdmissionFake{status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	deps := providerNativeDeps(providerNativeProfile(), admission)
+	store := &providerCredentialStoreFake{secret: []byte("must-not-be-read")}
+	deps.credential = store
+	deps.sign = func(context.Context, []byte) (providerattestation.SignatureMetadata, error) {
+		return providerattestation.SignatureMetadata{}, errors.New("signer unavailable")
+	}
+	called := false
+	deps.run = func(context.Context, zai.NativeHTTPClient, zai.NativeRequest) (zai.NativeReceipt, error) {
+		called = true
+		return zai.NativeReceipt{}, nil
+	}
+	err := runProviderNative(&cobra.Command{}, providerNativeRunOptions{profile: "zai-native", prompt: "p", operationID: "native-no-signer", live: true}, deps)
+	if err == nil || store.getID != "" || called || admission.acquires != 0 {
+		t.Fatalf("err=%v credential=%q called=%t admission=%+v", err, store.getID, called, admission)
 	}
 }
 
@@ -181,6 +231,30 @@ func TestProviderNativeRunRedactsInputsAndRecordsSuccess(t *testing.T) {
 		if strings.Contains(output.String(), secret) {
 			t.Fatalf("output leaked %q: %q", secret, output.String())
 		}
+	}
+}
+
+func TestProviderNativeTelemetryFailureIsSignedAndDoesNotReplayProvider(t *testing.T) {
+	admission := &providerNativeAdmissionFake{decision: ratelimit.Decision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	deps := providerNativeDeps(providerNativeProfile(), admission)
+	runCalls := 0
+	deps.run = func(_ context.Context, _ zai.NativeHTTPClient, request zai.NativeRequest) (zai.NativeReceipt, error) {
+		runCalls++
+		return zai.NativeReceipt{Model: request.Model, NonceVerified: true, FinishReason: "stop", StartedAt: time.Unix(1, 0).UTC(), CompletedAt: time.Unix(2, 0).UTC()}, nil
+	}
+	deps.recordTelemetry = func(context.Context, providertelemetry.Observation) (providertelemetry.Observation, error) {
+		return providertelemetry.Observation{}, errors.New("telemetry store full")
+	}
+	opts := providerNativeRunOptions{profile: "zai-native", prompt: "one paid operation", operationID: "native-telemetry-failure", live: true}
+	for i := 0; i < 2; i++ {
+		cmd := &cobra.Command{}
+		cmd.SetOut(&bytes.Buffer{})
+		if err := runProviderNative(cmd, opts, deps); err != nil {
+			t.Fatalf("run %d: %v", i+1, err)
+		}
+	}
+	if runCalls != 1 {
+		t.Fatalf("telemetry failure replayed provider %d times", runCalls)
 	}
 }
 

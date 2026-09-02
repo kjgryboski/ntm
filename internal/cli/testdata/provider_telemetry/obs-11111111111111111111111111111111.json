@@ -1,0 +1,20 @@
+{
+  "schema_version": "ntm.provider-telemetry.v1",
+  "id": "11111111111111111111111111111111",
+  "observed_at": "2026-09-01T12:00:00Z",
+  "identity_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "model": "grok-4.6",
+  "transport": "acp",
+  "adapter": "native_acp",
+  "runtime": "1.0.13",
+  "policy_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "compatibility_fixture_version": "grok-acp-1.0.13-v1",
+  "latency_micros": 1500,
+  "input_tokens": 12,
+  "output_tokens": 4,
+  "cached_tokens": 2,
+  "provider_error_class": "none",
+  "quota": {"state": "available", "remaining": 7},
+  "circuit": {"state": "closed", "failure_count": 0},
+  "no_failover": true
+}

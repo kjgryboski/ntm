@@ -16,6 +16,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
 )
 
 const (
@@ -35,6 +37,18 @@ var requiredChecks = []string{
 	"zero_residual_cleanup",
 }
 
+var nativeRequiredChecks = []string{
+	"exact_model_request_id",
+	"controller_tool_loop",
+	"workspace_edit",
+	"isolated_verification",
+	"protected_path_denial",
+	"shell_and_push_absent",
+	"local_inflight_http_cancellation",
+	"outcome_unknown_no_replay",
+	"local_sandbox_process_cleanup",
+}
+
 // Check is one redaction-safe qualification assertion. EvidenceSHA256 binds
 // the assertion to adapter-owned structured evidence without persisting raw
 // provider output, repository paths, prompts, or credentials.
@@ -48,22 +62,24 @@ type Check struct {
 
 // Receipt is a self-digested local qualification record. ReceiptSHA256 is
 // calculated over the JSON representation with that field empty. Store is
-// create-only, but this is not a signature or protection from same-user file
-// replacement; doctor treats it as local evidence, not external attestation.
+// create-only. Attestation, when present, provides public tamper evidence;
+// readiness consumers must separately require it rather than treating an
+// unsigned legacy receipt as qualified evidence.
 type Receipt struct {
-	SchemaVersion      string    `json:"schema_version"`
-	Mode               string    `json:"mode"`
-	Provider           string    `json:"provider"`
-	Transport          string    `json:"transport"`
-	IdentitySHA256     string    `json:"identity_sha256"`
-	PolicySHA256       string    `json:"policy_sha256"`
-	RuntimeVersion     string    `json:"runtime_version"`
-	StartedAt          time.Time `json:"started_at"`
-	CompletedAt        time.Time `json:"completed_at"`
-	DisposableRepoHash string    `json:"disposable_repo_sha256"`
-	Checks             []Check   `json:"checks"`
-	Passed             bool      `json:"passed"`
-	ReceiptSHA256      string    `json:"receipt_sha256"`
+	SchemaVersion      string                                 `json:"schema_version"`
+	Mode               string                                 `json:"mode"`
+	Provider           string                                 `json:"provider"`
+	Transport          string                                 `json:"transport"`
+	IdentitySHA256     string                                 `json:"identity_sha256"`
+	PolicySHA256       string                                 `json:"policy_sha256"`
+	RuntimeVersion     string                                 `json:"runtime_version"`
+	StartedAt          time.Time                              `json:"started_at"`
+	CompletedAt        time.Time                              `json:"completed_at"`
+	DisposableRepoHash string                                 `json:"disposable_repo_sha256"`
+	Checks             []Check                                `json:"checks"`
+	Passed             bool                                   `json:"passed"`
+	ReceiptSHA256      string                                 `json:"receipt_sha256"`
+	Attestation        *providerattestation.SignatureMetadata `json:"attestation,omitempty"`
 }
 
 // Finalize validates the complete live matrix and seals the receipt. It does
@@ -98,14 +114,19 @@ func (r *Receipt) Finalize() error {
 		}
 		seen[check.Name] = check
 	}
-	r.Passed = len(r.Checks) == len(requiredChecks)
-	for _, name := range requiredChecks {
+	required, err := requiredChecksForTransport(r.Transport)
+	if err != nil {
+		return err
+	}
+	r.Passed = len(r.Checks) == len(required)
+	for _, name := range required {
 		check, ok := seen[name]
 		if !ok || !check.Passed || check.EvidenceSHA256 == "" {
 			r.Passed = false
 		}
 	}
 	r.ReceiptSHA256 = ""
+	r.Attestation = nil
 	digest, err := digestReceipt(*r)
 	if err != nil {
 		return err
@@ -144,8 +165,12 @@ func (r Receipt) Validate() error {
 		}
 		seen[check.Name] = check
 	}
-	passed := len(r.Checks) == len(requiredChecks)
-	for _, name := range requiredChecks {
+	required, err := requiredChecksForTransport(r.Transport)
+	if err != nil {
+		return err
+	}
+	passed := len(r.Checks) == len(required)
+	for _, name := range required {
 		check, ok := seen[name]
 		if !ok || !check.Passed || !isSHA256(check.EvidenceSHA256) || (check.Provenance != "live" && check.Provenance != "local_authoritative") {
 			passed = false
@@ -154,8 +179,61 @@ func (r Receipt) Validate() error {
 	if passed != r.Passed {
 		return errors.New("qualification passed flag does not match required checks")
 	}
+	if r.Attestation != nil {
+		attested := r
+		attested.ReceiptSHA256 = want
+		payload, err := attested.CanonicalPayload()
+		if err != nil || providerattestation.Verify(payload, *r.Attestation) != nil {
+			return errors.New("qualification receipt attestation is invalid")
+		}
+	}
 	return nil
 }
+
+// CanonicalPayload returns the finalized receipt bytes covered by the public
+// attestation. The signature envelope itself is excluded to avoid recursion;
+// the self-digest remains included.
+func (r Receipt) CanonicalPayload() ([]byte, error) {
+	if !isSHA256(r.ReceiptSHA256) {
+		return nil, errors.New("qualification receipt must be finalized before attestation")
+	}
+	r.Attestation = nil
+	encoded, err := json.Marshal(r)
+	if err != nil {
+		return nil, fmt.Errorf("encode qualification attestation payload: %w", err)
+	}
+	return encoded, nil
+}
+
+func (r *Receipt) AttachAttestation(signature providerattestation.SignatureMetadata) error {
+	if r == nil {
+		return errors.New("qualification receipt is required")
+	}
+	payload, err := r.CanonicalPayload()
+	if err != nil {
+		return err
+	}
+	if err := providerattestation.Verify(payload, signature); err != nil {
+		return errors.New("qualification receipt attestation is invalid")
+	}
+	r.Attestation = &signature
+	return nil
+}
+
+func requiredChecksForTransport(transport string) ([]string, error) {
+	switch transport {
+	case "zai_claude_runtime":
+		return requiredChecks, nil
+	case "zai_native_api":
+		return nativeRequiredChecks, nil
+	default:
+		return nil, fmt.Errorf("unsupported qualification transport %q", transport)
+	}
+}
+
+// NativeRequiredChecks returns a copy of the complete native qualification
+// matrix so the live adapter cannot silently omit a gate.
+func NativeRequiredChecks() []string { return append([]string(nil), nativeRequiredChecks...) }
 
 func (r Receipt) validateIdentityFields() error {
 	if strings.TrimSpace(r.Provider) == "" || strings.TrimSpace(r.Transport) == "" || strings.TrimSpace(r.RuntimeVersion) == "" {
@@ -174,6 +252,7 @@ func (r Receipt) validateIdentityFields() error {
 }
 
 func digestReceipt(r Receipt) (string, error) {
+	r.Attestation = nil
 	encoded, err := json.Marshal(r)
 	if err != nil {
 		return "", fmt.Errorf("encode qualification receipt: %w", err)

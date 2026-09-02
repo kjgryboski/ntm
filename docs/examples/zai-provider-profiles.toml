@@ -18,6 +18,31 @@ automation_policy = "zai-native-no-tools-v1"
 exact_target_only = true
 probe_required = true
 
-# The native lane uses only ZAI_NATIVE_API_KEY. It is not eligible for the
-# Claude-compatible nine-check coding qualification and has no provider-side
-# cancellation/resume proof.
+# The no-tool lane is not eligible for coding qualification and has no
+# provider-side cancellation/resume proof. Provision its separately authorized
+# API key with `ntm provider credential set --profile=zai-native-no-tools
+# --stdin`; NTM does not read this credential from the environment.
+
+[provider_profiles.zai-native-tools]
+provider = "zai"
+account_alias = "YOUR_API_ACCOUNT_ALIAS"
+model = "YOUR_ENTITLED_NATIVE_MODEL"
+endpoint = "https://api.z.ai/api/paas/v4/chat/completions"
+runtime = "zai-api"
+runtime_version = "zai-native-http-v1"
+credential_class = "api_key"
+billing_class = "api_usage"
+entitlement = "native_api"
+config_sha256 = "YOUR_64_CHARACTER_LOWERCASE_REDACTED_CONFIG_SHA256"
+command = ""
+automation_policy = "zai-native-tools-v1"
+exact_target_only = true
+probe_required = true
+
+# The tools lane exposes only controller-owned list/read/write and isolated
+# verifier operations inside an exact linked disposable worktree. It must pass
+# `ntm provider qualify --profile=zai-native-tools --live` before doctor can
+# treat that exact identity and policy as qualified coding evidence or
+# `ntm provider run --tools` can dispatch. The verifier has no network, host
+# home, credential paths, or dependency cache; vendor required dependencies in
+# the worktree.

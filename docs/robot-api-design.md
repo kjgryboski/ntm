@@ -326,12 +326,14 @@ blocks native headless resume/fork rather than being misrepresented as shared
 capacity.
 
 Z.ai Coding Plan and native API access are intentionally different identities:
-the Claude-compatible Coding Plan lane accepts only `ZAI_API_KEY`, while the native API lane
-requires `ZAI_NATIVE_API_KEY`. Credential class, billing class, and entitlement
-are all identity inputs, so one lane cannot borrow the other lane's capacity or
-claim its authorization. The native API may have structured completion, usage,
-and error evidence, but cancellation and resume remain unavailable until their
-own authoritative receipts exist.
+the Claude-compatible Coding Plan lane accepts only `ZAI_API_KEY`, while the
+native API lane reads a separately authorized key only from the OS credential
+broker after `ntm provider credential set --profile=PROFILE --stdin`.
+Credential class, billing class, and entitlement are all identity inputs, so
+one lane cannot borrow the other lane's capacity or claim its authorization.
+The native API may have structured completion, usage, tool-call, and error
+evidence, but provider-side cancellation and resume remain unavailable until
+their own authoritative receipts exist.
 
 The native no-tool path is an explicit one-shot operation, not a coding
 qualification or lifecycle substitute:
@@ -340,8 +342,8 @@ qualification or lifecycle substitute:
 ntm provider run --profile=zai-native-no-tools --operation-id=YOUR_UNIQUE_OPERATION_ID --prompt='bounded no-tool task' --live
 ```
 
-It requires the separately authorized `ZAI_NATIVE_API_KEY` lane, records a
-redacted operation-bound receipt, and derives a non-secret request ID from the
+It requires the separately authorized OS-brokered native API lane, records a
+signed redacted operation-bound receipt, and derives a non-secret request ID from the
 durable binding. That ID is sent in the API body and must be echoed exactly by
 the successful event stream; a matching response header alone is insufficient.
 It must not be promoted to provider-side cancellation, resume, or coding-policy
@@ -359,16 +361,20 @@ Pane-launch admission is not a reservation or circuit authority for the model
 requests subsequently made inside that pane.
 
 `ntm provider qualify --profile=PROFILE --live` is an explicit live-only
-qualification for the Z.ai Claude-compatible Coding Plan lane; it rejects
-native-API credentials and stores a create-only, self-digested local receipt from a
-disposable repository. All nine mandatory checks must pass: `model_identity`,
+qualification for either the Z.ai Claude-compatible Coding Plan lane or the
+native controller-tools lane; it stores a create-only, self-digested and signed
+local receipt from a disposable repository. All Coding Plan checks must pass: `model_identity`,
 `workspace_edit`, `test_execution`, `secret_access_denied`, `push_denied`,
 `crash_recovery`, `cancellation`, `session_resumption`, and
 `zero_residual_cleanup`. **Hard NO-GO:** until doctor finds a current all-nine
 live-pass receipt bound to the exact identity, transport, and policy, the lane
-is not ready for production coding. This design document does not claim that a
-live qualification has occurred. The receipt is unsigned and is not
-tamper-evident against the same local account. Machine proof is parsed only
+is not ready for production coding. The native tools lane has its own nine-check
+matrix covering controller-owned structured tools, an in-flight local HTTP
+context-cancellation observation, no-replay handling, and local sandbox-process
+cleanup. Those local checks do not claim provider-side cancellation, removal of
+the retained qualification repository, or provider-authoritative cleanup.
+This design document does not claim that a live qualification has occurred.
+Machine proof is parsed only
 from documented top-level protocol events; model-authored text and stderr are
 never accepted as tool-use or permission-denial evidence. The test check runs
 after an exact repository-delta check in a cleared-environment Bubblewrap
@@ -377,7 +383,11 @@ network/PID/filesystem sandbox.
 The production suite is Linux-only. It uses Bubblewrap for the controller-owned
 test check; on another platform NTM rejects the default live suite in preflight,
 before disposable-repository creation or any provider call. Tests may inject a
-verifier, but that is not a production readiness escape hatch. Native no-tool
+verifier, but that is not a production readiness escape hatch. The production
+sandbox uses an empty root plus explicit read-only runtime mounts; it never
+mounts the host root, home, credential paths, or dependency caches. Projects
+must therefore vendor any dependencies needed by the approved verification
+manifest. Native no-tool
 Z.ai requests remain a separate non-qualification lane.
 
 A matching managed policy, runtime inspection, or configuration digest is only
