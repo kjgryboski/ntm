@@ -160,7 +160,12 @@ func TestProviderNativeRunRedactsInputsAndRecordsSuccess(t *testing.T) {
 	admission := &providerNativeAdmissionFake{decision: ratelimit.Decision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
 	deps := providerNativeDeps(providerNativeProfile(), admission)
 	deps.run = func(_ context.Context, _ zai.NativeHTTPClient, request zai.NativeRequest) (zai.NativeReceipt, error) {
-		if !request.ExplicitOptIn || request.AllowTools || request.Endpoint != zai.NativeChatCompletionsEndpoint || request.Model != "glm-test" || request.NativeAPIKey != "native-only-test-key" || !strings.Contains(request.Prompt, request.ExpectedNonce) {
+		identity, err := providerNativeProfile().Identity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		expectedRequestID := providerNativeRequestID(providerNativeBindingHash(identity, "very sensitive prompt"), "native-success")
+		if !request.ExplicitOptIn || request.AllowTools || request.Endpoint != zai.NativeChatCompletionsEndpoint || request.Model != "glm-test" || request.NativeAPIKey != "native-only-test-key" || !strings.Contains(request.Prompt, request.ExpectedNonce) || request.ExpectedRequestID != expectedRequestID {
 			t.Fatalf("native request=%+v", request)
 		}
 		return zai.NativeReceipt{Model: "glm-test", NonceVerified: true, FinishReason: "stop", OutputSHA256: providerTestHash("output")}, nil
@@ -176,6 +181,43 @@ func TestProviderNativeRunRedactsInputsAndRecordsSuccess(t *testing.T) {
 		if strings.Contains(output.String(), secret) {
 			t.Fatalf("output leaked %q: %q", secret, output.String())
 		}
+	}
+}
+
+func TestProviderNativeRequestIDIsDeterministicAndBounded(t *testing.T) {
+	identity, err := providerNativeProfile().Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := providerNativeRequestID(providerNativeBindingHash(identity, "private prompt one"), "op-one")
+	if second := providerNativeRequestID(providerNativeBindingHash(identity, "private prompt one"), "op-one"); first != second {
+		t.Fatalf("request IDs not deterministic: %q != %q", first, second)
+	}
+	if changed := providerNativeRequestID(providerNativeBindingHash(identity, "private prompt two"), "op-one"); changed == first {
+		t.Fatalf("request ID did not bind to operation content: %q", first)
+	}
+	if changed := providerNativeRequestID(providerNativeBindingHash(identity, "private prompt one"), "op-two"); changed == first {
+		t.Fatalf("request ID did not bind to the exact operation: %q", first)
+	}
+	if len(first) != 64 || !strings.HasPrefix(first, "ntm-") || strings.Contains(first, "private") {
+		t.Fatalf("request ID is not bounded non-secret correlation data: %q", first)
+	}
+}
+
+func TestProviderDoctorNativeProbeRequestIDUsesPerProbeBinding(t *testing.T) {
+	identity, err := providerNativeProfile().Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := providerDoctorNativeProbeRequestID(identity, "NTM_ACK_0123456789abcdef0123456789abcdef")
+	if duplicate := providerDoctorNativeProbeRequestID(identity, "NTM_ACK_0123456789abcdef0123456789abcdef"); first != duplicate {
+		t.Fatalf("probe request IDs not deterministic for the same binding: %q != %q", first, duplicate)
+	}
+	if next := providerDoctorNativeProbeRequestID(identity, "NTM_ACK_fedcba9876543210fedcba9876543210"); first == next {
+		t.Fatalf("probe request ID did not bind the per-probe nonce: %q", first)
+	}
+	if len(first) != 64 || !strings.HasPrefix(first, "ntm-") {
+		t.Fatalf("probe request ID not valid for Z.ai: %q", first)
 	}
 }
 

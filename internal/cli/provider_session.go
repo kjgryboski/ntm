@@ -39,33 +39,37 @@ type providerSessionAdmission interface {
 }
 
 type providerSessionDependencies struct {
-	loadConfig       func() *config.Config
-	lookPath         func(string) (string, error)
-	version          func(context.Context, string) (string, error)
-	readFile         func(string) ([]byte, error)
-	stat             func(string) (os.FileInfo, error)
-	rootOwned        func(os.FileInfo) bool
-	readRequirements func(string) ([]byte, os.FileInfo, error)
-	inspectGrok      func(context.Context, string, string) (providerGrokInspection, error)
-	isLinkedWorktree func(context.Context, string) (bool, error)
-	run              func(context.Context, grok.LifecycleRunner, grok.SessionRequest) (grok.SessionReceipt, error)
-	runner           grok.LifecycleRunner
-	admission        providerSessionAdmission
+	loadConfig          func() *config.Config
+	lookPath            func(string) (string, error)
+	version             func(context.Context, string) (string, error)
+	readFile            func(string) ([]byte, error)
+	stat                func(string) (os.FileInfo, error)
+	rootOwned           func(os.FileInfo) bool
+	trustExecutable     func(string) (string, error)
+	readRequirements    func(string) ([]byte, os.FileInfo, error)
+	inspectGrok         func(context.Context, string, string) (providerGrokInspection, error)
+	probeGrokBypassLock func(context.Context, string) (providerGrokBypassProbe, error)
+	isLinkedWorktree    func(context.Context, string) (bool, error)
+	run                 func(context.Context, grok.LifecycleRunner, grok.SessionRequest) (grok.SessionReceipt, error)
+	runner              grok.LifecycleRunner
+	admission           providerSessionAdmission
 }
 
 var providerSessionDeps = providerSessionDependencies{
-	loadConfig:       loadSelectedConfigOrDefault,
-	lookPath:         exec.LookPath,
-	version:          providerRuntimeVersion,
-	readFile:         os.ReadFile,
-	stat:             os.Stat,
-	rootOwned:        providerRequirementsRootOwned,
-	readRequirements: providerRequirementsReadForDoctor,
-	inspectGrok:      providerRuntimeInspectGrok,
-	isLinkedWorktree: providerIsLinkedGitWorktree,
-	run:              grok.ExecuteSession,
-	runner:           grok.HeadlessOSRunner{},
-	admission:        ratelimit.DefaultAdmissionController(),
+	loadConfig:          loadSelectedConfigOrDefault,
+	lookPath:            exec.LookPath,
+	version:             providerRuntimeVersion,
+	readFile:            os.ReadFile,
+	stat:                os.Stat,
+	rootOwned:           providerRequirementsRootOwned,
+	trustExecutable:     providerSystemAuthoritativeExecutable,
+	readRequirements:    providerRequirementsReadForDoctor,
+	inspectGrok:         providerRuntimeInspectGrok,
+	probeGrokBypassLock: providerRuntimeProbeGrokBypassLock,
+	isLinkedWorktree:    providerIsLinkedGitWorktree,
+	run:                 grok.ExecuteSession,
+	runner:              grok.HeadlessOSRunner{},
+	admission:           ratelimit.DefaultAdmissionController(),
 }
 
 type providerSessionAdmissionEvidence struct {
@@ -127,7 +131,7 @@ func runProviderSession(cmd *cobra.Command, action grok.SessionAction, opts prov
 	if opts.timeout <= 0 {
 		return errors.New("provider session timeout must be positive")
 	}
-	if deps.loadConfig == nil || deps.lookPath == nil || deps.version == nil || (deps.readRequirements == nil && (deps.readFile == nil || deps.stat == nil)) || deps.rootOwned == nil || deps.inspectGrok == nil || deps.isLinkedWorktree == nil || deps.run == nil || deps.runner == nil || deps.admission == nil {
+	if deps.loadConfig == nil || deps.lookPath == nil || deps.trustExecutable == nil || deps.version == nil || (deps.readRequirements == nil && (deps.readFile == nil || deps.stat == nil)) || deps.rootOwned == nil || deps.inspectGrok == nil || deps.probeGrokBypassLock == nil || deps.isLinkedWorktree == nil || deps.run == nil || deps.runner == nil || deps.admission == nil {
 		return errors.New("provider session dependencies are incomplete")
 	}
 
@@ -166,15 +170,13 @@ func runProviderSession(cmd *cobra.Command, action grok.SessionAction, opts prov
 			return errors.New("workspace-write Grok sessions require a linked disposable Git worktree")
 		}
 	}
-	policyResult, policyCheck := diagnoseProviderPolicy(providerCommandContext(cmd), cwd, profile, identity, providerDoctorDependencies{
-		readFile: deps.readFile, stat: deps.stat, rootOwned: deps.rootOwned, readRequirements: deps.readRequirements, inspectGrok: deps.inspectGrok,
-	})
-	if policyCheck.Status != providerDoctorPass || !policyResult.BypassLockAuthoritative {
-		return errors.New("root-owned Grok managed requirements are missing, mismatched, or not authoritative")
-	}
-	binary, err := deps.lookPath(profile.Command)
+	locatedBinary, err := deps.lookPath(profile.Command)
 	if err != nil {
 		return fmt.Errorf("locate configured Grok runtime: %w", err)
+	}
+	binary, err := deps.trustExecutable(locatedBinary)
+	if err != nil {
+		return fmt.Errorf("configured Grok runtime is not system-authoritative: %w", err)
 	}
 	commandCtx := providerCommandContext(cmd)
 	versionCtx, versionCancel := context.WithTimeout(commandCtx, 5*time.Second)
@@ -185,6 +187,16 @@ func runProviderSession(cmd *cobra.Command, action grok.SessionAction, opts prov
 	}
 	if profile.RuntimeVersion == "" || !versionMatches(actualVersion, profile.RuntimeVersion) {
 		return errors.New("configured Grok runtime is unpinned or has drifted")
+	}
+	attestedProfile := profile
+	attestedProfile.Command = binary
+	policyResult, policyCheck := diagnoseProviderPolicy(commandCtx, cwd, attestedProfile, identity, providerDoctorDependencies{
+		lookPath: func(string) (string, error) { return binary, nil },
+		readFile: deps.readFile, stat: deps.stat, rootOwned: deps.rootOwned, readRequirements: deps.readRequirements,
+		inspectGrok: deps.inspectGrok, probeGrokBypassLock: deps.probeGrokBypassLock,
+	})
+	if policyCheck.Status != providerDoctorPass || !policyResult.BypassLockAuthoritative {
+		return errors.New("root-owned Grok managed requirements are missing, mismatched, or not authoritative")
 	}
 	status := deps.admission.CapacityStatus()
 	if status.Scope != provider.CapacityControlScopeLocalShared {

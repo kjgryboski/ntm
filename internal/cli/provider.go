@@ -90,13 +90,25 @@ type providerDoctorPolicy struct {
 	ManagedRequirementsState  string `json:"managed_requirements_state"`
 	RuntimeInspectionState    string `json:"runtime_inspection_state"`
 	RuntimeInspectionSHA256   string `json:"runtime_inspection_sha256,omitempty"`
+	BypassLockProbeState      string `json:"bypass_lock_probe_state"`
+	BypassLockProbeSHA256     string `json:"bypass_lock_probe_sha256,omitempty"`
 	BypassLockAuthoritative   bool   `json:"bypass_lock_authoritative"`
 }
 
 type providerGrokInspection struct {
-	GrokVersion         string
-	PermissionsLoaded   bool
-	ManagedSettingsPath string
+	GrokVersion                    string
+	PermissionsLoaded              bool
+	PermissionSources              []string
+	SystemRequirementsLayerPresent bool
+	BypassLockWarning              bool
+	SHA256                         string
+}
+
+type providerGrokBypassProbe struct {
+	Refused             bool
+	NetworkIsolated     bool
+	CredentialsIsolated bool
+	ExitCode            int
 	SHA256              string
 }
 
@@ -203,16 +215,22 @@ type providerDoctorDependencies struct {
 	readFile  func(string) ([]byte, error)
 	stat      func(string) (os.FileInfo, error)
 	rootOwned func(os.FileInfo) bool
+	// trustExecutable returns a canonical system-authoritative executable path.
+	// The file and every parent directory must be root-owned and non-writable
+	// by unprivileged users so the path cannot be swapped between attestation
+	// and dispatch.
+	trustExecutable func(string) (string, error)
 	// readRequirements securely binds content and metadata to the same open
 	// file descriptor. Production sets it; unit tests may inject the older
 	// readFile/stat pair to exercise report assembly without privileged files.
-	readRequirements   func(string) ([]byte, os.FileInfo, error)
-	inspectGrok        func(context.Context, string, string) (providerGrokInspection, error)
-	onlineProbe        func(context.Context, config.ProviderProfileConfig, provider.Identity) (providerDoctorLiveEvidence, error)
-	qualificationStore func(string, string) (providerqualification.Receipt, string, error)
-	capacityStatus     func() ratelimit.CapacityStatus
-	capacitySnapshot   func(provider.Identity) ratelimit.AdmissionSnapshot
-	admission          providerDoctorAdmission
+	readRequirements    func(string) ([]byte, os.FileInfo, error)
+	inspectGrok         func(context.Context, string, string) (providerGrokInspection, error)
+	probeGrokBypassLock func(context.Context, string) (providerGrokBypassProbe, error)
+	onlineProbe         func(context.Context, config.ProviderProfileConfig, provider.Identity) (providerDoctorLiveEvidence, error)
+	qualificationStore  func(string, string) (providerqualification.Receipt, string, error)
+	capacityStatus      func() ratelimit.CapacityStatus
+	capacitySnapshot    func(provider.Identity) ratelimit.AdmissionSnapshot
+	admission           providerDoctorAdmission
 }
 
 type providerQualificationDependencies struct {
@@ -228,17 +246,19 @@ type providerQualificationDependencies struct {
 func defaultProviderDoctorDependencies() providerDoctorDependencies {
 	admission := ratelimit.DefaultAdmissionController()
 	return providerDoctorDependencies{
-		now:                time.Now,
-		lookPath:           exec.LookPath,
-		version:            providerRuntimeVersion,
-		lookupEnv:          os.LookupEnv,
-		readFile:           os.ReadFile,
-		stat:               os.Stat,
-		rootOwned:          providerRequirementsRootOwned,
-		readRequirements:   providerRequirementsReadForDoctor,
-		inspectGrok:        providerRuntimeInspectGrok,
-		onlineProbe:        runProviderDoctorOnlineProbe,
-		qualificationStore: providerqualification.LoadLatest,
+		now:                 time.Now,
+		lookPath:            exec.LookPath,
+		version:             providerRuntimeVersion,
+		lookupEnv:           os.LookupEnv,
+		readFile:            os.ReadFile,
+		stat:                os.Stat,
+		rootOwned:           providerRequirementsRootOwned,
+		trustExecutable:     providerSystemAuthoritativeExecutable,
+		readRequirements:    providerRequirementsReadForDoctor,
+		inspectGrok:         providerRuntimeInspectGrok,
+		probeGrokBypassLock: providerRuntimeProbeGrokBypassLock,
+		onlineProbe:         runProviderDoctorOnlineProbe,
+		qualificationStore:  providerqualification.LoadLatest,
 		capacityStatus: func() ratelimit.CapacityStatus {
 			return admission.CapacityStatus()
 		},
@@ -671,11 +691,58 @@ func buildProviderDoctorReport(ctx context.Context, cfg *config.Config, opts pro
 		providerDoctorCheck{ID: "identity", Status: providerDoctorPass, Provenance: "profile_attested", Summary: "immutable provider identity is complete", Evidence: identity.Hash()},
 	)
 
-	policy, policyCheck := diagnoseProviderPolicy(ctx, providerDoctorInspectionCWD(), profile, identity, deps)
+	executionProfile := profile
+	executionDeps := deps
+	var executionAuthorityErr error
+	if identity.Provider() == "xai" {
+		switch {
+		case deps.lookPath == nil || deps.trustExecutable == nil:
+			executionAuthorityErr = errors.New("Grok runtime authority dependencies are incomplete")
+		default:
+			located, resolveErr := deps.lookPath(profile.Command)
+			if resolveErr != nil {
+				executionAuthorityErr = fmt.Errorf("locate configured Grok runtime: %w", resolveErr)
+				break
+			}
+			trusted, trustErr := deps.trustExecutable(located)
+			if trustErr != nil {
+				executionAuthorityErr = fmt.Errorf("configured Grok runtime is not system-authoritative: %w", trustErr)
+				break
+			}
+			executionProfile.Command = trusted
+			executionDeps.lookPath = func(string) (string, error) { return trusted, nil }
+		}
+	}
+	var policy providerDoctorPolicy
+	var policyCheck providerDoctorCheck
+	if executionAuthorityErr != nil {
+		report.Runtime = providerDoctorRuntime{ExpectedVersion: profile.RuntimeVersion, Drift: "untrusted"}
+		report.Checks = append(report.Checks, providerDoctorCheck{
+			ID: "runtime", Status: providerDoctorFail, Provenance: "live_local",
+			Summary:     "configured Grok runtime is not system-authoritative",
+			Evidence:    safeErrorDigest(executionAuthorityErr),
+			Remediation: "Install the pinned Grok executable under a root-owned, non-writable canonical path",
+		})
+		policy = providerDoctorPolicy{
+			Name: profile.AutomationPolicy, ManagedRequirementsState: "not_checked",
+			RuntimeInspectionState: "runtime_untrusted", BypassLockProbeState: "blocked",
+		}
+		if descriptor, ok := agent.GrokAutomationPolicy(profile.AutomationPolicy); ok {
+			policy.SHA256 = agent.GrokAutomationPolicySHA256(profile.AutomationPolicy)
+			policy.Sandbox, policy.PermissionMode = descriptor.Sandbox, descriptor.PermissionMode
+		}
+		policyCheck = providerDoctorCheck{
+			ID: "policy", Status: providerDoctorFail, Provenance: "preflight",
+			Summary:     "managed policy attestation was blocked before executing an untrusted Grok runtime",
+			Evidence:    safeErrorDigest(executionAuthorityErr),
+			Remediation: "Repair executable ownership and parent-directory authority before policy attestation",
+		}
+	} else {
+		report.Runtime, report.Checks = diagnoseProviderRuntime(ctx, executionProfile, identity, executionDeps, report.Checks)
+		policy, policyCheck = diagnoseProviderPolicy(ctx, providerDoctorInspectionCWD(), executionProfile, identity, executionDeps)
+	}
 	report.Policy = policy
 	report.Checks = append(report.Checks, policyCheck)
-
-	report.Runtime, report.Checks = diagnoseProviderRuntime(ctx, profile, identity, deps, report.Checks)
 	authCheck := diagnoseProviderAuthPresence(identity, deps.lookupEnv)
 	report.Checks = append(report.Checks, authCheck)
 	report.Capacity, report.Checks = diagnoseProviderCapacity(identity, deps, report.Checks)
@@ -685,6 +752,8 @@ func buildProviderDoctorReport(ctx context.Context, cfg *config.Config, opts pro
 		switch {
 		case deps.onlineProbe == nil || deps.admission == nil:
 			probePreflightErr = errors.New("online provider probe dependencies are incomplete")
+		case executionAuthorityErr != nil:
+			probePreflightErr = executionAuthorityErr
 		case report.Capacity.Scope != provider.CapacityControlScopeLocalShared:
 			probePreflightErr = errors.New("online provider probe requires the cross-process local shared capacity store")
 		case report.Runtime.Drift != "none":
@@ -700,7 +769,7 @@ func buildProviderDoctorReport(ctx context.Context, cfg *config.Config, opts pro
 			report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "local_shared_admission", Summary: "live no-tool identity/model probe was denied before provider dispatch", Evidence: sha256StringCLI(string(decision.Reason)), Remediation: "Honor the exact identity retry/circuit state; provider failover is prohibited"})
 		} else {
 			probeCtx, cancel := context.WithTimeout(ctx, opts.timeout)
-			live, probeErr := deps.onlineProbe(probeCtx, profile, identity)
+			live, probeErr := deps.onlineProbe(probeCtx, executionProfile, identity)
 			cancel()
 			deps.admission.Release(identity, decision)
 			if probeErr != nil {
@@ -738,10 +807,19 @@ func buildProviderDoctorReport(ctx context.Context, cfg *config.Config, opts pro
 }
 
 func diagnoseProviderPolicy(ctx context.Context, inspectionCWD string, profile config.ProviderProfileConfig, identity provider.Identity, deps providerDoctorDependencies) (providerDoctorPolicy, providerDoctorCheck) {
-	result := providerDoctorPolicy{Name: profile.AutomationPolicy, ManagedRequirementsState: "not_applicable", RuntimeInspectionState: "not_applicable"}
+	result := providerDoctorPolicy{Name: profile.AutomationPolicy, ManagedRequirementsState: "not_applicable", RuntimeInspectionState: "not_applicable", BypassLockProbeState: "not_applicable"}
 	if identity.Provider() != "xai" {
 		result.SHA256 = identity.ConfigSHA256()
 		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorPass, Provenance: "config_validated", Summary: "provider policy is bound by the reviewed profile manifest", Evidence: result.SHA256}
+	}
+	binary := profile.Command
+	if deps.lookPath != nil {
+		resolved, err := deps.lookPath(profile.Command)
+		if err != nil {
+			result.RuntimeInspectionState = "runtime_unavailable"
+			return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "live_local", Summary: "configured Grok runtime could not be resolved before policy attestation", Evidence: safeErrorDigest(err), Remediation: "Install and pin the exact Grok runtime before automation"}
+		}
+		binary = resolved
 	}
 	descriptor, ok := agent.GrokAutomationPolicy(profile.AutomationPolicy)
 	if !ok {
@@ -795,20 +873,45 @@ func diagnoseProviderPolicy(ctx context.Context, inspectionCWD string, profile c
 		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "live_local", Summary: "root-owned Grok requirements match, but runtime discovery was not inspected", Evidence: requirements.SHA256, Remediation: "Run the pinned Grok runtime inspection and verify the managed settings path"}
 	}
 	inspectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	inspection, inspectErr := deps.inspectGrok(inspectCtx, profile.Command, inspectionCWD)
+	inspection, inspectErr := deps.inspectGrok(inspectCtx, binary, inspectionCWD)
 	cancel()
 	result.RuntimeInspectionSHA256 = inspection.SHA256
 	if inspectErr != nil {
 		result.RuntimeInspectionState = "failed"
 		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "live_runtime_inspection", Summary: "Grok runtime inspection failed", Evidence: safeErrorDigest(inspectErr), Remediation: "Run grok --no-auto-update inspect --json and review managed configuration discovery"}
 	}
-	if !inspection.PermissionsLoaded || !sameProviderRequirementsPath(inspection.ManagedSettingsPath, path) {
+	if !inspection.PermissionsLoaded || !hasProviderSystemRequirementsSource(inspection.PermissionSources, path) || !inspection.SystemRequirementsLayerPresent {
 		result.RuntimeInspectionState = "managed_requirements_not_discovered"
-		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "live_runtime_inspection", Summary: "pinned Grok runtime did not report the exact managed requirements path as loaded", Evidence: inspection.SHA256, Remediation: "Repair the system requirements installation and re-run Grok inspection"}
+		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "live_runtime_inspection", Summary: "pinned Grok runtime did not report the exact system requirements source and layer as loaded", Evidence: inspection.SHA256, Remediation: "Repair the system requirements installation and re-run Grok inspection"}
 	}
 	result.RuntimeInspectionState = "managed_requirements_discovered"
+	if inspection.BypassLockWarning {
+		// Grok 1.0.13 reports the documented key as an inspect-schema warning
+		// even while its headless runtime enforces the managed lock. Preserve
+		// that discrepancy in the receipt and require an isolated behavioral
+		// refusal below; the warning alone is never authority evidence.
+		result.RuntimeInspectionState = "managed_requirements_discovered_with_bypass_warning"
+	}
+	if deps.probeGrokBypassLock == nil {
+		result.BypassLockProbeState = "unavailable"
+		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "live_behavioral_attestation", Summary: "Grok managed bypass lock was not behaviorally attested", Evidence: inspection.SHA256, Remediation: "Run the isolated no-network Grok bypass-lock refusal probe"}
+	}
+	probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
+	probe, probeErr := deps.probeGrokBypassLock(probeCtx, binary)
+	probeCancel()
+	result.BypassLockProbeSHA256 = probe.SHA256
+	if probeErr != nil {
+		result.BypassLockProbeState = "failed"
+		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "live_behavioral_attestation", Summary: "Grok managed bypass-lock refusal probe failed closed", Evidence: safeErrorDigest(probeErr), Remediation: "Restore Linux Bubblewrap isolation and verify the exact pinned Grok runtime refuses always-approve"}
+	}
+	if !probe.Refused || !probe.NetworkIsolated || !probe.CredentialsIsolated {
+		result.BypassLockProbeState = "not_refused"
+		return result, providerDoctorCheck{ID: "policy", Status: providerDoctorFail, Provenance: "live_behavioral_attestation", Summary: "Grok did not authoritatively refuse always-approve inside the isolated probe", Evidence: probe.SHA256, Remediation: "Do not automate Grok until the root-owned bypass lock is enforced by the pinned runtime"}
+	}
+	result.BypassLockProbeState = "always_approve_refused"
 	result.BypassLockAuthoritative = true
-	return result, providerDoctorCheck{ID: "policy", Status: providerDoctorPass, Provenance: "live_runtime_inspection", Summary: "compiled policy, root-owned bypass lock, and Grok runtime discovery match", Evidence: inspection.SHA256}
+	evidence := sha256StringCLI(inspection.SHA256 + "\x00" + probe.SHA256)
+	return result, providerDoctorCheck{ID: "policy", Status: providerDoctorPass, Provenance: "live_behavioral_attestation", Summary: "compiled policy, root-owned requirements, runtime discovery, and isolated always-approve refusal match", Evidence: evidence}
 }
 
 // verifyGrokACPDispatchAuthority is the live, fail-closed gate for the legacy
@@ -816,19 +919,19 @@ func diagnoseProviderPolicy(ctx context.Context, inspectionCWD string, profile c
 // the exact managed policy must be root-owned and discovered by the pinned
 // Grok runtime immediately before the provider process is started.
 func verifyGrokACPDispatchAuthority(ctx context.Context, inspectionCWD string, profile config.ProviderProfileConfig, identity provider.Identity, deps providerDoctorDependencies) (string, error) {
-	if deps.lookPath == nil || deps.version == nil || deps.rootOwned == nil || deps.inspectGrok == nil || (deps.readRequirements == nil && (deps.readFile == nil || deps.stat == nil)) {
+	if deps.lookPath == nil || deps.trustExecutable == nil || deps.version == nil || deps.rootOwned == nil || deps.inspectGrok == nil || deps.probeGrokBypassLock == nil || (deps.readRequirements == nil && (deps.readFile == nil || deps.stat == nil)) {
 		return "", errors.New("Grok ACP authority verification dependencies are incomplete")
 	}
 	if identity.Provider() != "xai" || identity.Runtime() != "grok" {
 		return "", errors.New("Grok ACP authority verification requires an exact xAI/Grok identity")
 	}
-	policy, check := diagnoseProviderPolicy(ctx, inspectionCWD, profile, identity, deps)
-	if check.Status != providerDoctorPass || !policy.BypassLockAuthoritative {
-		return "", errors.New("root-owned Grok managed requirements are missing, mismatched, or not authoritative")
-	}
-	binary, err := deps.lookPath(profile.Command)
+	locatedBinary, err := deps.lookPath(profile.Command)
 	if err != nil {
 		return "", fmt.Errorf("locate configured Grok runtime: %w", err)
+	}
+	binary, err := deps.trustExecutable(locatedBinary)
+	if err != nil {
+		return "", fmt.Errorf("configured Grok runtime is not system-authoritative: %w", err)
 	}
 	versionCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	actualVersion, err := deps.version(versionCtx, binary)
@@ -838,6 +941,14 @@ func verifyGrokACPDispatchAuthority(ctx context.Context, inspectionCWD string, p
 	}
 	if strings.TrimSpace(profile.RuntimeVersion) == "" || !versionMatches(actualVersion, profile.RuntimeVersion) {
 		return "", errors.New("configured Grok runtime is unpinned or has drifted")
+	}
+	attestedProfile := profile
+	attestedProfile.Command = binary
+	attestedDeps := deps
+	attestedDeps.lookPath = func(string) (string, error) { return binary, nil }
+	policy, check := diagnoseProviderPolicy(ctx, inspectionCWD, attestedProfile, identity, attestedDeps)
+	if check.Status != providerDoctorPass || !policy.BypassLockAuthoritative {
+		return "", errors.New("root-owned Grok managed requirements are missing, mismatched, or not authoritative")
 	}
 	return binary, nil
 }
@@ -1069,7 +1180,11 @@ func runProviderDoctorOnlineProbe(ctx context.Context, profile config.ProviderPr
 		if runErr != nil {
 			return providerDoctorLiveEvidence{SHA256: digest}, runErr
 		}
-		return providerDoctorLiveEvidence{ModelVerified: result.Model == identity.Model() && result.ModelEvidence != "", AuthVerified: result.Success && result.AcknowledgementVerified, SHA256: digest}, nil
+		return providerDoctorLiveEvidence{
+			ModelVerified: result.Model == identity.Model() && grokDoctorModelEvidenceConfirmed(result.ModelEvidence),
+			AuthVerified:  result.Success && result.AcknowledgementVerified && result.Authenticated && result.AuthenticationEvidence == "cached_token_authenticate_plus_completed_session",
+			SHA256:        digest,
+		}, nil
 	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementClaudeCompat:
 		receipt, probeErr := zai.Probe(ctx, zai.ProbeSpec{Binary: profile.Command, Endpoint: identity.Endpoint(), Model: identity.Model()})
 		digest := digestSafeJSON(receipt)
@@ -1081,7 +1196,7 @@ func runProviderDoctorOnlineProbe(ctx context.Context, profile config.ProviderPr
 		key := strings.TrimSpace(os.Getenv("ZAI_NATIVE_API_KEY"))
 		receipt, probeErr := zai.RunNative(ctx, zai.DefaultNativeHTTPClient(), zai.NativeRequest{
 			Endpoint: identity.Endpoint(), Model: identity.Model(), Prompt: "Reply with this exact nonce and no other text: " + nonce,
-			ExpectedNonce: nonce, NativeAPIKey: key, ExplicitOptIn: true, AllowTools: false,
+			ExpectedNonce: nonce, ExpectedRequestID: providerDoctorNativeProbeRequestID(identity, nonce), NativeAPIKey: key, ExplicitOptIn: true, AllowTools: false,
 		})
 		digest := digestSafeJSON(receipt)
 		if probeErr != nil {
@@ -1091,6 +1206,26 @@ func runProviderDoctorOnlineProbe(ctx context.Context, profile config.ProviderPr
 	default:
 		return providerDoctorLiveEvidence{}, errors.New("provider has no online doctor probe")
 	}
+}
+
+// grokDoctorModelEvidenceConfirmed accepts only structured facts bound to the
+// ACP session. A global catalog or the requested launch argument alone cannot
+// establish the model that served an online doctor probe.
+func grokDoctorModelEvidenceConfirmed(evidence string) bool {
+	switch strings.TrimSpace(evidence) {
+	case "completion_metadata", "provider_session_notification_plus_exact_launch", "session_config_option_plus_exact_launch", "session_model_state_plus_exact_launch":
+		return true
+	default:
+		return false
+	}
+}
+
+// providerDoctorNativeProbeRequestID uses the same bounded native request-ID
+// derivation as a durable operation. The doctor probe has no operation ledger,
+// so its random acknowledgement nonce supplies per-probe uniqueness without
+// retaining a raw correlation ID.
+func providerDoctorNativeProbeRequestID(identity provider.Identity, nonce string) string {
+	return providerNativeRequestID(providerNativeBindingHash(identity, "ntm.provider-doctor-native-probe.v1:"+nonce), "doctor:"+nonce)
 }
 
 func providerDoctorInspectionCWD() string {
@@ -1132,12 +1267,22 @@ func providerRuntimeInspectGrok(ctx context.Context, binary, cwd string) (provid
 	if len(output) == 0 || capture.exceeded {
 		return providerGrokInspection{}, errors.New("Grok runtime inspection output was empty or exceeded its limit")
 	}
+	return parseProviderRuntimeInspectGrok(output)
+}
+
+func parseProviderRuntimeInspectGrok(output []byte) (providerGrokInspection, error) {
 	var envelope struct {
 		GrokVersion string `json:"grokVersion"`
 		Permissions struct {
-			Loaded              bool   `json:"loaded"`
-			ManagedSettingsPath string `json:"managedSettingsPath"`
+			Loaded  json.RawMessage `json:"loaded"`
+			Sources []string        `json:"sources"`
 		} `json:"permissions"`
+		ConfigSources struct {
+			Layers []struct {
+				Role string `json:"role"`
+			} `json:"layers"`
+		} `json:"configSources"`
+		ConfigWarnings []json.RawMessage `json:"configWarnings"`
 	}
 	if err := json.Unmarshal(output, &envelope); err != nil {
 		return providerGrokInspection{}, errors.New("Grok runtime inspection returned invalid JSON")
@@ -1145,12 +1290,55 @@ func providerRuntimeInspectGrok(ctx context.Context, binary, cwd string) (provid
 	if strings.TrimSpace(envelope.GrokVersion) == "" {
 		return providerGrokInspection{}, errors.New("Grok runtime inspection omitted its version")
 	}
-	return providerGrokInspection{
-		GrokVersion:         strings.TrimSpace(envelope.GrokVersion),
-		PermissionsLoaded:   envelope.Permissions.Loaded,
-		ManagedSettingsPath: strings.TrimSpace(envelope.Permissions.ManagedSettingsPath),
-		SHA256:              sha256TextCLI(output),
-	}, nil
+	loaded, err := providerGrokPermissionsLoaded(envelope.Permissions.Loaded)
+	if err != nil {
+		return providerGrokInspection{}, err
+	}
+	inspection := providerGrokInspection{
+		GrokVersion:       strings.TrimSpace(envelope.GrokVersion),
+		PermissionsLoaded: loaded,
+		PermissionSources: append([]string(nil), envelope.Permissions.Sources...),
+		SHA256:            sha256TextCLI(output),
+	}
+	for _, layer := range envelope.ConfigSources.Layers {
+		if strings.TrimSpace(layer.Role) == "system-requirements" {
+			inspection.SystemRequirementsLayerPresent = true
+			break
+		}
+	}
+	for _, warning := range envelope.ConfigWarnings {
+		text := strings.ToLower(string(warning))
+		if strings.Contains(text, "ui.disable_bypass_permissions_mode") && (strings.Contains(text, "unknown") || strings.Contains(text, "unrecognized")) {
+			inspection.BypassLockWarning = true
+			break
+		}
+	}
+	return inspection, nil
+}
+
+// providerGrokPermissionsLoaded accepts the pre-1.0.13 boolean shape and the
+// current count shape. A positive count is required: a present but empty
+// permission source list is never authority evidence.
+func providerGrokPermissionsLoaded(raw json.RawMessage) (bool, error) {
+	var boolean bool
+	if err := json.Unmarshal(raw, &boolean); err == nil {
+		return boolean, nil
+	}
+	var count int
+	if err := json.Unmarshal(raw, &count); err == nil && count >= 0 {
+		return count > 0, nil
+	}
+	return false, errors.New("Grok runtime inspection returned an invalid permissions.loaded value")
+}
+
+func hasProviderSystemRequirementsSource(sources []string, path string) bool {
+	want := filepath.Clean(path) + " (system requirements)"
+	for _, source := range sources {
+		if strings.TrimSpace(source) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func providerRuntimeVersion(ctx context.Context, binary string) (string, error) {

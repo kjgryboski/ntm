@@ -109,7 +109,12 @@ func (r syntheticProviderRuntime) Deliver(_ context.Context, _ string, nonce str
 }
 
 func (r syntheticProviderRuntime) Cancel(context.Context, string) (provider.CancelObservation, error) {
-	return provider.CancelObservation{Attempted: true, Authoritative: r.transport == "xai_headless_session"}, nil
+	return provider.CancelObservation{
+		Attempted:                   true,
+		Authoritative:               r.transport == "xai_headless_session",
+		AgentACPAcknowledged:        r.transport == "xai_acp",
+		CloudInferenceStopConfirmed: false,
+	}, nil
 }
 
 func (syntheticProviderRuntime) Recover(context.Context, string) (provider.RecoveryObservation, error) {

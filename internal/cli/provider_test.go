@@ -130,6 +130,22 @@ func TestProviderDoctorDoesNotRequireZAICodingQualificationForProviderNativeTran
 	}
 }
 
+func TestGrokDoctorModelEvidenceConfirmedRejectsCatalogOnlyEvidence(t *testing.T) {
+	for evidence, want := range map[string]bool{
+		"completion_metadata":                             true,
+		"provider_session_notification_plus_exact_launch": true,
+		"session_config_option_plus_exact_launch":         true,
+		"session_model_state_plus_exact_launch":           true,
+		"provider_catalog_plus_exact_launch":              false,
+		"":                                                false,
+		"unrecognized":                                    false,
+	} {
+		if got := grokDoctorModelEvidenceConfirmed(evidence); got != want {
+			t.Fatalf("grokDoctorModelEvidenceConfirmed(%q)=%v, want %v", evidence, got, want)
+		}
+	}
+}
+
 func TestProviderQualificationStoresFailedLiveReceiptWithoutPromoting(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0).UTC()
 	profile := providerTestProfile()
@@ -212,6 +228,95 @@ func providerTestGrokProfile(policy string) config.ProviderProfileConfig {
 	}
 }
 
+func providerTestGrokInspection() providerGrokInspection {
+	return providerGrokInspection{
+		GrokVersion:                    "1.0.13",
+		PermissionsLoaded:              true,
+		PermissionSources:              []string{providerRequirementsPath() + " (system requirements)"},
+		SystemRequirementsLayerPresent: true,
+		SHA256:                         providerTestHash("inspect"),
+	}
+}
+
+func providerTestGrokBypassProbe() providerGrokBypassProbe {
+	return providerGrokBypassProbe{
+		Refused: true, NetworkIsolated: true, CredentialsIsolated: true,
+		ExitCode: 1, SHA256: providerTestHash("bypass-lock-probe"),
+	}
+}
+
+func TestParseProviderRuntimeInspectGrokCurrentSchemaRequiresSystemEvidence(t *testing.T) {
+	inspection, err := parseProviderRuntimeInspectGrok([]byte(`{
+		"grokVersion":"1.0.13",
+		"permissions":{"loaded":3,"sources":["/etc/grok/requirements.toml (system requirements)"],"managedSettingsPath":"/not-authority"},
+		"configSources":{"layers":[{"role":"user"},{"role":"system-requirements"}]},
+		"configWarnings":[]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !inspection.PermissionsLoaded || !inspection.SystemRequirementsLayerPresent || !hasProviderSystemRequirementsSource(inspection.PermissionSources, "/etc/grok/requirements.toml") {
+		t.Fatalf("current inspection did not retain system requirements evidence: %+v", inspection)
+	}
+
+	legacy, err := parseProviderRuntimeInspectGrok([]byte(`{
+		"grokVersion":"1.0.12",
+		"permissions":{"loaded":true,"sources":["/etc/grok/requirements.toml (system requirements)"]},
+		"configSources":{"layers":[{"role":"system-requirements"}]}
+	}`))
+	if err != nil || !legacy.PermissionsLoaded {
+		t.Fatalf("legacy boolean loaded shape was not accepted: inspection=%+v err=%v", legacy, err)
+	}
+	warning, err := parseProviderRuntimeInspectGrok([]byte(`{
+		"grokVersion":"1.0.13",
+		"permissions":{"loaded":1,"sources":["/etc/grok/requirements.toml (system requirements)"]},
+		"configSources":{"layers":[{"role":"system-requirements"}]},
+		"configWarnings":["unknown setting ui.disable_bypass_permissions_mode"]
+	}`))
+	if err != nil || !warning.BypassLockWarning {
+		t.Fatalf("unrecognized bypass warning was not retained: inspection=%+v err=%v", warning, err)
+	}
+}
+
+func TestProviderPolicyAcceptsInspectWarningOnlyWithIsolatedBehavioralRefusal(t *testing.T) {
+	profile := providerTestGrokProfile(agent.DefaultGrokAutomationPolicyName)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requirements, ok := agent.GrokSystemRequirementsForPolicy(profile.AutomationPolicy)
+	if !ok {
+		t.Fatal("missing compiled requirements")
+	}
+	deps := providerDoctorDependencies{
+		readFile:  func(string) ([]byte, error) { return []byte(requirements.Contents), nil },
+		stat:      func(string) (os.FileInfo, error) { return nil, nil },
+		rootOwned: func(os.FileInfo) bool { return true },
+		inspectGrok: func(context.Context, string, string) (providerGrokInspection, error) {
+			inspection := providerTestGrokInspection()
+			inspection.BypassLockWarning = true
+			return inspection, nil
+		},
+		probeGrokBypassLock: func(context.Context, string) (providerGrokBypassProbe, error) {
+			return providerTestGrokBypassProbe(), nil
+		},
+	}
+	result, check := diagnoseProviderPolicy(context.Background(), "/repo", profile, identity, deps)
+	if check.Status != providerDoctorPass || !result.BypassLockAuthoritative || result.RuntimeInspectionState != "managed_requirements_discovered_with_bypass_warning" || result.BypassLockProbeState != "always_approve_refused" {
+		t.Fatalf("behaviorally enforced bypass lock was rejected: result=%+v check=%+v", result, check)
+	}
+
+	deps.probeGrokBypassLock = func(context.Context, string) (providerGrokBypassProbe, error) {
+		probe := providerTestGrokBypassProbe()
+		probe.Refused = false
+		return probe, nil
+	}
+	result, check = diagnoseProviderPolicy(context.Background(), "/repo", profile, identity, deps)
+	if check.Status != providerDoctorFail || result.BypassLockAuthoritative || result.BypassLockProbeState != "not_refused" {
+		t.Fatalf("missing behavioral refusal was accepted: result=%+v check=%+v", result, check)
+	}
+}
+
 func providerSessionTestDeps(t *testing.T, profile config.ProviderProfileConfig, admission *providerSessionAdmissionFake) providerSessionDependencies {
 	t.Helper()
 	requirements, ok := agent.GrokSystemRequirementsForPolicy(profile.AutomationPolicy)
@@ -222,13 +327,22 @@ func providerSessionTestDeps(t *testing.T, profile config.ProviderProfileConfig,
 		loadConfig: func() *config.Config {
 			return &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{"grok-qualified": profile}}
 		},
-		lookPath:  func(string) (string, error) { return "/usr/bin/grok", nil },
+		lookPath: func(string) (string, error) { return "/usr/bin/grok", nil },
+		trustExecutable: func(path string) (string, error) {
+			if path != "/usr/bin/grok" {
+				t.Fatalf("unexpected Grok executable path %q", path)
+			}
+			return path, nil
+		},
 		version:   func(context.Context, string) (string, error) { return "grok 1.0.13", nil },
 		readFile:  func(string) ([]byte, error) { return []byte(requirements.Contents), nil },
 		stat:      func(string) (os.FileInfo, error) { return nil, nil },
 		rootOwned: func(os.FileInfo) bool { return true },
 		inspectGrok: func(context.Context, string, string) (providerGrokInspection, error) {
-			return providerGrokInspection{GrokVersion: "1.0.13", PermissionsLoaded: true, ManagedSettingsPath: providerRequirementsPath(), SHA256: providerTestHash("inspect")}, nil
+			return providerTestGrokInspection(), nil
+		},
+		probeGrokBypassLock: func(context.Context, string) (providerGrokBypassProbe, error) {
+			return providerTestGrokBypassProbe(), nil
 		},
 		isLinkedWorktree: func(context.Context, string) (bool, error) { return true, nil },
 		runner:           providerSessionRunnerFake{}, admission: admission,
@@ -250,7 +364,10 @@ func TestProviderPolicyRequiresPinnedRuntimeDiscoveryOfManagedRequirements(t *te
 		stat:      func(string) (os.FileInfo, error) { return nil, nil },
 		rootOwned: func(os.FileInfo) bool { return true },
 		inspectGrok: func(context.Context, string, string) (providerGrokInspection, error) {
-			return providerGrokInspection{GrokVersion: "1.0.13", PermissionsLoaded: true, ManagedSettingsPath: providerRequirementsPath(), SHA256: providerTestHash("inspect")}, nil
+			return providerTestGrokInspection(), nil
+		},
+		probeGrokBypassLock: func(context.Context, string) (providerGrokBypassProbe, error) {
+			return providerTestGrokBypassProbe(), nil
 		},
 	}
 	result, check := diagnoseProviderPolicy(context.Background(), "/repo", profile, identity, deps)
@@ -259,7 +376,10 @@ func TestProviderPolicyRequiresPinnedRuntimeDiscoveryOfManagedRequirements(t *te
 	}
 
 	deps.inspectGrok = func(context.Context, string, string) (providerGrokInspection, error) {
-		return providerGrokInspection{GrokVersion: "1.0.13", PermissionsLoaded: true, ManagedSettingsPath: "/wrong/requirements.toml", SHA256: providerTestHash("wrong")}, nil
+		inspection := providerTestGrokInspection()
+		inspection.PermissionSources = []string{"/wrong/requirements.toml (system requirements)"}
+		inspection.SHA256 = providerTestHash("wrong")
+		return inspection, nil
 	}
 	result, check = diagnoseProviderPolicy(context.Background(), "/repo", profile, identity, deps)
 	if check.Status != providerDoctorFail || result.BypassLockAuthoritative || result.RuntimeInspectionState != "managed_requirements_not_discovered" {
@@ -279,13 +399,22 @@ func TestGrokACPDispatchRequiresLiveManagedPolicyAndPinnedRuntime(t *testing.T) 
 	}
 	versionCalls := 0
 	deps := providerDoctorDependencies{
-		lookPath:  func(string) (string, error) { return "/verified/bin/grok", nil },
+		lookPath: func(string) (string, error) { return "/user-path/grok", nil },
+		trustExecutable: func(path string) (string, error) {
+			if path != "/user-path/grok" {
+				t.Fatalf("unexpected located runtime %q", path)
+			}
+			return "/verified/bin/grok", nil
+		},
 		version:   func(context.Context, string) (string, error) { versionCalls++; return "grok 1.0.13", nil },
 		readFile:  func(string) ([]byte, error) { return []byte(requirements.Contents), nil },
 		stat:      func(string) (os.FileInfo, error) { return nil, nil },
 		rootOwned: func(os.FileInfo) bool { return true },
 		inspectGrok: func(context.Context, string, string) (providerGrokInspection, error) {
-			return providerGrokInspection{GrokVersion: "1.0.13", PermissionsLoaded: true, ManagedSettingsPath: providerRequirementsPath(), SHA256: providerTestHash("inspect")}, nil
+			return providerTestGrokInspection(), nil
+		},
+		probeGrokBypassLock: func(context.Context, string) (providerGrokBypassProbe, error) {
+			return providerTestGrokBypassProbe(), nil
 		},
 	}
 	binary, err := verifyGrokACPDispatchAuthority(context.Background(), "/repo", profile, identity, deps)
@@ -294,19 +423,33 @@ func TestGrokACPDispatchRequiresLiveManagedPolicyAndPinnedRuntime(t *testing.T) 
 	}
 
 	deps.inspectGrok = func(context.Context, string, string) (providerGrokInspection, error) {
-		return providerGrokInspection{GrokVersion: "1.0.13", PermissionsLoaded: false, ManagedSettingsPath: providerRequirementsPath()}, nil
+		inspection := providerTestGrokInspection()
+		inspection.PermissionsLoaded = false
+		return inspection, nil
 	}
 	versionCalls = 0
-	if _, err := verifyGrokACPDispatchAuthority(context.Background(), "/repo", profile, identity, deps); err == nil || versionCalls != 0 {
-		t.Fatalf("runtime policy drift reached provider version check: calls=%d err=%v", versionCalls, err)
+	if _, err := verifyGrokACPDispatchAuthority(context.Background(), "/repo", profile, identity, deps); err == nil || versionCalls != 1 {
+		t.Fatalf("runtime policy drift was not rejected after the pinned-version precheck: calls=%d err=%v", versionCalls, err)
 	}
 
 	deps.inspectGrok = func(context.Context, string, string) (providerGrokInspection, error) {
-		return providerGrokInspection{GrokVersion: "1.0.13", PermissionsLoaded: true, ManagedSettingsPath: providerRequirementsPath(), SHA256: providerTestHash("inspect")}, nil
+		return providerTestGrokInspection(), nil
 	}
 	deps.version = func(context.Context, string) (string, error) { return "grok 1.0.130", nil }
 	if _, err := verifyGrokACPDispatchAuthority(context.Background(), "/repo", profile, identity, deps); err == nil {
 		t.Fatal("runtime drift was accepted for Grok ACP dispatch")
+	}
+
+	deps.version = func(context.Context, string) (string, error) {
+		versionCalls++
+		return "grok 1.0.13", nil
+	}
+	deps.trustExecutable = func(string) (string, error) {
+		return "", errors.New("user-owned runtime")
+	}
+	versionCalls = 0
+	if _, err := verifyGrokACPDispatchAuthority(context.Background(), "/repo", profile, identity, deps); err == nil || versionCalls != 0 {
+		t.Fatalf("untrusted executable reached version/policy attestation: calls=%d err=%v", versionCalls, err)
 	}
 }
 
@@ -506,6 +649,94 @@ func TestProviderDoctorBlocksGrokOnlineProbeUntilManagedPolicyIsAuthoritative(t 
 	}
 	if probeCalls != 0 || admission.acquires != 0 || report.Readiness != providerReadinessNoGo || checkStatus(report.Checks, "model_entitlement") != providerDoctorFail {
 		t.Fatalf("unsafe Grok probe calls=%d admission=%+v readiness=%s checks=%+v", probeCalls, admission, report.Readiness, report.Checks)
+	}
+}
+
+func TestProviderDoctorCanonicalizesGrokRuntimeBeforeOnlineDispatch(t *testing.T) {
+	profile := providerTestGrokProfile(agent.DefaultGrokAutomationPolicyName)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requirements, ok := agent.GrokSystemRequirementsForPolicy(profile.AutomationPolicy)
+	if !ok {
+		t.Fatal("missing compiled requirements")
+	}
+	newDeps := func(admission *providerSessionAdmissionFake) providerDoctorDependencies {
+		return providerDoctorDependencies{
+			now:      time.Now,
+			lookPath: func(string) (string, error) { return "/replaceable/grok", nil },
+			trustExecutable: func(path string) (string, error) {
+				if path != "/replaceable/grok" {
+					t.Fatalf("unexpected located runtime %q", path)
+				}
+				return "/system/grok-1.0.13", nil
+			},
+			version: func(_ context.Context, path string) (string, error) {
+				if path != "/system/grok-1.0.13" {
+					t.Fatalf("version check re-entered untrusted runtime path %q", path)
+				}
+				return "grok 1.0.13", nil
+			},
+			lookupEnv: func(string) (string, bool) { return "", false },
+			readFile:  func(string) ([]byte, error) { return []byte(requirements.Contents), nil },
+			stat:      func(string) (os.FileInfo, error) { return nil, nil },
+			rootOwned: func(os.FileInfo) bool { return true },
+			inspectGrok: func(_ context.Context, path, _ string) (providerGrokInspection, error) {
+				if path != "/system/grok-1.0.13" {
+					t.Fatalf("runtime inspection re-entered untrusted path %q", path)
+				}
+				return providerTestGrokInspection(), nil
+			},
+			probeGrokBypassLock: func(_ context.Context, path string) (providerGrokBypassProbe, error) {
+				if path != "/system/grok-1.0.13" {
+					t.Fatalf("policy probe re-entered untrusted path %q", path)
+				}
+				return providerTestGrokBypassProbe(), nil
+			},
+			capacityStatus: func() ratelimit.CapacityStatus {
+				return ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared, SharedStorePath: "/redacted/capacity.json"}
+			},
+			capacitySnapshot: func(provider.Identity) ratelimit.AdmissionSnapshot {
+				return ratelimit.AdmissionSnapshot{IdentityHash: identity.Hash(), Scope: provider.CapacityControlScopeLocalShared, Tokens: 1}
+			},
+			admission: admission,
+		}
+	}
+
+	admission := &providerSessionAdmissionFake{
+		decision: ratelimit.Decision{Allowed: true, NoFailover: true},
+		status:   ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared},
+	}
+	deps := newDeps(admission)
+	onlineCalls := 0
+	deps.onlineProbe = func(_ context.Context, got config.ProviderProfileConfig, _ provider.Identity) (providerDoctorLiveEvidence, error) {
+		onlineCalls++
+		if got.Command != "/system/grok-1.0.13" {
+			t.Fatalf("online probe received non-canonical runtime %q", got.Command)
+		}
+		return providerDoctorLiveEvidence{ModelVerified: true, AuthVerified: true, SHA256: providerTestHash("live")}, nil
+	}
+	cfg := &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{"grok-qualified": profile}}
+	report, err := buildProviderDoctorReport(context.Background(), cfg, providerCommandOptions{profile: "grok-qualified", online: true, timeout: time.Minute, qualificationAge: time.Hour}, deps)
+	if err != nil || onlineCalls != 1 || report.Readiness != providerReadinessGoScoped {
+		t.Fatalf("canonical doctor report=%+v calls=%d err=%v", report, onlineCalls, err)
+	}
+
+	blockedAdmission := &providerSessionAdmissionFake{
+		decision: ratelimit.Decision{Allowed: true, NoFailover: true},
+		status:   ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared},
+	}
+	blocked := newDeps(blockedAdmission)
+	blocked.trustExecutable = func(string) (string, error) { return "", errors.New("user-writable runtime") }
+	blockedCalls := 0
+	blocked.onlineProbe = func(context.Context, config.ProviderProfileConfig, provider.Identity) (providerDoctorLiveEvidence, error) {
+		blockedCalls++
+		return providerDoctorLiveEvidence{}, nil
+	}
+	report, err = buildProviderDoctorReport(context.Background(), cfg, providerCommandOptions{profile: "grok-qualified", online: true, timeout: time.Minute, qualificationAge: time.Hour}, blocked)
+	if err != nil || blockedCalls != 0 || blockedAdmission.acquires != 0 || report.Readiness != providerReadinessNoGo || checkStatus(report.Checks, "runtime") != providerDoctorFail {
+		t.Fatalf("untrusted runtime was not blocked: report=%+v calls=%d admission=%+v err=%v", report, blockedCalls, blockedAdmission, err)
 	}
 }
 

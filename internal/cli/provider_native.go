@@ -159,6 +159,7 @@ func runProviderNative(cmd *cobra.Command, opts providerNativeRunOptions, deps p
 	}
 	logicalPrompt := strings.TrimSpace(opts.prompt)
 	binding := providerNativeBindingHash(identity, logicalPrompt)
+	requestID := providerNativeRequestID(binding, opID)
 	output := providerNativeRunOutput{SchemaVersion: providerNativeRunSchema, Profile: opts.profile, Transport: "zai_native_api", IdentitySHA256: identity.Hash(), AdapterVersion: providerNativeAdapterVersion, OperationID: opID, BindingSHA256: binding, ReceiptState: "not_claimed", State: "preflight"}
 	ledger, closeLedger, err := deps.openLedger()
 	if err != nil || ledger == nil {
@@ -228,7 +229,7 @@ func runProviderNative(cmd *cobra.Command, opts providerNativeRunOptions, deps p
 	}
 	prompt := logicalPrompt + "\n\nWhen finished, return this exact acknowledgement token on its own line and no other final text: " + nonce
 	runCtx, cancel := context.WithTimeout(providerCommandContext(cmd), providerNativeRunTimeout)
-	receipt, runErr := deps.run(runCtx, deps.client, zai.NativeRequest{Endpoint: identity.Endpoint(), Model: identity.Model(), Prompt: prompt, ExpectedNonce: nonce, NativeAPIKey: key, ExplicitOptIn: true, AllowTools: false})
+	receipt, runErr := deps.run(runCtx, deps.client, zai.NativeRequest{Endpoint: identity.Endpoint(), Model: identity.Model(), Prompt: prompt, ExpectedNonce: nonce, ExpectedRequestID: requestID, NativeAPIKey: key, ExplicitOptIn: true, AllowTools: false})
 	cancel()
 	output.Receipt = receipt
 	if runErr != nil {
@@ -321,6 +322,16 @@ func providerNativeBindingHash(identity provider.Identity, prompt string) string
 		sha256StringCLI(provider.NativeZAINoToolsPolicyName), sha256StringCLI(providerNativeAdapterVersion),
 	}
 	return sha256StringCLI(strings.Join(fields, "\x00"))
+}
+
+// providerNativeRequestID is deterministic from the durable binding and exact
+// operation ID, not from raw prompt or credential material. Including the
+// operation ID keeps distinct authorized operations unique even when their
+// identity and prompt are identical. Its 64 ASCII characters meet Z.ai's
+// documented request_id size limit while durable receipts retain only hashes.
+func providerNativeRequestID(binding, operationID string) string {
+	correlation := strings.Join([]string{"ntm.zai-native.request-id.v1", binding, operationID}, "\x00")
+	return "ntm-" + sha256StringCLI(correlation)[:60]
 }
 
 func validRecordedProviderNativeOutput(output providerNativeRunOutput, operationID, binding, profile, identitySHA256 string) bool {

@@ -179,8 +179,12 @@ only hashes/counts, provider session and optional structured model/usage fields,
 plus observable local exit/cleanup state; it never contains prompts, nonces,
 raw output, tool arguments, or credentials. Missing nonce acknowledgement is a
 typed operation failure. A post-acceptance timeout is `DISPATCH_UNKNOWN` rather
-than a retry-safe failure. Local termination/reap does not prove provider-side
-cancellation, so ACP cancellation is deliberately advertised as unavailable.
+than a retry-safe failure. On cancellation NTM writes ACP `session/cancel`; the
+only accepted acknowledgement is the original matching `session/prompt`
+response with `stopReason=cancelled`. The capability scope is `agent_acp`: this
+proves the local Grok ACP agent acknowledged that transition, not that xAI
+stopped cloud inference. Local process-tree termination, residual-PID
+inspection, and reaping are separate `local_process_tree` evidence.
 Automated ACP removes `XAI_API_KEY` and all proxy variables from the child
 environment (proxy URLs may embed credentials), then authenticates only with
 the local Grok CLI's `cached_token`; if that method is unavailable it fails
@@ -190,7 +194,7 @@ or a structured xAI model notification bound to the returned provider session
 and exact launch model. A global provider catalog is availability evidence only
 and cannot make a robot operation succeed.
 The operation ID is durably bound to the identity, logical prompt, working
-directory, executable, and policy hashes before provider dispatch; the receipt
+directory, canonical executable-path, and policy hashes before provider dispatch; the receipt
 separately hashes the exact nonce-bound packet. Normal retries with a newly
 generated transport nonce replay the recorded safe outcome, conflicting reuse fails, and an
 in-progress/outcome-unknown operation is never stale-taken-over. Query it with
@@ -337,8 +341,11 @@ ntm provider run --profile=zai-native-no-tools --operation-id=YOUR_UNIQUE_OPERAT
 ```
 
 It requires the separately authorized `ZAI_NATIVE_API_KEY` lane, records a
-redacted operation-bound receipt, and must not be promoted to provider-side
-cancellation, resume, or coding-policy authority.
+redacted operation-bound receipt, and derives a non-secret request ID from the
+durable binding. That ID is sent in the API body and must be echoed exactly by
+the successful event stream; a matching response header alone is insufficient.
+It must not be promoted to provider-side cancellation, resume, or coding-policy
+authority.
 
 Provider doctor reports `GO_SCOPED` when all gates for a declared operation
 scope pass but cancellation or cleanup lacks provider-side acknowledgement.
@@ -376,6 +383,13 @@ Z.ai requests remain a separate non-qualification lane.
 A matching managed policy, runtime inspection, or configuration digest is only
 configuration attestation. It does not turn a local process-tree stop or
 cleanup observation into provider-side cancellation acknowledgement.
+For Grok, dispatch additionally requires the canonical version-pinned binary
+and every parent directory to be root-owned and non-writable by unprivileged
+users, followed by a no-network, credential-free Bubblewrap behavioral probe of
+that same system-authoritative binary: `--always-approve`
+must be refused by the requirements policy after its root-owned, non-writable
+file and parent path are revalidated. `grok inspect` remains source/layer
+evidence only and cannot substitute for this refusal test.
 
 ### 2.3 Aliases for Backward Compatibility
 
@@ -488,9 +502,10 @@ Neither state claims the account or operation has been qualified.
 
 The matrix is a contract for the evidence a transport can produce, not proof
 that a local account is enabled or qualified. In particular, an exact Z.ai
-profile still needs its fresh nonce-bound live probe before launch, and
-the ACP cancellation field remains unavailable until an authoritative
-provider-side cancellation contract and receipt are implemented. Run the
+profile still needs its fresh nonce-bound live probe before launch. Grok ACP
+cancellation is `authoritative/agent_acp` only after the original matching
+prompt returns `stopReason=cancelled`; its cloud-inference-stop field remains
+false because neither ACP nor xAI supplies that receipt. Run the
 offline harness explicitly with `--robot-provider-conformance
 --provider-profile=NAME
 --provider-transport=xai_acp|xai_headless_session|xai_grok_tui|zai_claude_runtime|zai_native_api`. It uses a
@@ -498,8 +513,9 @@ compiled redacted synthetic runtime, makes no live provider or network call,
 and is not a live qualification result. The report always covers no-write
 launch/identity, nonce delivery, exact error taxonomy, cancellation semantics,
 crash/outcome-unknown recovery, declared resumption support, and zero-residual
-cleanup. Its zero-residual observation is synthetic; transport cleanup remains
-`submission` evidence until a live process-tree/session residual check exists.
+cleanup. Its zero-residual observation is synthetic; a live Grok ACP operation
+records its separate observed local process-tree termination and residual-PID
+check, while the other transports retain their declared narrower cleanup scope.
 
 For a separate opt-in no-write live Grok ACP check, run
 `NTM_LIVE_GROK_ACP=1 NTM_LIVE_GROK_MODEL=grok-4.6 go test -tags=integration ./internal/grok -run '^TestLiveACPReadOnlyRoundTrip$' -count=1 -v`

@@ -24,13 +24,14 @@ import (
 const NativeChatCompletionsEndpoint = "https://api.z.ai/api/paas/v4/chat/completions"
 
 type NativeRequest struct {
-	Endpoint      string
-	Model         string
-	Prompt        string
-	ExpectedNonce string
-	NativeAPIKey  string
-	ExplicitOptIn bool
-	AllowTools    bool
+	Endpoint          string
+	Model             string
+	Prompt            string
+	ExpectedNonce     string
+	ExpectedRequestID string
+	NativeAPIKey      string
+	ExplicitOptIn     bool
+	AllowTools        bool
 }
 
 // NativeReceipt contains structured evidence, never prompt text, key material,
@@ -93,7 +94,10 @@ func RunNative(ctx context.Context, client NativeHTTPClient, input NativeRequest
 	if err := validateNativeRequest(input); err != nil {
 		return finishNative(r, err)
 	}
-	body, err := json.Marshal(map[string]any{"model": input.Model, "stream": true, "messages": []map[string]string{{"role": "user", "content": input.Prompt}}})
+	body, err := json.Marshal(nativeRequestPayload{
+		Model: input.Model, Stream: true, RequestID: input.ExpectedRequestID,
+		Messages: []map[string]string{{"role": "user", "content": input.Prompt}},
+	})
 	if err != nil {
 		return finishNative(r, err)
 	}
@@ -120,13 +124,6 @@ func RunNative(ctx context.Context, client NativeHTTPClient, input NativeRequest
 	r.HTTPStatus = resp.StatusCode
 	if resp.Request == nil || resp.Request.URL == nil || resp.Request.URL.String() != NativeChatCompletionsEndpoint {
 		return finishNative(r, errors.New("Z.ai native transport response came from an unexpected endpoint"))
-	}
-	if requestID := firstHeader(resp.Header, "X-Request-Id", "X-Request-ID", "Request-Id"); requestID != "" {
-		if !validNativeIdentifier(requestID) {
-			return finishNative(r, errors.New("Z.ai native response emitted an invalid request identifier"))
-		}
-		r.requestID = requestID
-		r.ProviderRequestIDSHA256 = hashNative([]byte(requestID))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		parseNativeError(resp.Body, &r)
@@ -157,6 +154,9 @@ func validateNativeRequest(in NativeRequest) error {
 	}
 	if strings.TrimSpace(in.ExpectedNonce) == "" || in.ExpectedNonce != strings.TrimSpace(in.ExpectedNonce) || hasControl(in.ExpectedNonce) || len(in.ExpectedNonce) > 256 || !strings.Contains(in.Prompt, in.ExpectedNonce) {
 		return errors.New("Z.ai native transport requires a prompt-bound acknowledgement nonce")
+	}
+	if !validNativeClientRequestID(in.ExpectedRequestID) {
+		return errors.New("Z.ai native transport requires a caller-provided 6-64 character request identifier")
 	}
 	if in.AllowTools {
 		return errors.New("Z.ai native tool execution is not enabled by this adapter")
@@ -197,11 +197,12 @@ func consumeNativeSSE(ctx context.Context, body io.Reader, input NativeRequest, 
 			return errors.New("Z.ai native SSE emitted invalid JSON")
 		}
 		if event.RequestID != "" {
-			if !validNativeIdentifier(event.RequestID) || r.requestID != "" && r.requestID != event.RequestID {
+			if !validNativeIdentifier(event.RequestID) || event.RequestID != input.ExpectedRequestID || r.requestID != "" && r.requestID != event.RequestID {
 				return errors.New("Z.ai native SSE emitted a conflicting request identifier")
 			}
 			r.requestID = event.RequestID
 			r.ProviderRequestIDSHA256 = hashNative([]byte(event.RequestID))
+			evidence.exactRequestIDSeen = true
 		}
 		if event.ID != "" {
 			if !validNativeIdentifier(event.ID) || r.completionID != "" && r.completionID != event.ID {
@@ -274,6 +275,9 @@ func consumeNativeSSE(ctx context.Context, body io.Reader, input NativeRequest, 
 	if !evidence.finishReasonSeen || strings.TrimSpace(r.FinishReason) == "" {
 		return errors.New("Z.ai native completion omitted finish reason")
 	}
+	if !evidence.exactRequestIDSeen || r.requestID != input.ExpectedRequestID {
+		return errors.New("Z.ai native completion omitted the exact caller request identifier")
+	}
 	matcher.finalize()
 	r.NonceVerified = matcher.verified
 	r.OutputSHA256 = hex.EncodeToString(output.Sum(nil))
@@ -285,9 +289,17 @@ func consumeNativeSSE(ctx context.Context, body io.Reader, input NativeRequest, 
 // It is not an assertion based on HTTP status, request headers, or a locally
 // closed response body; those do not attest to provider-side completion.
 type nativeCompletionEvidence struct {
-	terminalSeen     bool
-	exactModelSeen   bool
-	finishReasonSeen bool
+	terminalSeen       bool
+	exactModelSeen     bool
+	exactRequestIDSeen bool
+	finishReasonSeen   bool
+}
+
+type nativeRequestPayload struct {
+	Model     string              `json:"model"`
+	Stream    bool                `json:"stream"`
+	RequestID string              `json:"request_id"`
+	Messages  []map[string]string `json:"messages"`
 }
 
 type nativeEvent struct {
@@ -371,19 +383,18 @@ func finishNative(r NativeReceipt, err error) (NativeReceipt, error) {
 	}
 	return r, err
 }
-func firstHeader(h http.Header, names ...string) string {
-	for _, n := range names {
-		if v := h.Get(n); v != "" {
-			return v
-		}
-	}
-	return ""
-}
 func endpointHost(value string) string { u, _ := url.Parse(value); return u.Hostname() }
 func hashNative(v []byte) string       { sum := sha256.Sum256(v); return hex.EncodeToString(sum[:]) }
 
 func validNativeIdentifier(value string) bool {
 	return strings.TrimSpace(value) != "" && value == strings.TrimSpace(value) && len(value) <= 4096 && !hasControl(value)
+}
+
+// validNativeClientRequestID follows Z.ai's documented request_id size
+// contract. The identifier is an application correlation value, not a secret;
+// callers must retain only its digest in durable evidence.
+func validNativeClientRequestID(value string) bool {
+	return len(value) >= 6 && len(value) <= 64 && validNativeIdentifier(value)
 }
 
 type nativeNonceMatcher struct {

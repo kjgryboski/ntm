@@ -79,12 +79,15 @@ func TestCapabilityMatrixPreservesEvidenceBoundaries(t *testing.T) {
 	if got := matrix["xai_acp"].Resume; got != EvidenceUnavailable {
 		t.Fatalf("xAI ACP resume = %q, want unavailable until production session/load is implemented", got)
 	}
+	if got := matrix["xai_acp"]; got.Cancellation != EvidenceAuthoritative || got.CancellationAuthorityScope != EvidenceAuthorityScopeAgentACP || got.Cleanup != EvidenceAuthoritative || got.CleanupAuthorityScope != EvidenceAuthorityScopeLocalProcessTree {
+		t.Fatalf("xAI ACP cancellation/cleanup matrix = %+v", got)
+	}
 	if got := matrix["xai_grok_tui"]; got.Delivery != EvidenceSubmission || got.Completion != EvidenceUnavailable {
 		t.Fatalf("Grok TUI matrix = %+v, want submission-only", got)
 	}
 	for transport, capabilities := range matrix {
 		want := EvidenceSubmission
-		if transport == "xai_headless_session" {
+		if transport == "xai_headless_session" || transport == "xai_acp" {
 			want = EvidenceAuthoritative
 		}
 		if capabilities.Cleanup != want {
@@ -128,9 +131,22 @@ func TestRunConformanceGrokHeadlessBindsResumeWithoutProviderCancelOverclaim(t *
 func TestRunConformanceACPAuthoritativeCompletion(t *testing.T) {
 	t.Parallel()
 	id := conformanceIdentity(t)
-	report := RunConformance(context.Background(), fakeRuntime{identityHash: id.Hash(), completion: true, cancel: CancelObservation{Attempted: true}, errors: genericErrors()}, "xai_acp", id, conformanceFixture(id), "nonce-1")
+	report := RunConformance(context.Background(), fakeRuntime{identityHash: id.Hash(), completion: true, cancel: CancelObservation{Attempted: true, AgentACPAcknowledged: true}, errors: genericErrors()}, "xai_acp", id, conformanceFixture(id), "nonce-1")
 	if !report.Passed() {
 		t.Fatalf("report = %+v", report)
+	}
+}
+
+func TestRunConformanceACPRejectsCloudCancellationOverclaim(t *testing.T) {
+	t.Parallel()
+	id := conformanceIdentity(t)
+	report := RunConformance(context.Background(), fakeRuntime{
+		identityHash: id.Hash(), completion: true,
+		cancel: CancelObservation{Attempted: true, AgentACPAcknowledged: true, CloudInferenceStopConfirmed: true},
+		errors: genericErrors(),
+	}, "xai_acp", id, conformanceFixture(id), "nonce-cloud-overclaim")
+	if report.Passed() || checkByName(report, "cancellation_semantics").Passed {
+		t.Fatalf("xAI ACP cloud cancellation overclaim was accepted: %+v", report)
 	}
 }
 

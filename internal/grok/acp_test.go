@@ -41,6 +41,9 @@ func TestRunCompletesFromACPTranscript(t *testing.T) {
 	if !result.Success || result.State != StateCompleted || !result.CompletionConfirmed {
 		t.Fatalf("result = %+v, want confirmed completion", result)
 	}
+	if !result.Authenticated || result.AuthenticationEvidence != "cached_token_authenticate_plus_completed_session" {
+		t.Fatalf("completed cached authentication evidence = authenticated:%v evidence:%q", result.Authenticated, result.AuthenticationEvidence)
+	}
 	if result.ProviderSessionID != "grok-session-7" || result.StopReason != "end_turn" {
 		t.Fatalf("provider receipt = %+v", result)
 	}
@@ -154,7 +157,7 @@ func TestRunExposesConcreteReapAndExitEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.CleanupState != "reaped_after_termination" || result.ExitCode == nil || *result.ExitCode != -1 {
+	if result.CleanupState != "unsupported_and_reaped" || !result.Cleanup.Reaped || result.Cleanup.LocalTermination != "unsupported" || result.ExitCode == nil || *result.ExitCode != -1 {
 		t.Fatalf("cleanup receipt = %+v", result)
 	}
 }
@@ -247,7 +250,7 @@ func TestRunRequiresStopReasonForAuthoritativeCompletion(t *testing.T) {
 		`{"jsonrpc":"2.0","id":4,"result":{}}`,
 	}, "\n")+"\n"), strings.NewReader(""))}, Request{Prompt: "hello", CWD: "/repo"})
 	assertCode(t, err, ErrOutcomeUnknown)
-	if result.CompletionConfirmed || result.State != StateOutcomeUnknown {
+	if result.CompletionConfirmed || result.State != StateOutcomeUnknown || result.Authenticated || result.AuthenticationEvidence != "" {
 		t.Fatalf("stop-reason-free receipt = %+v", result)
 	}
 }
@@ -260,21 +263,28 @@ func TestMinimalGrokEnvironmentExcludesUnrelatedValues(t *testing.T) {
 	}
 }
 
-func TestRunHashesOnlyNonAssistantUpdateNamesAndProviderUsage(t *testing.T) {
+func TestRunSeparatesToolCallsFromOtherNonMessageUpdates(t *testing.T) {
 	transcript := strings.Join([]string{
 		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
 		`{"jsonrpc":"2.0","id":2,"result":{}}`,
 		`{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s"}}`,
 		`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","arguments":{"api_key":"must-not-retain"}}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","content":{"text":"must-not-retain"}}}}`,
 		`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_result","content":{"text":"must-not-retain"}}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"must-not-retain"}}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"usage_update","used":12,"size":100}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"update":[]}}`,
 		`{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn","model":"grok-4.6","usage":{"inputTokens":12,"output_tokens":34}}}`,
 	}, "\n") + "\n"
 	result, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{Prompt: "hello", CWD: "/repo"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.ToolEventCount != 2 || result.ToolEventsSHA256 != toolEventHash("tool_call", "tool_result") {
+	if result.ToolEventCount != 2 || result.ToolEventsSHA256 != updateNameHash("tool_call", "tool_call_update") {
 		t.Fatalf("tool evidence = %+v", result)
+	}
+	if result.NonMessageUpdateCount != 6 || result.NonMessageUpdatesSHA256 != updateNameHash("tool_call", "tool_call_update", "tool_result", "agent_thought_chunk", "usage_update", "unknown") {
+		t.Fatalf("non-message update evidence = %+v", result)
 	}
 	if result.Model != "grok-4.6" || result.ModelEvidence != "completion_metadata" || result.Usage == nil || result.Usage.InputTokens == nil || *result.Usage.InputTokens != 12 || result.Usage.OutputTokens == nil || *result.Usage.OutputTokens != 34 || result.Usage.TotalTokens != nil {
 		t.Fatalf("provider metadata = %+v", result)
@@ -321,6 +331,84 @@ func TestRunAcceptsOnlySessionBoundVendorModelEvidence(t *testing.T) {
 	})
 	if err != nil || result.Model != "grok-4.6" || result.ModelEvidence != "provider_session_notification_plus_exact_launch" {
 		t.Fatalf("session-bound model evidence result=%+v err=%v", result, err)
+	}
+}
+
+func TestRunDerivesExactModelFromSessionConfigOption(t *testing.T) {
+	transcript := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
+		`{"jsonrpc":"2.0","id":2,"result":{}}`,
+		`{"jsonrpc":"2.0","id":3,"result":{"sessionId":"session-7","configOptions":[{"id":"model","category":"model","type":"select","currentValue":"grok-4.6","options":[{"value":"grok-4.5"},{"value":"grok-4.6"}]}]}}`,
+		`{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}`,
+	}, "\n") + "\n"
+	result, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{
+		Prompt: "hello", CWD: "/repo", Model: "grok-4.6",
+	})
+	if err != nil || result.Model != "grok-4.6" || result.ModelEvidence != "session_config_option_plus_exact_launch" {
+		t.Fatalf("session config model evidence result=%+v err=%v", result, err)
+	}
+	if !result.Authenticated || result.AuthenticationEvidence != "cached_token_authenticate_plus_completed_session" {
+		t.Fatalf("completed cached authentication was not recorded safely: authenticated=%v evidence=%q", result.Authenticated, result.AuthenticationEvidence)
+	}
+}
+
+func TestRunDerivesExactModelFromTopLevelSessionModelState(t *testing.T) {
+	transcript := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
+		`{"jsonrpc":"2.0","id":2,"result":{}}`,
+		`{"jsonrpc":"2.0","id":3,"result":{"sessionId":"session-7","models":{"currentModelId":"grok-4.6","availableModels":[{"modelId":"grok-4.5"},{"modelId":"grok-4.6"}]}}}`,
+		`{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}`,
+	}, "\n") + "\n"
+	result, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{
+		Prompt: "hello", CWD: "/repo", Model: "grok-4.6",
+	})
+	if err != nil || result.Model != "grok-4.6" || result.ModelEvidence != "session_model_state_plus_exact_launch" {
+		t.Fatalf("top-level session model-state evidence result=%+v err=%v", result, err)
+	}
+}
+
+func TestSessionConfigExactModelRejectsAmbiguousOrUnboundOptions(t *testing.T) {
+	valid := func() sessionConfigOption {
+		return sessionConfigOption{
+			Category: "model", Type: "select", CurrentValue: json.RawMessage(`"grok-4.6"`),
+			Options: json.RawMessage(`[{"value":"grok-4.6"}]`),
+		}
+	}
+	for name, options := range map[string][]sessionConfigOption{
+		"missing":              nil,
+		"wrong category":       {{Category: "Model", Type: "select", CurrentValue: json.RawMessage(`"grok-4.6"`), Options: json.RawMessage(`[{"value":"grok-4.6"}]`)}},
+		"duplicate model":      {valid(), valid()},
+		"wrong type":           {{Category: "model", Type: "boolean", CurrentValue: json.RawMessage(`"grok-4.6"`), Options: json.RawMessage(`[{"value":"grok-4.6"}]`)}},
+		"wrong current value":  {{Category: "model", Type: "select", CurrentValue: json.RawMessage(`"grok-4.5"`), Options: json.RawMessage(`[{"value":"grok-4.5"}]`)}},
+		"value absent options": {{Category: "model", Type: "select", CurrentValue: json.RawMessage(`"grok-4.6"`), Options: json.RawMessage(`[{"value":"grok-4.5"}]`)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if model, ok := sessionConfigExactModel(options, "grok-4.6"); ok || model != "" {
+				t.Fatalf("unbound session config option became model evidence: model=%q ok=%v", model, ok)
+			}
+		})
+	}
+	if model, ok := sessionConfigExactModel([]sessionConfigOption{valid()}, "grok-4.6"); !ok || model != "grok-4.6" {
+		t.Fatalf("exact session config option not accepted: model=%q ok=%v", model, ok)
+	}
+	duplicateValue := valid()
+	duplicateValue.Options = json.RawMessage(`[{"value":"grok-4.6"},{"value":"grok-4.6"}]`)
+	if model, ok := sessionConfigExactModel([]sessionConfigOption{duplicateValue}, "grok-4.6"); ok || model != "" {
+		t.Fatalf("duplicate current model option value became evidence: model=%q ok=%v", model, ok)
+	}
+
+	for name, raw := range map[string]json.RawMessage{
+		"wrong current":     json.RawMessage(`{"currentModelId":"grok-4.5","availableModels":[{"modelId":"grok-4.5"}]}`),
+		"missing current":   json.RawMessage(`{"currentModelId":"grok-4.6","availableModels":[{"modelId":"grok-4.5"}]}`),
+		"duplicate current": json.RawMessage(`{"currentModelId":"grok-4.6","availableModels":[{"modelId":"grok-4.6"},{"modelId":"grok-4.6"}]}`),
+		"legacy id only":    json.RawMessage(`{"currentModelId":"grok-4.6","availableModels":[{"id":"grok-4.6"}]}`),
+		"nested only":       json.RawMessage(`{"state":{"currentModelId":"grok-4.6","availableModels":[{"modelId":"grok-4.6"}]}}`),
+	} {
+		t.Run("model state "+name, func(t *testing.T) {
+			if model, ok := sessionModelsExactModel(raw, "grok-4.6"); ok {
+				t.Fatalf("unbound top-level model state became evidence: model=%q", model)
+			}
+		})
 	}
 }
 
@@ -447,6 +535,129 @@ func TestRunCancellationBeforePromptWritesNoBytesIsSafelyAborted(t *testing.T) {
 	}
 }
 
+func TestRunCancellationRequiresOriginalPromptCancelledAcknowledgement(t *testing.T) {
+	for name, completion := range map[string]string{
+		"acknowledged":        `{"stopReason":"cancelled"}`,
+		"missing stop reason": `{}`,
+		"wrong stop reason":   `{"stopReason":"end_turn"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			proc, writer := cancellationTranscriptProcess(t)
+			proc.onWrite = func(message wireRequest) {
+				switch message.Method {
+				case "session/prompt":
+					cancel()
+				case "session/cancel":
+					_, _ = io.WriteString(writer, `{"jsonrpc":"2.0","id":4,"result":`+completion+"}\n")
+					_ = writer.Close()
+				}
+			}
+			result, err := Run(ctx, &fakeRunner{proc: proc}, Request{
+				Prompt: "hello", CWD: "/repo", OperationID: "operation-cancelled",
+				CancellationGracePeriod: 100 * time.Millisecond,
+			})
+			requests := decodeRequests(t, proc.stdin.String())
+			if len(requests) != 5 || requests[4].Method != "session/cancel" || len(requests[4].ID) != 0 || nestedString(t, requests[4].Params, "sessionId") != "provider-session" {
+				t.Fatalf("ACP cancellation wire sequence = %+v", requests)
+			}
+			if !result.Cancellation.Requested || !result.Cancellation.NotificationWritten || result.Cancellation.SessionSHA256 != acpCancellationHash("provider-session") || result.Cancellation.OperationSHA256 != acpOperationHash("operation-cancelled", "provider-session", 4) || result.Cancellation.PromptRequestID != 4 || result.Cancellation.CloudInferenceStopConfirmed {
+				t.Fatalf("cancellation binding receipt = %+v", result.Cancellation)
+			}
+			if name == "acknowledged" {
+				assertCode(t, err, ErrCancelled)
+				if result.State != StateCancelled || !result.CompletionConfirmed || result.StopReason != "cancelled" || !result.Cancellation.AgentACPAcknowledged || result.Cancellation.Acknowledgement != "session_prompt_stop_reason_cancelled" {
+					t.Fatalf("cancellation acknowledgement receipt = %+v", result)
+				}
+				return
+			}
+			assertCode(t, err, ErrCancellationUnconfirmed)
+			if result.State != StateOutcomeUnknown || result.Cancellation.AgentACPAcknowledged || result.StopReason == "cancelled" {
+				t.Fatalf("unconfirmed cancellation receipt = %+v", result)
+			}
+		})
+	}
+}
+
+func TestRunCancellationTimeoutLeavesOutcomeUnknown(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	proc, _ := cancellationTranscriptProcess(t)
+	proc.onWrite = func(message wireRequest) {
+		if message.Method == "session/prompt" {
+			cancel()
+		}
+	}
+	result, err := Run(ctx, &fakeRunner{proc: proc}, Request{
+		Prompt: "hello", CWD: "/repo", OperationID: "operation-timeout",
+		CancellationGracePeriod: 10 * time.Millisecond,
+	})
+	assertCode(t, err, ErrOutcomeUnknown)
+	requests := decodeRequests(t, proc.stdin.String())
+	if len(requests) != 5 || requests[4].Method != "session/cancel" || !result.Cancellation.Requested || !result.Cancellation.NotificationWritten || result.Cancellation.AgentACPAcknowledged || result.State != StateOutcomeUnknown {
+		t.Fatalf("timeout cancellation receipt = %+v requests=%+v", result, requests)
+	}
+}
+
+func TestCleanupACPProcessKeepsResidualTreeEvidenceSeparate(t *testing.T) {
+	proc := newFakeProcess(strings.NewReader(""), strings.NewReader(""))
+	proc.pid = 404
+	cleanup := cleanupACPProcessWithTerminator(proc, func(context.Context, int32) CancellationReceipt {
+		return CancellationReceipt{
+			LocalTermination: "residual_processes_detected",
+			ResidualPIDs:     []int32{404, 405},
+			ObservedAt:       time.Unix(1, 0).UTC(),
+		}
+	})
+	if cleanup.LocalTermination != "residual_processes_detected" || !slices.Equal(cleanup.ResidualPIDs, []int32{404, 405}) || cleanup.Reaped || cleanup.ObservedAt != time.Unix(1, 0).UTC() {
+		t.Fatalf("cleanup = %+v", cleanup)
+	}
+}
+
+func TestReconcileACPResidualsAfterReapPromotesOnlyGoneObservedPIDs(t *testing.T) {
+	started := time.Unix(1, 0).UTC()
+	base := ProcessCleanupReceipt{
+		LocalTermination: "residual_processes_detected",
+		ResidualPIDs:     []int32{404, 405},
+		Reaped:           true,
+		ObservedAt:       started,
+	}
+
+	t.Run("all previously observed residuals are gone after reap", func(t *testing.T) {
+		inspector := &treeInspector{live: map[int32]bool{404: false, 405: false}}
+		got := reconcileACPResidualsAfterReapWithInspector(base, inspector, 0)
+		if got.LocalTermination != "observed_tree_terminated_verified" || len(got.ResidualPIDs) != 0 || !got.Reaped || !got.ObservedAt.After(started) {
+			t.Fatalf("reconciled cleanup = %+v", got)
+		}
+	})
+
+	t.Run("still-live observed residual stays explicit", func(t *testing.T) {
+		inspector := &treeInspector{live: map[int32]bool{404: true, 405: false}}
+		got := reconcileACPResidualsAfterReapWithInspector(base, inspector, 0)
+		if got.LocalTermination != "residual_processes_detected" || !slices.Equal(got.ResidualPIDs, []int32{404}) || !got.Reaped || !got.ObservedAt.Equal(started) {
+			t.Fatalf("residual cleanup was overclaimed: %+v", got)
+		}
+	})
+}
+
+func cancellationTranscriptProcess(t *testing.T) (*fakeProcess, *io.PipeWriter) {
+	t.Helper()
+	reader, writer := io.Pipe()
+	proc := newFakeProcess(reader, strings.NewReader(""))
+	proc.kill = func() { _ = writer.Close() }
+	go func() {
+		for _, line := range []string{
+			`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
+			`{"jsonrpc":"2.0","id":2,"result":{}}`,
+			`{"jsonrpc":"2.0","id":3,"result":{"sessionId":"provider-session"}}`,
+		} {
+			_, _ = io.WriteString(writer, line+"\n")
+		}
+	}()
+	return proc, writer
+}
+
 type fakeRunner struct {
 	proc *fakeProcess
 	spec StartSpec
@@ -473,6 +684,7 @@ type fakeProcess struct {
 	waitCalls   int
 	kill        func()
 	waitErr     error
+	pid         int32
 }
 
 func newFakeProcess(stdout, stderr io.Reader) *fakeProcess {
@@ -502,6 +714,7 @@ func (p *fakeProcess) Wait() error {
 	p.waitCalls++
 	return p.waitErr
 }
+func (p *fakeProcess) PID() int32 { return p.pid }
 
 type fakeExitError struct{ code int }
 
@@ -565,6 +778,7 @@ func (w *recordingWriteCloser) String() string {
 }
 
 type wireRequest struct {
+	ID     json.RawMessage `json:"id"`
 	Method string          `json:"method"`
 	Params json.RawMessage `json:"params"`
 }
@@ -621,7 +835,7 @@ func successfulTranscript(authMethods string) string {
 	}, "\n") + "\n"
 }
 
-func toolEventHash(names ...string) string {
+func updateNameHash(names ...string) string {
 	hash := sha256.New()
 	for _, name := range names {
 		var length [4]byte

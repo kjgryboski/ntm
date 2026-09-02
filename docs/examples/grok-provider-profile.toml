@@ -3,8 +3,15 @@
 # different account, model, endpoint, runtime version, or policy. Never put a
 # credential in this file.
 #
-# Hashed manifest:
+# ACP cancellation is narrowly agent-scoped: NTM writes `session/cancel` and
+# accepts it only when the original `session/prompt` response says
+# `stopReason=cancelled`. That receipt does not prove xAI cloud inference
+# stopped. Local process-tree termination/reaping is recorded separately.
+#
+# Observe-profile hashed manifest:
 # provider=xai;account=local-cached;model=grok-4.6;endpoint=https://api.x.ai/v1;runtime=grok;runtime_version=1.0.13;policy=grok-readonly-ci
+# Workspace-write-profile hashed manifest:
+# provider=xai;account=local-cached;model=grok-4.6;endpoint=https://api.x.ai/v1;runtime=grok;runtime_version=1.0.13;policy=grok-workspace-write-ci
 
 [provider_profiles."grok-observe"]
 provider = "xai"
@@ -14,7 +21,20 @@ endpoint = "https://api.x.ai/v1"
 runtime = "grok"
 runtime_version = "1.0.13"
 config_sha256 = "8ef1037867e53a83a12e3170773f2d5b510fd7b3c25dbf002eedb2e28077d7b4"
-command = "grok"
+command = "/usr/local/libexec/ntm/grok-1.0.13"
 automation_policy = "grok-readonly-ci"
+exact_target_only = true
+probe_required = false
+
+[provider_profiles."grok-workspace-write"]
+provider = "xai"
+account_alias = "local-cached"
+model = "grok-4.6"
+endpoint = "https://api.x.ai/v1"
+runtime = "grok"
+runtime_version = "1.0.13"
+config_sha256 = "a8dd5c6add08b6333c148fcff0ccbfdf81e6bf5b61ce3c645bc0112c3fa97958"
+command = "/usr/local/libexec/ntm/grok-1.0.13"
+automation_policy = "grok-workspace-write-ci"
 exact_target_only = true
 probe_required = false

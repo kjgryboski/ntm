@@ -9,6 +9,10 @@ import "os"
 // authority.
 func providerRequirementsRootOwned(os.FileInfo) bool { return false }
 func providerRequirementsCanInstall() bool           { return false }
+func providerSystemAuthoritativeExecutable(string) (string, error) {
+	return "", os.ErrPermission
+}
+func providerSecureRootPath(string) error { return os.ErrPermission }
 func providerRequirementsOpenExisting(string) (*os.File, error) {
 	return nil, os.ErrPermission
 }

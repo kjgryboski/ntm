@@ -23,6 +23,45 @@ func providerRequirementsRootOwned(info os.FileInfo) bool {
 
 func providerRequirementsCanInstall() bool { return os.Geteuid() == 0 }
 
+// providerSystemAuthoritativeExecutable canonicalizes an executable and then
+// proves that neither the file nor any directory used to reach it can be
+// replaced by an unprivileged user. The returned path contains no symlinks, so
+// callers can use that same path for version inspection, policy attestation,
+// and the eventual provider dispatch without re-entering a user-writable PATH.
+func providerSystemAuthoritativeExecutable(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	resolved = filepath.Clean(resolved)
+	if !filepath.IsAbs(resolved) {
+		return "", errors.New("runtime path is not absolute")
+	}
+	file, err := providerRequirementsOpenExisting(resolved)
+	if err != nil {
+		return "", fmt.Errorf("runtime is not a root-owned, non-writable regular file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return "", fmt.Errorf("close trusted runtime descriptor: %w", err)
+	}
+	if err := providerSecureRootPath(filepath.Dir(resolved)); err != nil {
+		return "", fmt.Errorf("runtime parent path is not system-authoritative: %w", err)
+	}
+	return resolved, nil
+}
+
+func providerSecureRootPath(path string) error {
+	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
+		if err := providerSecureRootDirectory(current); err != nil {
+			return fmt.Errorf("%s: %w", current, err)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+	}
+}
+
 func providerRequirementsOpenExisting(path string) (*os.File, error) {
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
@@ -42,6 +81,9 @@ func providerRequirementsOpenExisting(path string) (*os.File, error) {
 // ReadFile/Stat calls. Ownership is evaluated by the caller so the doctor can
 // distinguish a digest match from an authority failure.
 func providerRequirementsReadForDoctor(path string) ([]byte, os.FileInfo, error) {
+	if err := providerSecureRootPath(filepath.Dir(path)); err != nil {
+		return nil, nil, fmt.Errorf("Grok requirements parent path is not system-authoritative: %w", err)
+	}
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, nil, &os.PathError{Op: "open", Path: path, Err: err}

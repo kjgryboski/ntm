@@ -4,6 +4,7 @@ package zai
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -26,7 +27,7 @@ func TestLiveNativeNoWriteRoundTrip(t *testing.T) {
 	result, err := RunNative(t.Context(), DefaultNativeHTTPClient(), NativeRequest{
 		Endpoint: NativeChatCompletionsEndpoint, Model: model,
 		Prompt:        "Reply with this exact nonce on its own line and no other text: " + nonce,
-		ExpectedNonce: nonce, NativeAPIKey: key, ExplicitOptIn: true,
+		ExpectedNonce: nonce, ExpectedRequestID: "ntm-live-" + strings.TrimPrefix(nonce, "NTM_ACK_"), NativeAPIKey: key, ExplicitOptIn: true,
 	})
 	if err != nil || !result.NonceVerified || result.Model == "" {
 		t.Fatalf("native Z.ai receipt failed: err=%v nonce=%t model=%q status=%d code=%q", err, result.NonceVerified, result.Model, result.HTTPStatus, result.ErrorCode)

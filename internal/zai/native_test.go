@@ -26,12 +26,16 @@ func TestRunNativeRedactsToolsAndBindsNonce(t *testing.T) {
 	body := "data: {\"id\":\"completion-1\",\"request_id\":\"request-1\",\"model\":\"glm-test\",\"session_id\":\"session-1\",\"choices\":[{\"delta\":{\"content\":\"" + nonce + "\\n\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5}}\n\ndata: [DONE]\n"
 	c := &nativeClient{response: &http.Response{StatusCode: 200, Header: http.Header{"X-Request-Id": []string{"request-1"}}, Body: ioNop(bytes.NewBufferString(body))}}
 	prompt := "secret prompt; return " + nonce
-	r, err := RunNative(t.Context(), c, NativeRequest{Endpoint: NativeChatCompletionsEndpoint, Model: "glm-test", Prompt: prompt, ExpectedNonce: nonce, NativeAPIKey: "secret-key", ExplicitOptIn: true})
+	r, err := RunNative(t.Context(), c, NativeRequest{Endpoint: NativeChatCompletionsEndpoint, Model: "glm-test", Prompt: prompt, ExpectedNonce: nonce, ExpectedRequestID: "request-1", NativeAPIKey: "secret-key", ExplicitOptIn: true})
 	if err != nil || !r.NonceVerified || r.ToolCallCount != 0 || r.FinishReason != "stop" || !r.Cancellation.LocalBodyClosed || r.ProviderRequestIDSHA256 == "" || r.CompletionIDSHA256 == "" || r.ProviderSessionIDSHA256 == "" {
 		t.Fatalf("receipt=%+v err=%v", r, err)
 	}
 	if r.ToolCallsSHA256 == "" || r.OutputSHA256 == "" || c.request.Header.Get("Authorization") != "Bearer secret-key" {
 		t.Fatalf("bad transport receipt/request")
+	}
+	var sent nativeRequestPayload
+	if err := json.NewDecoder(c.request.Body).Decode(&sent); err != nil || sent.RequestID != "request-1" {
+		t.Fatalf("payload=%+v err=%v", sent, err)
 	}
 	encoded, _ := json.Marshal(r)
 	if strings.Contains(string(encoded), "request-1") || strings.Contains(string(encoded), "completion-1") || strings.Contains(string(encoded), "session-1") || strings.Contains(string(encoded), "secret") {
@@ -75,6 +79,16 @@ func TestRunNativeRequiresExactDocumentedEndpoint(t *testing.T) {
 	}
 }
 
+func TestRunNativeValidatesCallerRequestID(t *testing.T) {
+	for _, value := range []string{"", "short", strings.Repeat("a", 65), "valid-req\n"} {
+		request := nativeRequest("")
+		request.ExpectedRequestID = value
+		if err := validateNativeRequest(request); err == nil {
+			t.Fatalf("invalid caller request ID %q accepted", value)
+		}
+	}
+}
+
 func TestRunNativeRejectsMissingTerminalMarker(t *testing.T) {
 	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
 	body := "data: {\"model\":\"glm-test\",\"choices\":[{\"delta\":{\"content\":\"" + nonce + "\\n\"},\"finish_reason\":\"stop\"}]}\n"
@@ -82,6 +96,32 @@ func TestRunNativeRejectsMissingTerminalMarker(t *testing.T) {
 	if err == nil || r.Cancellation.ProviderAcknowledged || !r.Cancellation.LocalBodyClosed {
 		t.Fatalf("receipt=%+v err=%v", r, err)
 	}
+}
+
+func TestRunNativeRequiresExactSSERequestIDEcho(t *testing.T) {
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	request := nativeRequest(nonce)
+
+	t.Run("missing from stream", func(t *testing.T) {
+		body := "data: {\"model\":\"glm-test\",\"choices\":[{\"delta\":{\"content\":\"" + nonce + "\\n\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n"
+		if _, err := RunNative(t.Context(), nativeResponse(body), request); err == nil {
+			t.Fatal("stream without caller request ID accepted")
+		}
+	})
+	t.Run("matching header alone", func(t *testing.T) {
+		body := "data: {\"model\":\"glm-test\",\"choices\":[{\"delta\":{\"content\":\"" + nonce + "\\n\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n"
+		client := nativeResponse(body)
+		client.response.Header.Set("X-Request-Id", request.ExpectedRequestID)
+		if _, err := RunNative(t.Context(), client, request); err == nil {
+			t.Fatal("header-only request correlation accepted")
+		}
+	})
+	t.Run("conflicting stream ID", func(t *testing.T) {
+		body := "data: {\"request_id\":\"other-request-123\",\"model\":\"glm-test\",\"choices\":[{\"delta\":{\"content\":\"" + nonce + "\\n\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n"
+		if _, err := RunNative(t.Context(), nativeResponse(body), request); err == nil {
+			t.Fatal("conflicting caller request ID accepted")
+		}
+	})
 }
 
 func TestRunNativeRejectsMissingFinishReason(t *testing.T) {
@@ -159,7 +199,7 @@ func nativeRequest(nonce string) NativeRequest {
 	if nonce == "" {
 		nonce = "NTM_ACK_0123456789abcdef0123456789abcdef"
 	}
-	return NativeRequest{Endpoint: NativeChatCompletionsEndpoint, Model: "glm-test", Prompt: "secret prompt; return " + nonce, ExpectedNonce: nonce, NativeAPIKey: "secret-key", ExplicitOptIn: true}
+	return NativeRequest{Endpoint: NativeChatCompletionsEndpoint, Model: "glm-test", Prompt: "secret prompt; return " + nonce, ExpectedNonce: nonce, ExpectedRequestID: "ntm-request-0123456789abcdef", NativeAPIKey: "secret-key", ExplicitOptIn: true}
 }
 
 func nativeResponse(body string) *nativeClient {

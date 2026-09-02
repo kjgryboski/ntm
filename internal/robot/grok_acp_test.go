@@ -65,7 +65,7 @@ func TestRunGrokACPOperationBindsNonceAndEmitsSafeReceipt(t *testing.T) {
 	if output.TokenUsage == nil || output.TokenUsage.Total == nil || *output.TokenUsage.Total != 33 || output.Cost == nil || output.Cost.Micro != 42 || output.ExitCode == nil || *output.ExitCode != 0 || output.CleanupState != "reaped" {
 		t.Fatalf("execution evidence = %+v", output)
 	}
-	if !strings.Contains(engine.request.Prompt, testGrokACPNonce) || engine.request.ExpectedNonce != testGrokACPNonce || engine.request.Model != "grok-code" {
+	if !strings.Contains(engine.request.Prompt, testGrokACPNonce) || engine.request.ExpectedNonce != testGrokACPNonce || engine.request.OperationID != "op-7" || engine.request.Model != "grok-code" {
 		t.Fatalf("nonce was not bound to outgoing request: %+v", engine.request)
 	}
 	if output.Model != "grok-code" {
@@ -156,6 +156,39 @@ func TestRunGrokACPOperationMapsTypedUnconfirmedAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestRunGrokACPOperationPreservesACPCancellationScopeAndLocalCleanup(t *testing.T) {
+	engine := &recordingGrokACPEngine{result: grok.Result{
+		State:               grok.StateCancelled,
+		ProviderSessionID:   "provider-session",
+		StopReason:          "cancelled",
+		CompletionConfirmed: true,
+		Cancellation: grok.ACPCancellationReceipt{
+			Requested:                   true,
+			NotificationWritten:         true,
+			SessionSHA256:               "session-digest",
+			OperationSHA256:             "operation-digest",
+			PromptRequestID:             4,
+			AgentACPAcknowledged:        true,
+			Acknowledgement:             "session_prompt_stop_reason_cancelled",
+			CloudInferenceStopConfirmed: false,
+		},
+		Cleanup: grok.ProcessCleanupReceipt{
+			LocalTermination: "residual_processes_detected",
+			ResidualPIDs:     []int32{101, 102},
+			Reaped:           true,
+		},
+	}, err: &grok.Error{Code: grok.ErrCancelled, Err: context.Canceled}}
+	output, err := RunGrokACPOperation(t.Context(), GrokACPOperationOptions{
+		Prompt: "hello", CWD: "/repo", OperationID: "op-cancel", Nonce: testGrokACPNonce, Identity: testGrokACPIdentity(t),
+	}, GrokACPOperationDeps{Engine: engine, Admission: allowingAdmission{}, Ledger: testGrokACPLedger(t)})
+	if err == nil || output.ErrorCode != "CANCELED" || output.State != grok.StateCancelled || output.FailureCode != grok.ErrCancelled {
+		t.Fatalf("cancellation output = %+v err=%v", output, err)
+	}
+	if !output.Cancellation.AgentACPAcknowledged || output.Cancellation.CloudInferenceStopConfirmed || output.Cancellation.OperationSHA256 != "operation-digest" || output.Cleanup.LocalTermination != "residual_processes_detected" || !slices.Equal(output.Cleanup.ResidualPIDs, []int32{101, 102}) || !output.Cleanup.Reaped {
+		t.Fatalf("cancellation/cleanup scope was not preserved: %+v", output)
+	}
+}
+
 func TestRunGrokACPOperationThreadsStructuredProviderMetadata(t *testing.T) {
 	input, outputTokens := int64(17), int64(29)
 	exitCode := -1
@@ -170,6 +203,8 @@ func TestRunGrokACPOperationThreadsStructuredProviderMetadata(t *testing.T) {
 		Usage:                   &grok.Usage{InputTokens: &input, OutputTokens: &outputTokens},
 		ToolEventCount:          2,
 		ToolEventsSHA256:        "event-sequence-sha256",
+		NonMessageUpdateCount:   5,
+		NonMessageUpdatesSHA256: "non-message-update-sequence-sha256",
 		ExitCode:                &exitCode,
 		CleanupState:            "reaped_after_termination",
 	}}
@@ -179,7 +214,7 @@ func TestRunGrokACPOperationThreadsStructuredProviderMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if output.Model != "grok-code" || output.TokenUsage == nil || output.TokenUsage.Input == nil || *output.TokenUsage.Input != 17 || output.TokenUsage.Output == nil || *output.TokenUsage.Output != 29 || output.TokenUsage.Total != nil || output.ToolEventCount != 2 || output.ToolEventsSHA256 != "event-sequence-sha256" || output.ExitCode == nil || *output.ExitCode != -1 || output.CleanupState != "reaped_after_termination" {
+	if output.Model != "grok-code" || output.TokenUsage == nil || output.TokenUsage.Input == nil || *output.TokenUsage.Input != 17 || output.TokenUsage.Output == nil || *output.TokenUsage.Output != 29 || output.TokenUsage.Total != nil || output.ToolEventCount != 2 || output.ToolEventsSHA256 != "event-sequence-sha256" || output.NonMessageUpdateCount != 5 || output.NonMessageUpdatesSHA256 != "non-message-update-sequence-sha256" || output.ExitCode == nil || *output.ExitCode != -1 || output.CleanupState != "reaped_after_termination" {
 		t.Fatalf("structured provider receipt = %+v", output)
 	}
 }
@@ -277,6 +312,21 @@ func TestRunGrokACPOperationRejectsCatalogOnlyModelEvidence(t *testing.T) {
 	}, GrokACPOperationDeps{Engine: engine, Admission: allowingAdmission{}, Ledger: testGrokACPLedger(t)})
 	if err == nil || output.Success || output.State != "identity_unconfirmed" || output.FailureCode != grok.ErrIdentityMismatch || output.Model != "" || output.ModelEvidence != "" {
 		t.Fatalf("catalog-only model evidence output = %+v, err = %v", output, err)
+	}
+}
+
+func TestGrokModelIdentityEvidenceConfirmedAcceptsTypedSessionModelState(t *testing.T) {
+	for evidence, want := range map[string]bool{
+		"completion_metadata":                             true,
+		"provider_session_notification_plus_exact_launch": true,
+		"session_config_option_plus_exact_launch":         true,
+		"session_model_state_plus_exact_launch":           true,
+		"provider_catalog_plus_exact_launch":              false,
+		"":                                                false,
+	} {
+		if got := grokModelIdentityEvidenceConfirmed(evidence); got != want {
+			t.Fatalf("grokModelIdentityEvidenceConfirmed(%q)=%v, want %v", evidence, got, want)
+		}
 	}
 }
 

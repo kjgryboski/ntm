@@ -231,3 +231,11 @@ func TestTerminateAndVerifyDistinguishesLocalTreeEvidence(t *testing.T) {
 		t.Fatalf("kill order=%v, want descendant before parent", i.killed)
 	}
 }
+
+func TestTerminateAndVerifyReportsAlreadyExitedWithoutOverclaimingTreeTermination(t *testing.T) {
+	i := &treeInspector{children: map[int32][]int32{}, live: map[int32]bool{10: false}}
+	r := terminateAndVerify(t.Context(), 10, i)
+	if r.LocalTermination != "already_exited_verified" || r.ProviderAcknowledged || len(r.ResidualPIDs) != 0 || len(i.killed) != 0 {
+		t.Fatalf("receipt: %+v killed=%v", r, i.killed)
+	}
+}

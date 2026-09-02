@@ -178,7 +178,7 @@ model = "YOUR_EXACT_GROK_MODEL"
 endpoint = "https://api.x.ai/v1"
 runtime = "grok"
 config_sha256 = "YOUR_64_CHARACTER_LOWERCASE_REDACTED_CONFIG_SHA256"
-command = "grok"
+command = "/usr/local/libexec/ntm/grok-1.0.13"
 automation_policy = "grok-readonly-ci"
 exact_target_only = true
 ```
@@ -194,12 +194,15 @@ ntm --robot-provider-capabilities
 The receipt is successful only when Grok reports structured completion and the
 assistant stream echoes the generated nonce exactly. It records only hashes,
 counts, provider session/model/usage metadata when supplied by ACP, and local
-exit/cleanup evidence when observable. A timeout after prompt acceptance is
-`DISPATCH_UNKNOWN`, not an invitation to replay blindly. ACP's local process
-termination/reap evidence is not an authoritative provider-cancellation receipt;
-the capability matrix currently marks provider cancellation as unavailable. NTM
-never serializes the prompt, nonce, credentials, raw output, or raw tool
-arguments in the receipt. Automated ACP starts with a minimal environment that
+exit/cleanup evidence when observable. When the caller cancels an accepted
+prompt, NTM sends the ACP `session/cancel` notification and accepts cancellation
+only when that exact original `session/prompt` response returns
+`stopReason=cancelled`. This is authoritative at the local Grok ACP-agent
+boundary, not proof that xAI stopped cloud inference. Local process-tree
+termination, residual-PID inspection, and reaping are recorded separately. A
+missing cancellation acknowledgement remains `DISPATCH_UNKNOWN`, not an
+invitation to replay blindly. NTM never serializes the prompt, nonce,
+credentials, raw output, or raw tool arguments in the receipt. Automated ACP starts with a minimal environment that
 explicitly removes `XAI_API_KEY` and all proxy variables (proxy URLs may embed
 credentials), then authenticates only with the local Grok CLI's `cached_token`;
 it fails with `GROK_ACP_CACHED_AUTH_UNAVAILABLE` when no cached login is offered.
@@ -218,8 +221,8 @@ tuple, but does not claim the opaque provider runtime independently proved
 them.
 
 Operation IDs are durable and binding-sensitive. The binding covers the exact
-provider identity, logical prompt hash, working-directory hash, executable
-hash, and compiled policy digest; the receipt separately hashes the exact
+provider identity, logical prompt hash, working-directory hash, canonical
+executable-path hash, and compiled policy digest; the receipt separately hashes the exact
 nonce-bound packet. This allows a normal retry with an omitted/generated nonce
 to replay the recorded safe outcome without another provider call. Conflicting reuse returns
 `IDEMPOTENCY_CONFLICT`; an abandoned in-progress operation remains
@@ -387,13 +390,37 @@ Grok has exactly two built-in unattended policies:
 The Grok requirements document is a system-owned bypass lock, not a
 per-project setting. An administrator/root process must install it once; the
 installer never overwrites a different existing document and verifies both
-digest and system-authoritative ownership:
+digest and system-authoritative ownership. Every live attestation revalidates
+the requirements file and its full root-owned, non-writable parent path before
+Grok inspects or Bubblewrap binds it:
 
 ```bash
 ntm provider policy requirements --policy=grok-readonly-ci --install --confirm
 # or, when the reviewed workspace-write envelope is needed:
 ntm provider policy requirements --policy=grok-workspace-write-ci --install --confirm
 ```
+
+Unattended Grok also requires a canonical system-authoritative executable rather
+than a user-updatable PATH entry. After reviewing the installed vendor binary,
+an administrator can place the pinned version at the path named by the profile:
+
+```bash
+sudo install -D -o root -g root -m 0755 "$(readlink -f "$(command -v grok)")" /usr/local/libexec/ntm/grok-1.0.13
+```
+
+NTM fails closed if that file or any parent directory is not root-owned and
+non-writable by unprivileged users. Updating Grok therefore requires an explicit
+reviewed replacement and a matching `runtime_version` update.
+
+Policy attestation requires more than parsing `grok inspect`. NTM verifies the
+root-owned digest and exact system-requirements source/layer, then canonicalizes
+the version-pinned Grok executable and requires both it and every parent
+directory to be root-owned and non-writable by unprivileged users. It starts
+that same system-authoritative binary inside a credential-free Bubblewrap
+namespace with no network and requests `--always-approve`. Automation is admitted only when the
+runtime emits the exact managed-policy refusal. This behavioral check also
+handles Grok 1.0.13's inspect-schema warning for the documented bypass-lock key
+without either ignoring the warning or making a provider request.
 
 Run `ntm provider doctor --profile=PROFILE` for the read-only report, or add
 `--online` for one bounded, no-tool identity/model probe. Doctor checks the
@@ -419,8 +446,9 @@ Native Grok ACP is the receipt-bearing one-shot route. For native headless
 lineage operations, use `ntm provider session resume` or `ntm provider session
 fork` with an exact Grok profile, `--session-id`, `--prompt`, and (when using
 the write policy) a linked disposable worktree. These commands additionally
-require a root-owned matching requirements document, a reviewed runtime-version
-pin with no drift, and the cross-process local shared capacity store. They emit
+require a root-owned matching requirements document, a canonical
+system-authoritative Grok executable, a reviewed runtime-version pin with no
+drift, and the cross-process local shared capacity store. They emit
 nonce-bound receipts that bind identity, policy, working-directory hash,
 admission, action, and child-session lineage without echoing the provider
 session ID or preserving the prompt. Cancellation and cleanup are authoritative
@@ -452,10 +480,13 @@ operation identifier:
 ntm provider run --profile=zai-native-no-tools --operation-id=YOUR_UNIQUE_OPERATION_ID --prompt='bounded no-tool task' --live
 ```
 
-Its redacted receipt binds the operation, exact identity, and request outcome;
-it does not establish provider-side cancellation, resume, or coding-policy
-authority. Do not use a Coding Plan credential in this lane, and do not infer a
-live Z.ai qualification from this command.
+Its redacted receipt binds the operation, exact identity, and request outcome.
+NTM derives a non-secret `request_id` from that durable binding, sends it in
+the API body, and requires the stream itself to echo the exact value; response
+headers alone are not completion evidence. This does not establish
+provider-side cancellation, resume, or coding-policy authority. Do not use a
+Coding Plan credential in this lane, and do not infer a live Z.ai qualification
+from this command.
 
 Run the live suite explicitly in its disposable repository:
 

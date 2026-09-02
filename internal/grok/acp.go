@@ -65,6 +65,15 @@ const (
 	// nonce-bound acknowledgement required by the orchestrator's contract.
 	ErrAcknowledgementUnconfirmed ErrorCode = "GROK_ACP_ACK_UNCONFIRMED"
 	ErrIdentityMismatch           ErrorCode = "GROK_ACP_IDENTITY_MISMATCH"
+	// ErrCancelled is returned only after this ACP agent acknowledged the
+	// cancellation notification by completing the original session/prompt call
+	// with stopReason=cancelled. It never claims that xAI stopped any upstream
+	// cloud inference that may already have been accepted.
+	ErrCancelled ErrorCode = "GROK_ACP_CANCELLED"
+	// ErrCancellationUnconfirmed means NTM requested cancellation, but the
+	// original prompt response did not provide the exact ACP acknowledgement
+	// required to bind that request to the active session and operation.
+	ErrCancellationUnconfirmed ErrorCode = "GROK_ACP_CANCEL_ACK_UNCONFIRMED"
 )
 
 // Error adds a machine-readable classification without exposing protocol
@@ -99,6 +108,7 @@ type Process interface {
 	Stderr() io.Reader
 	Wait() error
 	Kill() error
+	PID() int32
 }
 
 // Runner starts the provider process. Tests supply a transcript-backed fake;
@@ -111,8 +121,11 @@ type Runner interface {
 // OSRunner starts the official local Grok CLI.
 type OSRunner struct{}
 
-func (OSRunner) Start(ctx context.Context, spec StartSpec) (Process, error) {
-	cmd := exec.CommandContext(ctx, spec.Binary, spec.Args...)
+func (OSRunner) Start(_ context.Context, spec StartSpec) (Process, error) {
+	// Run owns cancellation after session/prompt becomes replay-unsafe. Do not
+	// bind this child to ctx: CommandContext would kill it before Run can send
+	// the ACP session/cancel notification and wait for the original response.
+	cmd := exec.Command(spec.Binary, spec.Args...)
 	cmd.Dir = spec.CWD
 	cmd.Env = minimalGrokEnvironment(os.Environ())
 	stdin, err := cmd.StdinPipe()
@@ -144,6 +157,12 @@ func (p osProcess) Stdin() io.WriteCloser { return p.stdin }
 func (p osProcess) Stdout() io.Reader     { return p.stdout }
 func (p osProcess) Stderr() io.Reader     { return p.stderr }
 func (p osProcess) Wait() error           { return p.cmd.Wait() }
+func (p osProcess) PID() int32 {
+	if p.cmd == nil || p.cmd.Process == nil {
+		return 0
+	}
+	return int32(p.cmd.Process.Pid)
+}
 func (p osProcess) Kill() error {
 	if p.cmd.Process == nil {
 		return nil
@@ -164,9 +183,19 @@ type Request struct {
 	// orchestrator. It is never retained in Result; only the verified boolean
 	// is exposed after a bounded streaming match over assistant chunks.
 	ExpectedNonce string
+	// OperationID is a caller-owned durable identifier when one exists. It is
+	// hashed in cancellation evidence; NTM never emits the raw value here.
+	// Empty is allowed for direct library callers, whose cancellation receipt is
+	// still bound to the generated ACP session and original prompt request ID.
+	OperationID string
 	// PostResponseQuietWindow bounds the drain of updates that are emitted
 	// after session/prompt completes. Zero selects the safe default.
 	PostResponseQuietWindow time.Duration
+	// CancellationGracePeriod bounds how long NTM waits for the original
+	// session/prompt response after writing the ACP session/cancel
+	// notification. Zero selects the safe default. It is not a cloud-inference
+	// deadline; timeout leaves the accepted operation outcome unknown.
+	CancellationGracePeriod time.Duration
 	// AutomationPolicyArgs are the named, per-invocation least-privilege
 	// --allow/--deny flags placed before `agent stdio`. Raw approval bypasses
 	// such as --always-approve are rejected rather than silently accepted.
@@ -190,26 +219,45 @@ type StderrDigest struct {
 // Result is a redaction-safe provider receipt. Assistant output is never
 // retained, only counted and hashed.
 type Result struct {
-	Success                 bool         `json:"success"`
-	State                   string       `json:"state"`
-	FailureCode             ErrorCode    `json:"failure_code,omitempty"`
-	ProviderSessionID       string       `json:"provider_session_id,omitempty"`
-	StopReason              string       `json:"stop_reason,omitempty"`
-	CompletionConfirmed     bool         `json:"completion_confirmed"`
-	AcknowledgementVerified bool         `json:"acknowledgement_verified"`
-	AssistantTextChunks     int          `json:"assistant_text_chunks"`
-	AssistantTextBytes      int64        `json:"assistant_text_bytes"`
-	OutputSHA256            string       `json:"output_sha256,omitempty"`
-	ToolEventCount          int          `json:"tool_event_count"`
-	ToolEventsSHA256        string       `json:"tool_events_sha256"`
-	Model                   string       `json:"model,omitempty"`
-	ModelEvidence           string       `json:"model_evidence,omitempty"`
-	Usage                   *Usage       `json:"usage,omitempty"`
-	ExitCode                *int         `json:"exit_code,omitempty"`
-	CleanupState            string       `json:"cleanup_state,omitempty"`
-	Stderr                  StderrDigest `json:"stderr"`
-	StartedAt               time.Time    `json:"started_at"`
-	CompletedAt             time.Time    `json:"completed_at"`
+	Success                 bool      `json:"success"`
+	State                   string    `json:"state"`
+	FailureCode             ErrorCode `json:"failure_code,omitempty"`
+	ProviderSessionID       string    `json:"provider_session_id,omitempty"`
+	StopReason              string    `json:"stop_reason,omitempty"`
+	CompletionConfirmed     bool      `json:"completion_confirmed"`
+	AcknowledgementVerified bool      `json:"acknowledgement_verified"`
+	AssistantTextChunks     int       `json:"assistant_text_chunks"`
+	AssistantTextBytes      int64     `json:"assistant_text_bytes"`
+	OutputSHA256            string    `json:"output_sha256,omitempty"`
+	// ToolEventCount and ToolEventsSHA256 cover only the ACP tool_call and
+	// tool_call_update session-update variants. They never include raw tool
+	// arguments, results, or any other update payload.
+	ToolEventCount   int    `json:"tool_event_count"`
+	ToolEventsSHA256 string `json:"tool_events_sha256"`
+	// NonMessageUpdateCount and NonMessageUpdatesSHA256 retain a redaction-safe
+	// name-only sequence of every session/update other than agent_message_chunk,
+	// including tool updates and unknown or malformed updates. This prevents
+	// lifecycle, usage, plan, and thought updates from being mislabeled as tools.
+	NonMessageUpdateCount   int    `json:"non_message_update_count"`
+	NonMessageUpdatesSHA256 string `json:"non_message_updates_sha256"`
+	Model                   string `json:"model,omitempty"`
+	ModelEvidence           string `json:"model_evidence,omitempty"`
+	// Authenticated records only a completed ACP session whose cached_token
+	// authenticate request succeeded. It identifies neither an account nor an
+	// entitlement, and therefore is safe to expose in a redacted receipt.
+	Authenticated          bool   `json:"authenticated"`
+	AuthenticationEvidence string `json:"authentication_evidence,omitempty"`
+	Usage                  *Usage `json:"usage,omitempty"`
+	ExitCode               *int   `json:"exit_code,omitempty"`
+	CleanupState           string `json:"cleanup_state,omitempty"`
+	// Cancellation is distinct from Cleanup. ACP acknowledgement proves only
+	// that the local Grok agent completed this session/prompt as cancelled;
+	// Cleanup proves local process-tree control and reaping separately.
+	Cancellation ACPCancellationReceipt `json:"cancellation"`
+	Cleanup      ProcessCleanupReceipt  `json:"cleanup"`
+	Stderr       StderrDigest           `json:"stderr"`
+	StartedAt    time.Time              `json:"started_at"`
+	CompletedAt  time.Time              `json:"completed_at"`
 }
 
 const (
@@ -217,7 +265,39 @@ const (
 	StateAbortedSafe    = "aborted_safe"
 	StateOutcomeUnknown = "outcome_unknown"
 	StateFailed         = "failed"
+	StateCancelled      = "cancelled_acknowledged"
 )
+
+const (
+	DefaultCancellationGracePeriod = 3 * time.Second
+	maxCancellationGracePeriod     = 10 * time.Second
+)
+
+// ACPCancellationReceipt is narrowly scoped evidence for a cancellation
+// request. ACP acknowledgement is intentionally not labelled provider-cloud
+// cancellation: the protocol proves only that the Grok ACP agent completed
+// the exact original prompt with stopReason=cancelled.
+type ACPCancellationReceipt struct {
+	Requested                   bool      `json:"requested"`
+	NotificationWritten         bool      `json:"notification_written"`
+	SessionSHA256               string    `json:"session_sha256,omitempty"`
+	OperationSHA256             string    `json:"operation_sha256,omitempty"`
+	PromptRequestID             int       `json:"prompt_request_id,omitempty"`
+	AgentACPAcknowledged        bool      `json:"agent_acp_acknowledged"`
+	Acknowledgement             string    `json:"acknowledgement,omitempty"`
+	CloudInferenceStopConfirmed bool      `json:"cloud_inference_stop_confirmed"`
+	RequestedAt                 time.Time `json:"requested_at,omitempty"`
+	AcknowledgedAt              time.Time `json:"acknowledged_at,omitempty"`
+}
+
+// ProcessCleanupReceipt describes only local process ownership. The process
+// tree and reaping facts must not be read as xAI/ACP cancellation evidence.
+type ProcessCleanupReceipt struct {
+	LocalTermination string    `json:"local_termination"`
+	ResidualPIDs     []int32   `json:"residual_pids"`
+	Reaped           bool      `json:"reaped"`
+	ObservedAt       time.Time `json:"observed_at"`
+}
 
 type rpcMessage struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -244,7 +324,15 @@ type rpcEvent struct {
 // because the provider may continue the already-accepted request.
 func Run(ctx context.Context, runner Runner, req Request) (result Result, returnErr error) {
 	started := time.Now().UTC()
-	result = Result{State: StateFailed, StartedAt: started}
+	result = Result{
+		State:        StateFailed,
+		StartedAt:    started,
+		Cancellation: ACPCancellationReceipt{},
+		Cleanup: ProcessCleanupReceipt{
+			LocalTermination: "not_started",
+			ResidualPIDs:     []int32{},
+		},
+	}
 	if ctx == nil {
 		return finishFailure(result, ErrInvalidRequest, errors.New("context is required"))
 	}
@@ -297,20 +385,29 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	events := readRPCEvents(proc.Stdout())
 
 	// Closing stdin and reaping the child is mandatory even after a confirmed
-	// reply: this is a one-shot adapter, not a daemon owner.
+	// reply: this is a one-shot adapter, not a daemon owner. This local cleanup
+	// is deliberately recorded separately from any ACP cancellation receipt.
 	defer func() {
 		_ = proc.Stdin().Close()
-		killErr := proc.Kill()
+		result.Cleanup = cleanupACPProcess(proc)
 		waitErr := proc.Wait()
-		result.CleanupState = "reaped"
-		if killErr == nil {
-			result.CleanupState = "reaped_after_termination"
+		_, exited := exitCodeFromError(waitErr)
+		if waitErr == nil || exited {
+			result.Cleanup.Reaped = true
+			// A killed process can remain visible as a zombie until Wait reaps
+			// it. Recheck only the residual PIDs already observed before Wait;
+			// never discover or claim control over a fresh process tree here.
+			result.Cleanup = reconcileACPResidualsAfterReap(result.Cleanup)
+		}
+		result.CleanupState = result.Cleanup.LocalTermination
+		if result.Cleanup.Reaped {
+			result.CleanupState += "_and_reaped"
 		}
 		if waitErr != nil {
 			if exitCode, ok := exitCodeFromError(waitErr); ok {
 				result.ExitCode = &exitCode
 			} else {
-				result.CleanupState = "wait_failed"
+				result.CleanupState = result.Cleanup.LocalTermination + "_wait_failed"
 			}
 		}
 		result.Stderr = <-stderrDone
@@ -348,12 +445,17 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	if err != nil {
 		return finishFailure(result, ErrCachedAuthUnavailable, err)
 	}
+	cachedTokenAuthenticated := false
 	if _, err := call("authenticate", authenticateParams{MethodID: methodID, Meta: map[string]bool{"headless": true}}); err != nil {
 		if isRPCError(err) {
 			return finishFailure(result, ErrAuthFailed, err)
 		}
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
 	}
+	// Do not expose this as authenticated until a terminal session/prompt
+	// completion is also observed below. A successful authenticate RPC alone
+	// does not establish that the cache can serve a completed session.
+	cachedTokenAuthenticated = true
 
 	newRaw, err := call("session/new", sessionNewParams{CWD: req.CWD, MCPServers: []any{}})
 	if err != nil {
@@ -368,6 +470,8 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	}
 	result.ProviderSessionID = session.SessionID
 	updates.providerSessionID = session.SessionID
+	sessionConfigModel, sessionConfigModelObserved := sessionConfigExactModel(session.ConfigOptions, strings.TrimSpace(req.Model))
+	sessionModelStateModel, sessionModelStateObserved := sessionModelsExactModel(session.Models, strings.TrimSpace(req.Model))
 
 	promptID := nextID
 	nextID++
@@ -378,13 +482,58 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	if err != nil {
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
 	}
-	promptRaw, err := waitResponse(ctx, events, promptID, &updates)
+	promptRaw, cancellation, err := waitPromptResponseOrCancellation(
+		ctx,
+		proc.Stdin(),
+		events,
+		promptID,
+		session.SessionID,
+		req.OperationID,
+		&updates,
+		cancellationGracePeriod(req.CancellationGracePeriod),
+	)
+	result.Cancellation = cancellation
 	if err != nil {
+		if cancellation.Requested {
+			return finishCancellationFailure(result, ErrOutcomeUnknown, err)
+		}
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
 	}
 	var prompt sessionPromptResult
 	if err := json.Unmarshal(promptRaw, &prompt); err != nil {
 		return finishFailure(result, ErrProtocol, fmt.Errorf("decode session/prompt result: %w", err))
+	}
+	// Once a terminal response has been matched to the original prompt request,
+	// retain only the receipt-safe metadata before deciding whether it was a
+	// normal completion or a cancellation acknowledgement.
+	result.StopReason = prompt.StopReason
+	result.Model = strings.TrimSpace(prompt.Model)
+	if result.Model != "" {
+		result.ModelEvidence = "completion_metadata"
+	} else if updates.sessionModelObserved {
+		result.Model = strings.TrimSpace(req.Model)
+		result.ModelEvidence = "provider_session_notification_plus_exact_launch"
+	} else if sessionConfigModelObserved {
+		result.Model = sessionConfigModel
+		result.ModelEvidence = "session_config_option_plus_exact_launch"
+	} else if sessionModelStateObserved {
+		result.Model = sessionModelStateModel
+		result.ModelEvidence = "session_model_state_plus_exact_launch"
+	}
+	result.Usage = prompt.Usage.canonical()
+	if cancellation.Requested {
+		result.CompletionConfirmed = strings.TrimSpace(result.StopReason) != ""
+		applyUpdateReceipt(&result, &updates, outputHasher)
+		if result.StopReason != "cancelled" {
+			return finishCancellationFailure(result, ErrCancellationUnconfirmed, errors.New("ACP session/cancel was not acknowledged by the original session/prompt response with stopReason=cancelled"))
+		}
+		result.Cancellation.AgentACPAcknowledged = true
+		result.Cancellation.Acknowledgement = "session_prompt_stop_reason_cancelled"
+		result.Cancellation.AcknowledgedAt = time.Now().UTC()
+		// No field in the ACP cancellation acknowledgement proves whether a
+		// previously accepted cloud inference request was stopped upstream.
+		result.Cancellation.CloudInferenceStopConfirmed = false
+		return finishCancellationFailure(result, ErrCancelled, context.Cause(ctx))
 	}
 	if strings.TrimSpace(prompt.StopReason) == "" {
 		return finishFailure(result, ErrOutcomeUnknown, errors.New("session/prompt completion omitted stopReason"))
@@ -392,29 +541,33 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	if err := drainPostResponseUpdates(ctx, events, &updates, postResponseQuietWindow(req.PostResponseQuietWindow)); err != nil {
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
 	}
-	updates.nonce.Finalize()
 	result.CompletionConfirmed = true
-	result.StopReason = prompt.StopReason
+	applyUpdateReceipt(&result, &updates, outputHasher)
+	if req.ExpectedNonce != "" && !result.AcknowledgementVerified {
+		return finishFailure(result, ErrAcknowledgementUnconfirmed, errors.New("session/prompt completion omitted the required standalone nonce acknowledgement"))
+	}
+	result.Success = true
+	result.State = StateCompleted
+	if cachedTokenAuthenticated {
+		result.Authenticated = true
+		result.AuthenticationEvidence = "cached_token_authenticate_plus_completed_session"
+	}
+	return result, nil
+}
+
+func applyUpdateReceipt(result *Result, updates *updateAccumulator, outputHasher hash.Hash) {
+	if result == nil || updates == nil || outputHasher == nil {
+		return
+	}
+	updates.nonce.Finalize()
 	result.AssistantTextChunks = updates.chunks
 	result.AssistantTextBytes = updates.bytes
 	result.AcknowledgementVerified = updates.nonce.verified
 	result.OutputSHA256 = hex.EncodeToString(outputHasher.Sum(nil))
 	result.ToolEventCount = updates.toolEventCount
 	result.ToolEventsSHA256 = hex.EncodeToString(updates.toolEventHasher.Sum(nil))
-	result.Model = strings.TrimSpace(prompt.Model)
-	if result.Model != "" {
-		result.ModelEvidence = "completion_metadata"
-	} else if updates.sessionModelObserved {
-		result.Model = strings.TrimSpace(req.Model)
-		result.ModelEvidence = "provider_session_notification_plus_exact_launch"
-	}
-	result.Usage = prompt.Usage.canonical()
-	if req.ExpectedNonce != "" && !result.AcknowledgementVerified {
-		return finishFailure(result, ErrAcknowledgementUnconfirmed, errors.New("session/prompt completion omitted the required standalone nonce acknowledgement"))
-	}
-	result.Success = true
-	result.State = StateCompleted
-	return result, nil
+	result.NonMessageUpdateCount = updates.nonMessageUpdateCount
+	result.NonMessageUpdatesSHA256 = hex.EncodeToString(updates.nonMessageUpdateHasher.Sum(nil))
 }
 
 func postResponseQuietWindow(value time.Duration) time.Duration {
@@ -425,6 +578,101 @@ func postResponseQuietWindow(value time.Duration) time.Duration {
 		return maxPostResponseQuietWindow
 	}
 	return value
+}
+
+func cancellationGracePeriod(value time.Duration) time.Duration {
+	if value <= 0 {
+		return DefaultCancellationGracePeriod
+	}
+	if value > maxCancellationGracePeriod {
+		return maxCancellationGracePeriod
+	}
+	return value
+}
+
+type sessionCancelParams struct {
+	SessionID string `json:"sessionId"`
+}
+
+// waitPromptResponseOrCancellation keeps one reader for ACP stdout. Once the
+// original session/prompt request has been written, caller-context
+// cancellation first writes the ACP v1 session/cancel notification and then
+// waits on a fresh bounded context for the response with that *same* prompt
+// request ID. A response for any other request is rejected by waitResponse.
+func waitPromptResponseOrCancellation(
+	ctx context.Context,
+	writer io.Writer,
+	events <-chan rpcEvent,
+	promptID int,
+	sessionID string,
+	operationID string,
+	updates *updateAccumulator,
+	grace time.Duration,
+) (json.RawMessage, ACPCancellationReceipt, error) {
+	for {
+		// Prefer a response that is already available. This prevents an
+		// operator interrupt racing a completed prompt from rewriting a known
+		// terminal outcome as a cancellation attempt.
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return nil, ACPCancellationReceipt{}, io.EOF
+			}
+			raw, done, err := consumeResponseEvent(event, promptID, updates)
+			if err != nil || done {
+				return raw, ACPCancellationReceipt{}, err
+			}
+			continue
+		default:
+		}
+
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return nil, ACPCancellationReceipt{}, io.EOF
+			}
+			raw, done, err := consumeResponseEvent(event, promptID, updates)
+			if err != nil || done {
+				return raw, ACPCancellationReceipt{}, err
+			}
+		case <-ctx.Done():
+			cancellation := ACPCancellationReceipt{
+				Requested:       true,
+				SessionSHA256:   acpCancellationHash(sessionID),
+				OperationSHA256: acpOperationHash(operationID, sessionID, promptID),
+				PromptRequestID: promptID,
+				RequestedAt:     time.Now().UTC(),
+			}
+			cancelCtx, cancel := context.WithTimeout(context.Background(), grace)
+			written, err := writeNotificationWithEvidence(cancelCtx, writer, "session/cancel", sessionCancelParams{SessionID: sessionID})
+			cancellation.NotificationWritten = written
+			if err != nil {
+				cancel()
+				return nil, cancellation, fmt.Errorf("write ACP session/cancel notification: %w", err)
+			}
+			raw, err := waitResponse(cancelCtx, events, promptID, updates)
+			cancel()
+			if err != nil {
+				return nil, cancellation, fmt.Errorf("wait for original ACP session/prompt cancellation response: %w", err)
+			}
+			return raw, cancellation, nil
+		}
+	}
+}
+
+func acpCancellationHash(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+// acpOperationHash makes the cancellation receipt bind both the durable
+// caller operation (when present) and the exact ACP session/prompt request.
+// The source identifiers are never retained in the receipt.
+func acpOperationHash(operationID, sessionID string, promptID int) string {
+	return acpCancellationHash(fmt.Sprintf("%s\x00%s\x00%d", operationID, sessionID, promptID))
 }
 
 // drainPostResponseUpdates receives all notifications that arrive before one
@@ -501,6 +749,22 @@ func finishFailure(result Result, code ErrorCode, err error) (Result, error) {
 	return result, &Error{Code: code, Err: err}
 }
 
+func finishCancellationFailure(result Result, code ErrorCode, err error) (Result, error) {
+	result.Success = false
+	result.FailureCode = code
+	if code == ErrCancelled {
+		result.State = StateCancelled
+	} else {
+		// A cancellation notification without the required matching original
+		// prompt response leaves the accepted provider operation unknown.
+		result.State = StateOutcomeUnknown
+	}
+	if result.CompletedAt.IsZero() {
+		result.CompletedAt = time.Now().UTC()
+	}
+	return result, &Error{Code: code, Err: err}
+}
+
 func contextAwareFailure(result Result, promptAccepted bool, err error) (Result, error) {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		if promptAccepted {
@@ -512,6 +776,92 @@ func contextAwareFailure(result Result, promptAccepted bool, err error) (Result,
 		return finishFailure(result, ErrProvider, err)
 	}
 	return finishFailure(result, ErrProtocol, err)
+}
+
+func cleanupACPProcess(proc Process) ProcessCleanupReceipt {
+	return cleanupACPProcessWithTerminator(proc, TerminateAndVerify)
+}
+
+func cleanupACPProcessWithTerminator(proc Process, terminate func(context.Context, int32) CancellationReceipt) ProcessCleanupReceipt {
+	receipt := ProcessCleanupReceipt{
+		LocalTermination: "unsupported",
+		ResidualPIDs:     []int32{},
+		ObservedAt:       time.Now().UTC(),
+	}
+	if proc == nil || terminate == nil {
+		return receipt
+	}
+	pid := proc.PID()
+	if pid > 0 {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		terminated := terminate(cleanupCtx, pid)
+		cancel()
+		receipt.LocalTermination = terminated.LocalTermination
+		receipt.ResidualPIDs = append(receipt.ResidualPIDs, terminated.ResidualPIDs...)
+		receipt.ObservedAt = terminated.ObservedAt
+		// A failed/incomplete tree inspection must not leave the owned parent
+		// running. This fallback does not upgrade the tree receipt: residuals
+		// stay explicit and only the parent kill was attempted.
+		if receipt.LocalTermination != "observed_tree_terminated_verified" && receipt.LocalTermination != "already_exited_verified" {
+			if err := proc.Kill(); err != nil {
+				receipt.LocalTermination += "_parent_kill_failed"
+			}
+		}
+		return receipt
+	}
+	// Test doubles and platforms without a PID cannot prove a complete tree,
+	// but still need a best-effort parent termination before Wait can reap it.
+	if err := proc.Kill(); err != nil {
+		receipt.LocalTermination = "parent_termination_failed"
+	}
+	return receipt
+}
+
+const postReapResidualRecheckWindow = 250 * time.Millisecond
+
+// reconcileACPResidualsAfterReap retries only PIDs that the original
+// termination pass already observed as residual. In particular, it never
+// walks the process tree again: reaping the owned root may remove a zombie,
+// but does not authorize discovery or control of any subsequently appearing
+// process. A successful recheck proves local process cleanup only.
+func reconcileACPResidualsAfterReap(receipt ProcessCleanupReceipt) ProcessCleanupReceipt {
+	return reconcileACPResidualsAfterReapWithInspector(receipt, osInspector{}, postReapResidualRecheckWindow)
+}
+
+func reconcileACPResidualsAfterReapWithInspector(receipt ProcessCleanupReceipt, inspector ProcessInspector, window time.Duration) ProcessCleanupReceipt {
+	if receipt.LocalTermination != "residual_processes_detected" || len(receipt.ResidualPIDs) == 0 || !receipt.Reaped || inspector == nil {
+		return receipt
+	}
+	observed := append([]int32{}, receipt.ResidualPIDs...)
+	check := func() bool {
+		remaining := remainingPIDs(observed, inspector)
+		if len(remaining) != 0 {
+			receipt.ResidualPIDs = remaining
+			return false
+		}
+		receipt.LocalTermination = "observed_tree_terminated_verified"
+		receipt.ResidualPIDs = []int32{}
+		receipt.ObservedAt = time.Now().UTC()
+		return true
+	}
+	if check() || window <= 0 {
+		return receipt
+	}
+
+	deadline := time.NewTimer(window)
+	defer deadline.Stop()
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-deadline.C:
+			return receipt
+		case <-tick.C:
+			if check() {
+				return receipt
+			}
+		}
+	}
 }
 
 type initializeParams struct {
@@ -538,7 +888,91 @@ type sessionNewParams struct {
 }
 
 type sessionNewResult struct {
-	SessionID string `json:"sessionId"`
+	SessionID     string                `json:"sessionId"`
+	ConfigOptions []sessionConfigOption `json:"configOptions"`
+	Models        json.RawMessage       `json:"models"`
+}
+
+// sessionConfigOption retains only the wire fields needed to bind a model to
+// one exact ACP session. The raw values prevent unrelated or future option
+// shapes from becoming a decoding or identity authority.
+type sessionConfigOption struct {
+	Category     string          `json:"category"`
+	Type         string          `json:"type"`
+	CurrentValue json.RawMessage `json:"currentValue"`
+	Options      json.RawMessage `json:"options"`
+}
+
+// sessionConfigExactModel accepts only the stable ACP select option dedicated
+// to the model category. A catalog, display name, model-like option id, or an
+// ambiguous duplicate cannot establish the model that served this session.
+func sessionConfigExactModel(configOptions []sessionConfigOption, requested string) (string, bool) {
+	if requested == "" {
+		return "", false
+	}
+	var modelOption *sessionConfigOption
+	for index := range configOptions {
+		option := &configOptions[index]
+		if option.Category != "model" {
+			continue
+		}
+		if modelOption != nil {
+			return "", false
+		}
+		modelOption = option
+	}
+	if modelOption == nil || modelOption.Type != "select" {
+		return "", false
+	}
+	var currentValue string
+	if json.Unmarshal(modelOption.CurrentValue, &currentValue) != nil || currentValue != requested {
+		return "", false
+	}
+	var options []struct {
+		Value string `json:"value"`
+	}
+	if json.Unmarshal(modelOption.Options, &options) != nil {
+		return "", false
+	}
+	matches := 0
+	for _, option := range options {
+		if option.Value == currentValue {
+			matches++
+		}
+	}
+	if matches != 1 {
+		return "", false
+	}
+	return currentValue, true
+}
+
+// sessionModelsExactModel accepts only Grok's top-level typed session model
+// state. It deliberately ignores vendor metadata and any nested lookalikes:
+// currentModelId must be the exact requested launch model and that modelId must
+// appear exactly once in availableModels.
+func sessionModelsExactModel(raw json.RawMessage, requested string) (string, bool) {
+	if len(raw) == 0 || requested == "" {
+		return "", false
+	}
+	var state struct {
+		CurrentModelID  string `json:"currentModelId"`
+		AvailableModels []struct {
+			ModelID string `json:"modelId"`
+		} `json:"availableModels"`
+	}
+	if json.Unmarshal(raw, &state) != nil || state.CurrentModelID != requested {
+		return "", false
+	}
+	matches := 0
+	for _, model := range state.AvailableModels {
+		if model.ModelID == state.CurrentModelID {
+			matches++
+		}
+	}
+	if matches != 1 {
+		return "", false
+	}
+	return state.CurrentModelID, true
 }
 
 type promptPart struct {
@@ -640,6 +1074,34 @@ func writeRequestWithEvidence(ctx context.Context, writer io.Writer, id int, met
 	return true, nil
 }
 
+// writeNotificationWithEvidence writes a JSON-RPC notification (no id) and
+// returns whether any byte entered the local ACP pipe. That is delivery to the
+// local Grok agent only; its separate session/prompt response is the sole
+// acknowledgement accepted by the cancellation contract.
+func writeNotificationWithEvidence(ctx context.Context, writer io.Writer, method string, params any) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	payload, err := json.Marshal(struct {
+		JSONRPC string `json:"jsonrpc"`
+		Method  string `json:"method"`
+		Params  any    `json:"params"`
+	}{JSONRPC: "2.0", Method: method, Params: params})
+	if err != nil {
+		return false, fmt.Errorf("encode %s notification: %w", method, err)
+	}
+	payload = append(payload, '\n')
+	written, err := writer.Write(payload)
+	mayHaveReachedAgent := written > 0
+	if err != nil {
+		return mayHaveReachedAgent, fmt.Errorf("write %s notification: %w", method, err)
+	}
+	if written != len(payload) {
+		return mayHaveReachedAgent, fmt.Errorf("write %s notification: %w", method, io.ErrShortWrite)
+	}
+	return true, nil
+}
+
 func readRPCEvents(reader io.Reader) <-chan rpcEvent {
 	events := make(chan rpcEvent, 1)
 	go func() {
@@ -666,7 +1128,6 @@ func readRPCEvents(reader io.Reader) <-chan rpcEvent {
 }
 
 func waitResponse(ctx context.Context, events <-chan rpcEvent, requestID int, updates *updateAccumulator) (json.RawMessage, error) {
-	wantID := fmt.Sprintf("%d", requestID)
 	for {
 		select {
 		case <-ctx.Done():
@@ -678,29 +1139,42 @@ func waitResponse(ctx context.Context, events <-chan rpcEvent, requestID int, up
 			if event.err != nil {
 				return nil, event.err
 			}
-			if event.message.Method == "session/update" {
-				updates.observe(event.message.Params)
-				continue
+			raw, done, err := consumeResponseEvent(event, requestID, updates)
+			if err != nil || done {
+				return raw, err
 			}
-			if isBenignACPNotification(event.message) {
-				updates.observeVendorNotification(event.message.Method, event.message.Params)
-				continue
-			}
-			if event.message.Method != "" {
-				return nil, fmt.Errorf("unexpected ACP notification %q", event.message.Method)
-			}
-			if string(event.message.ID) != wantID {
-				return nil, fmt.Errorf("unexpected ACP response id %s, want %s", string(event.message.ID), wantID)
-			}
-			if event.message.Error != nil {
-				return nil, &providerError{message: event.message.Error.Message}
-			}
-			if len(event.message.Result) == 0 {
-				return nil, errors.New("ACP response omitted both result and error")
-			}
-			return event.message.Result, nil
 		}
 	}
+}
+
+// consumeResponseEvent processes notifications and accepts a response only
+// when it is bound to the exact request ID the caller is awaiting.
+func consumeResponseEvent(event rpcEvent, requestID int, updates *updateAccumulator) (json.RawMessage, bool, error) {
+	if event.err != nil {
+		return nil, false, event.err
+	}
+	if event.message.Method == "session/update" {
+		updates.observe(event.message.Params)
+		return nil, false, nil
+	}
+	if isBenignACPNotification(event.message) {
+		updates.observeVendorNotification(event.message.Method, event.message.Params)
+		return nil, false, nil
+	}
+	if event.message.Method != "" {
+		return nil, false, fmt.Errorf("unexpected ACP notification %q", event.message.Method)
+	}
+	wantID := fmt.Sprintf("%d", requestID)
+	if string(event.message.ID) != wantID {
+		return nil, false, fmt.Errorf("unexpected ACP response id %s, want %s", string(event.message.ID), wantID)
+	}
+	if event.message.Error != nil {
+		return nil, false, &providerError{message: event.message.Error.Message}
+	}
+	if len(event.message.Result) == 0 {
+		return nil, false, errors.New("ACP response omitted both result and error")
+	}
+	return event.message.Result, true, nil
 }
 
 // isBenignACPNotification recognizes xAI's vendor-extension notification
@@ -728,20 +1202,22 @@ func isRPCError(err error) bool {
 }
 
 type updateAccumulator struct {
-	hasher               io.Writer
-	chunks               int
-	bytes                int64
-	nonce                nonceMatcher
-	toolEventHasher      hash.Hash
-	toolEventCount       int
-	expectedModel        string
-	sessionModelObserved bool
-	providerSessionID    string
+	hasher                 io.Writer
+	chunks                 int
+	bytes                  int64
+	nonce                  nonceMatcher
+	toolEventHasher        hash.Hash
+	toolEventCount         int
+	nonMessageUpdateHasher hash.Hash
+	nonMessageUpdateCount  int
+	expectedModel          string
+	sessionModelObserved   bool
+	providerSessionID      string
 }
 
 func newUpdateAccumulator(hasher io.Writer, nonce, expectedModel string) updateAccumulator {
 	return updateAccumulator{
-		hasher: hasher, nonce: newNonceMatcher(nonce), toolEventHasher: sha256.New(),
+		hasher: hasher, nonce: newNonceMatcher(nonce), toolEventHasher: sha256.New(), nonMessageUpdateHasher: sha256.New(),
 		expectedModel: strings.TrimSpace(expectedModel),
 	}
 }
@@ -783,7 +1259,7 @@ func (a *updateAccumulator) observe(params json.RawMessage) {
 		} `json:"update"`
 	}
 	if json.Unmarshal(params, &envelope) != nil {
-		a.recordToolEvent("unknown")
+		a.recordNonMessageUpdate("unknown")
 		return
 	}
 	if envelope.Update.SessionUpdate != "agent_message_chunk" {
@@ -791,7 +1267,10 @@ func (a *updateAccumulator) observe(params json.RawMessage) {
 		if name == "" {
 			name = "unknown"
 		}
-		a.recordToolEvent(name)
+		a.recordNonMessageUpdate(name)
+		if name == "tool_call" || name == "tool_call_update" {
+			a.recordToolEvent(name)
+		}
 		return
 	}
 	if envelope.Update.Content.Text == "" {
@@ -804,7 +1283,21 @@ func (a *updateAccumulator) observe(params json.RawMessage) {
 }
 
 func (a *updateAccumulator) recordToolEvent(name string) {
-	if a == nil || a.toolEventHasher == nil {
+	if a == nil {
+		return
+	}
+	a.recordUpdateName(a.toolEventHasher, &a.toolEventCount, name)
+}
+
+func (a *updateAccumulator) recordNonMessageUpdate(name string) {
+	if a == nil {
+		return
+	}
+	a.recordUpdateName(a.nonMessageUpdateHasher, &a.nonMessageUpdateCount, name)
+}
+
+func (a *updateAccumulator) recordUpdateName(hasher hash.Hash, count *int, name string) {
+	if hasher == nil || count == nil {
 		return
 	}
 	// Length-prefixing makes the sequence unambiguous while hashing only the
@@ -812,9 +1305,9 @@ func (a *updateAccumulator) recordToolEvent(name string) {
 	// tool results.
 	var length [4]byte
 	binary.BigEndian.PutUint32(length[:], uint32(len(name)))
-	_, _ = a.toolEventHasher.Write(length[:])
-	_, _ = io.WriteString(a.toolEventHasher, name)
-	a.toolEventCount++
+	_, _ = hasher.Write(length[:])
+	_, _ = io.WriteString(hasher, name)
+	*count++
 }
 
 const maxAcknowledgementLineBytes = 256

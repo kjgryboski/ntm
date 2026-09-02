@@ -87,18 +87,26 @@ type GrokACPOperationOutput struct {
 	OutputSHA256             string                         `json:"output_sha256,omitempty"`
 	ToolEventCount           int                            `json:"tool_event_count"`
 	ToolEventsSHA256         string                         `json:"tool_events_sha256"`
+	NonMessageUpdateCount    int                            `json:"non_message_update_count"`
+	NonMessageUpdatesSHA256  string                         `json:"non_message_updates_sha256"`
 	TokenUsage               *GrokACPTokenUsage             `json:"token_usage,omitempty"`
 	Cost                     *GrokACPCost                   `json:"cost,omitempty"`
 	ExitCode                 *int                           `json:"exit_code,omitempty"`
 	CleanupState             string                         `json:"cleanup_state"`
-	State                    string                         `json:"state"`
-	FailureCode              grok.ErrorCode                 `json:"failure_code,omitempty"`
-	Admission                AdmissionEvidence              `json:"admission"`
-	StartedAt                time.Time                      `json:"started_at"`
-	CompletedAt              time.Time                      `json:"completed_at"`
-	BindingSHA256            string                         `json:"binding_sha256"`
-	ReceiptState             string                         `json:"receipt_state"`
-	Replayed                 bool                           `json:"replayed"`
+	// Cancellation is ACP-agent acknowledgement evidence only. It must never
+	// be read as proof that xAI stopped any accepted cloud inference.
+	Cancellation grok.ACPCancellationReceipt `json:"cancellation"`
+	// Cleanup is local process-tree and reaping evidence, intentionally kept
+	// separate from ACP cancellation acknowledgement.
+	Cleanup       grok.ProcessCleanupReceipt `json:"cleanup"`
+	State         string                     `json:"state"`
+	FailureCode   grok.ErrorCode             `json:"failure_code,omitempty"`
+	Admission     AdmissionEvidence          `json:"admission"`
+	StartedAt     time.Time                  `json:"started_at"`
+	CompletedAt   time.Time                  `json:"completed_at"`
+	BindingSHA256 string                     `json:"binding_sha256"`
+	ReceiptState  string                     `json:"receipt_state"`
+	Replayed      bool                       `json:"replayed"`
 }
 
 // GrokACPEngine is the injectable direct-provider boundary. It deliberately
@@ -339,6 +347,7 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 	result, runErr := deps.Engine.Run(ctx, grok.Request{
 		Prompt:               transmittedPrompt,
 		ExpectedNonce:        nonce,
+		OperationID:          operationID,
 		CWD:                  opts.CWD,
 		Binary:               opts.Binary,
 		Model:                opts.Model,
@@ -388,7 +397,7 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 // a catalog proves only availability, never which model served this session.
 func grokModelIdentityEvidenceConfirmed(evidence string) bool {
 	switch strings.TrimSpace(evidence) {
-	case "completion_metadata", "provider_session_notification_plus_exact_launch":
+	case "completion_metadata", "provider_session_notification_plus_exact_launch", "session_config_option_plus_exact_launch", "session_model_state_plus_exact_launch":
 		return true
 	default:
 		return false
@@ -473,12 +482,16 @@ func applyGrokACPResult(output *GrokACPOperationOutput, result grok.Result, evid
 	output.OutputSHA256 = result.OutputSHA256
 	output.ToolEventCount = result.ToolEventCount
 	output.ToolEventsSHA256 = result.ToolEventsSHA256
+	output.NonMessageUpdateCount = result.NonMessageUpdateCount
+	output.NonMessageUpdatesSHA256 = result.NonMessageUpdatesSHA256
 	if strings.TrimSpace(result.Model) != "" {
 		output.Model = strings.TrimSpace(result.Model)
 		output.ModelEvidence = strings.TrimSpace(result.ModelEvidence)
 	}
 	output.TokenUsage = grokUsageToReceipt(result.Usage)
 	output.ExitCode = cloneGrokACPExitCode(result.ExitCode)
+	output.Cancellation = result.Cancellation
+	output.Cleanup = cloneGrokACPCleanup(result.Cleanup)
 	if strings.TrimSpace(result.CleanupState) != "" {
 		output.CleanupState = strings.TrimSpace(result.CleanupState)
 	}
@@ -522,6 +535,14 @@ func applyGrokACPError(output *GrokACPOperationOutput, err error) {
 			output.State = "acknowledgement_unconfirmed"
 			output.RobotResponse = NewErrorResponse(errors.New("Grok ACP completion did not include the required nonce acknowledgement"), string(grok.ErrAcknowledgementUnconfirmed), "Inspect the provider session; do not treat completion alone as acknowledged delivery")
 			return
+		case grok.ErrCancelled:
+			output.State = grok.StateCancelled
+			output.RobotResponse = NewErrorResponse(errors.New("Grok ACP agent acknowledged cancellation"), "CANCELED", "The ACP agent acknowledged this session/prompt cancellation; this does not prove xAI cloud inference stopped")
+			return
+		case grok.ErrCancellationUnconfirmed:
+			output.State = grok.StateOutcomeUnknown
+			output.RobotResponse = NewErrorResponse(errors.New("Grok ACP cancellation acknowledgement was not confirmed"), ErrCodeDispatchUnknown, "Do not retry; inspect the original provider session because the cancellation outcome is unknown")
+			return
 		}
 	}
 	output.RobotResponse = NewErrorResponse(errors.New("Grok ACP operation failed"), ErrCodeInternalError, "Inspect the typed failure code; prompts, provider output, and credentials are intentionally not included")
@@ -535,10 +556,14 @@ func invalidGrokACPOperationOutput(opts GrokACPOperationOptions, now time.Time, 
 		Transport:     grokACPTransport,
 		Target:        grokACPTarget,
 		CleanupState:  "not_started",
-		State:         grok.StateFailed,
-		FailureCode:   grok.ErrInvalidRequest,
-		StartedAt:     now,
-		CompletedAt:   now,
+		Cleanup: grok.ProcessCleanupReceipt{
+			LocalTermination: "not_started",
+			ResidualPIDs:     []int32{},
+		},
+		State:       grok.StateFailed,
+		FailureCode: grok.ErrInvalidRequest,
+		StartedAt:   now,
+		CompletedAt: now,
 	}
 }
 
@@ -604,4 +629,10 @@ func cloneGrokACPExitCode(value *int) *int {
 	}
 	copy := *value
 	return &copy
+}
+
+func cloneGrokACPCleanup(value grok.ProcessCleanupReceipt) grok.ProcessCleanupReceipt {
+	copy := value
+	copy.ResidualPIDs = append([]int32{}, value.ResidualPIDs...)
+	return copy
 }

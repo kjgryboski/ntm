@@ -43,6 +43,11 @@ type DeliveryObservation struct {
 type CancelObservation struct {
 	Attempted     bool
 	Authoritative bool
+	// AgentACPAcknowledged is valid only for an agent_acp capability scope. It
+	// means the original session/prompt response reported stopReason=cancelled
+	// for this operation; it does not claim cloud-inference cancellation.
+	AgentACPAcknowledged        bool
+	CloudInferenceStopConfirmed bool
 }
 type RecoveryObservation struct {
 	OutcomeUnknown         bool
@@ -149,7 +154,14 @@ func RunConformance(ctx context.Context, runtime Runtime, transport string, iden
 	cancel, err := runtime.Cancel(ctx, launch.SessionID)
 	cancelPass := err == nil && cancel.Attempted
 	if capabilities.Cancellation == EvidenceAuthoritative {
-		cancelPass = cancelPass && cancel.Authoritative
+		switch capabilities.CancellationAuthorityScope {
+		case EvidenceAuthorityScopeAgentACP:
+			cancelPass = cancelPass && cancel.AgentACPAcknowledged && !cancel.CloudInferenceStopConfirmed
+		case EvidenceAuthorityScopeProvider, EvidenceAuthorityScopeLocalProcessTree:
+			cancelPass = cancelPass && cancel.Authoritative
+		default:
+			cancelPass = false
+		}
 	} else if cancel.Authoritative {
 		cancelPass = false
 		report.Discrepancies = append(report.Discrepancies, "cancellation was claimed authoritative although matrix does not establish it")

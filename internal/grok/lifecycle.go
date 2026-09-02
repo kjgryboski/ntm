@@ -549,6 +549,15 @@ func terminateAndVerify(ctx context.Context, rootPID int32, inspector ProcessIns
 		r.LocalTermination = "unsupported"
 		return r
 	}
+	exists, err := inspector.Exists(rootPID)
+	if err != nil {
+		r.LocalTermination = "inspection_failed"
+		return r
+	}
+	if !exists {
+		r.LocalTermination = "already_exited_verified"
+		return r
+	}
 	seen := map[int32]bool{}
 	ids := make([]int32, 0)
 	var visit func(int32) bool

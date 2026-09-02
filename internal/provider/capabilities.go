@@ -13,13 +13,16 @@ const (
 
 // EvidenceAuthorityScope identifies who can substantiate an operation at the
 // declared evidence grade. A provider scope means the provider/runtime emitted
-// the acknowledgement; a local_process_tree scope proves only local process
-// control and must never be read as provider-side cancellation.
+// the acknowledgement; agent_acp means the local Grok ACP agent acknowledged
+// the exact protocol transition, not that xAI cloud inference was stopped.
+// A local_process_tree scope proves only local process control and must never
+// be read as provider-side cancellation.
 type EvidenceAuthorityScope string
 
 const (
 	EvidenceAuthorityScopeUnavailable      EvidenceAuthorityScope = "unavailable"
 	EvidenceAuthorityScopeProvider         EvidenceAuthorityScope = "provider"
+	EvidenceAuthorityScopeAgentACP         EvidenceAuthorityScope = "agent_acp"
 	EvidenceAuthorityScopeLocalProcessTree EvidenceAuthorityScope = "local_process_tree"
 	EvidenceAuthorityScopeLocalClient      EvidenceAuthorityScope = "local_client"
 )
@@ -70,16 +73,17 @@ type OperationCapabilities struct {
 // identifier intentionally separate from a provider profile/config surface.
 func CapabilityMatrix() map[string]OperationCapabilities {
 	return map[string]OperationCapabilities{
-		// xAI ACP emits JSON-RPC completion metadata for session/prompt. The
-		// published headless contract does not establish an authoritative cancel
-		// receipt, so cancellation deliberately remains unavailable here.
+		// xAI ACP cancellation is authoritative only at the Grok ACP-agent
+		// boundary: NTM writes session/cancel and requires the original
+		// session/prompt response to say stopReason=cancelled. That does not
+		// establish that an already accepted xAI cloud inference was stopped.
 		"xai_acp": {
 			IdentityEvidence:     IdentityEvidenceProfileAttested,
 			CapacityControlScope: CapacityControlScopeLocalShared,
 			Launch:               EvidenceAuthoritative, Delivery: EvidenceAuthoritative,
 			Completion: EvidenceAuthoritative, CompletionAuthorityScope: EvidenceAuthorityScopeProvider,
-			Cancellation: EvidenceUnavailable, CancellationAuthorityScope: EvidenceAuthorityScopeUnavailable,
-			Resume: EvidenceUnavailable, Cleanup: EvidenceSubmission, CleanupAuthorityScope: EvidenceAuthorityScopeLocalClient,
+			Cancellation: EvidenceAuthoritative, CancellationAuthorityScope: EvidenceAuthorityScopeAgentACP,
+			Resume: EvidenceUnavailable, Cleanup: EvidenceAuthoritative, CleanupAuthorityScope: EvidenceAuthorityScopeLocalProcessTree,
 			LaunchCapacityControl: EvidenceAuthoritative, RequestCapacityControl: EvidenceAuthoritative,
 			LiveErrorFeedback: EvidenceUnavailable,
 		},

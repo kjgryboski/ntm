@@ -35,7 +35,8 @@ func TestGetProviderCapabilitiesRedactsConfiguredProfiles(t *testing.T) {
 	if !output.Success || !output.ConfigSupplied || len(output.ProviderProfiles) != 2 {
 		t.Fatalf("output = %+v", output)
 	}
-	if output.Transports["xai_acp"].Completion != provider.EvidenceAuthoritative || output.Transports["xai_acp"].CapacityControlScope != provider.CapacityControlScopeLocalShared || !output.OfflineConformanceHarness.Available {
+	acp := output.Transports["xai_acp"]
+	if acp.Completion != provider.EvidenceAuthoritative || acp.Cancellation != provider.EvidenceAuthoritative || acp.CancellationAuthorityScope != provider.EvidenceAuthorityScopeAgentACP || acp.Cleanup != provider.EvidenceAuthoritative || acp.CleanupAuthorityScope != provider.EvidenceAuthorityScopeLocalProcessTree || acp.CapacityControlScope != provider.CapacityControlScopeLocalShared || !output.OfflineConformanceHarness.Available {
 		t.Fatalf("transport/conformance capability = %+v", output)
 	}
 	if len(output.GrokAutomationPolicies) != 2 || output.GrokAutomationPolicy.Name == "" || output.GrokAutomationPolicy.Sandbox != "read-only" || output.GrokAutomationPolicy.SHA256 == "" || output.GrokAutomationPolicy.SystemRequirementsSHA256 == "" || output.GrokAutomationPolicy.AllowRuleCount == 0 || output.GrokAutomationPolicy.DenyRuleCount == 0 {
