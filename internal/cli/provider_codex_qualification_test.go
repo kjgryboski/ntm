@@ -156,6 +156,30 @@ func TestProviderCodexQualificationPreflightsBrokerBeforeWorkspace(t *testing.T)
 	}
 }
 
+func TestProviderCodexQualificationAppliesSuiteTimeoutBeforeWorkspace(t *testing.T) {
+	profile := providerCodexProfile(t.TempDir())
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared := false
+	deps := codexQualificationDepsForTest(profile, &codexQualificationAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}, func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		return zai.CodexRunReceipt{}, errors.New("not reached")
+	})
+	deps.attest = func(ctx context.Context, _ zai.CodexManifestExpectation) (zai.CodexManifestAttestation, error) {
+		<-ctx.Done()
+		return zai.CodexManifestAttestation{}, ctx.Err()
+	}
+	deps.prepare = func(context.Context, string) (providerCodexQualificationWorkspace, error) {
+		prepared = true
+		return providerCodexQualificationWorkspace{}, nil
+	}
+	err = runProviderCodexQualification(&cobra.Command{}, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Millisecond}, profile, identity, deps)
+	if err == nil || !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) || prepared {
+		t.Fatalf("err=%v prepared=%t", err, prepared)
+	}
+}
+
 func TestProviderCodexQualificationStoresSignedModelGapNoGo(t *testing.T) {
 	profile := providerCodexProfile(t.TempDir())
 	identity, err := profile.Identity()

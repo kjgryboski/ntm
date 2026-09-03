@@ -355,7 +355,8 @@ func newProviderQualifyCmd() *cobra.Command {
 		Short: "Run the live Z.ai Coding Plan qualification suite",
 		Long: `Run all mandatory checks against one exact Z.ai provider profile.
 
-This command is intentionally live-only and retains its disposable repository.
+This command is intentionally live-only and removes its disposable repository
+after recording controller-owned cleanup evidence.
 Coding Plan and native API credentials remain separate; native tool qualification
 requires the controller-owned tools policy and OS-protected credential broker.`,
 		Args: cobra.NoArgs,

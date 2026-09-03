@@ -571,6 +571,20 @@ var codexToolItemTypes = map[string]bool{
 	"tool_call":         true,
 }
 
+func validCodexTerminalToolStatus(itemType, status string, present bool) bool {
+	switch itemType {
+	case "command_execution":
+		return present && (status == "completed" || status == "failed" || status == "declined")
+	case "file_change", "mcp_tool_call", "web_search", "tool_call":
+		// Preserve the existing narrow lane for every other tool type. The
+		// observed compatibility gap is specific to terminal command failures;
+		// other capabilities must not broaden implicitly.
+		return present && status == "completed"
+	default:
+		return false
+	}
+}
+
 func parseCodexEvents(raw []byte, nonce, parent string, resume bool, expectedCommand ...string) (codexParsed, error) {
 	parsed := codexParsed{toolDigest: digestCodex(nil), itemIDs: map[string]bool{}}
 	wantCommand, wantFile := "", ""
@@ -658,9 +672,9 @@ func parseCodexEvents(raw []byte, nonce, parent string, resume bool, expectedCom
 				parsed.nonce = strings.TrimSpace(text) == nonce
 				parsed.agentMessageSeen = true
 			case codexToolItemTypes[itemType]:
-				status, ok := rawJSONString(item["status"])
-				if !ok || status != "completed" {
-					return parsed, errors.New("Codex tool item lacks completed status")
+				status, statusPresent := rawJSONString(item["status"])
+				if !validCodexTerminalToolStatus(itemType, status, statusPresent) {
+					return parsed, errors.New("Codex tool item lacks a valid terminal status")
 				}
 				if itemType == "command_execution" && wantCommand != "" {
 					command, _ := rawJSONString(item["command"])
@@ -669,14 +683,30 @@ func parseCodexEvents(raw []byte, nonce, parent string, resume bool, expectedCom
 							return parsed, errors.New("Codex emitted the expected tool command more than once")
 						}
 						parsed.expectedToolSeen = true
-						exitCode, present, exitErr := signedJSONInt(item["exit_code"])
-						if exitErr != nil || !present {
-							return parsed, errors.New("Codex expected tool command lacks an exit status")
+						exitCode, exitPresent, exitErr := signedJSONInt(item["exit_code"])
+						if exitErr != nil {
+							return parsed, errors.New("Codex expected tool command has inconsistent terminal evidence")
 						}
-						parsed.expectedToolDeny = exitCode != 0
+						switch status {
+						case "declined":
+							if exitPresent {
+								return parsed, errors.New("Codex declined expected tool command unexpectedly has an exit status")
+							}
+							parsed.expectedToolDeny = true
+						case "failed":
+							if !exitPresent || exitCode == 0 {
+								return parsed, errors.New("Codex failed expected tool command lacks a nonzero exit status")
+							}
+							parsed.expectedToolDeny = true
+						case "completed":
+							if !exitPresent {
+								return parsed, errors.New("Codex completed expected tool command lacks an exit status")
+							}
+							parsed.expectedToolDeny = exitCode != 0
+						}
 					}
 				}
-				if itemType == "file_change" && wantFile != "" {
+				if itemType == "file_change" && status == "completed" && wantFile != "" {
 					matched, err := codexFileChangeMatches(item["changes"], wantFile)
 					if err != nil {
 						return parsed, err

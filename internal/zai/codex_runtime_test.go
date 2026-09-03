@@ -291,28 +291,116 @@ func TestRunCodexStructuredFailsClosedOnMissingOrRemappedModel(t *testing.T) {
 }
 
 func TestRunCodexStructuredBindsExpectedDeniedCommandWithoutRetainingIt(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		status   string
+		exitCode any
+	}{
+		{name: "completed_nonzero", status: "completed", exitCode: 1},
+		{name: "failed", status: "failed", exitCode: 1},
+		{name: "declined", status: "declined"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &codexRunnerFixture{}
+			spec := codexFixtureSpec(t, runner)
+			spec.ExpectedToolCommand = "cat -- .qualification-secret"
+			var observedSession string
+			spec.SessionObserver = func(session string) { observedSession = session }
+			item := map[string]any{"id": "tool-1", "type": "command_execution", "command": spec.ExpectedToolCommand, "aggregated_output": "permission denied", "status": test.status}
+			if test.exitCode != nil {
+				item["exit_code"] = test.exitCode
+			}
+			runner.outcome.Stdout = codexJSONL(t,
+				map[string]any{"type": "thread.started", "thread_id": codexTestSession},
+				map[string]any{"type": "turn.started"},
+				map[string]any{"type": "item.completed", "item": item},
+				map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": spec.ExpectedNonce}},
+				map[string]any{"type": "turn.completed", "server_model": "glm-5.3"},
+			)
+			receipt, err := RunCodexStructured(context.Background(), spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !receipt.ExpectedToolObserved || !receipt.ExpectedToolDenied || receipt.ExpectedToolSHA256 != digestCodex([]byte(spec.ExpectedToolCommand)) || observedSession != codexTestSession {
+				t.Fatalf("expected denied command evidence = %+v session=%q", receipt, observedSession)
+			}
+			encoded, _ := json.Marshal(receipt)
+			if strings.Contains(string(encoded), spec.ExpectedToolCommand) || strings.Contains(string(encoded), "permission denied") {
+				t.Fatalf("receipt retained tool text: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestRunCodexStructuredContinuesAfterUnrequestedFailedCommand(t *testing.T) {
 	runner := &codexRunnerFixture{}
 	spec := codexFixtureSpec(t, runner)
-	spec.ExpectedToolCommand = "cat -- .qualification-secret"
-	var observedSession string
-	spec.SessionObserver = func(session string) { observedSession = session }
 	runner.outcome.Stdout = codexJSONL(t,
 		map[string]any{"type": "thread.started", "thread_id": codexTestSession},
 		map[string]any{"type": "turn.started"},
-		map[string]any{"type": "item.completed", "item": map[string]any{"id": "tool-1", "type": "command_execution", "command": spec.ExpectedToolCommand, "aggregated_output": "permission denied", "exit_code": 1, "status": "completed"}},
+		map[string]any{"type": "item.completed", "item": map[string]any{"id": "tool-1", "type": "command_execution", "command": "pwd", "aggregated_output": "denied", "exit_code": 1, "status": "failed"}},
 		map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": spec.ExpectedNonce}},
-		map[string]any{"type": "turn.completed", "server_model": "glm-5.3"},
+		map[string]any{"type": "turn.completed", "server_model": "glm-5.3", "usage": map[string]any{"input_tokens": 1, "output_tokens": 1}},
 	)
 	receipt, err := RunCodexStructured(context.Background(), spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !receipt.ExpectedToolObserved || !receipt.ExpectedToolDenied || receipt.ExpectedToolSHA256 != digestCodex([]byte(spec.ExpectedToolCommand)) || observedSession != codexTestSession {
-		t.Fatalf("expected denied command evidence = %+v session=%q", receipt, observedSession)
+	if !receipt.CompletionConfirmed || !receipt.NonceVerified || receipt.ToolEventCount != 1 || !receipt.ModelVerified {
+		t.Fatalf("receipt = %+v", receipt)
 	}
-	encoded, _ := json.Marshal(receipt)
-	if strings.Contains(string(encoded), spec.ExpectedToolCommand) || strings.Contains(string(encoded), "permission denied") {
-		t.Fatalf("receipt retained tool text: %s", encoded)
+}
+
+func TestParseCodexEventsRejectsNonterminalOrUnknownToolStatus(t *testing.T) {
+	for _, status := range []string{"in_progress", "unknown", ""} {
+		t.Run(status, func(t *testing.T) {
+			item := map[string]any{"id": "tool-1", "type": "command_execution", "command": "pwd", "exit_code": 0}
+			if status != "" {
+				item["status"] = status
+			}
+			raw := codexJSONL(t,
+				map[string]any{"type": "thread.started", "thread_id": codexTestSession},
+				map[string]any{"type": "turn.started"},
+				map[string]any{"type": "item.completed", "item": item},
+				map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": "nonce"}},
+				map[string]any{"type": "turn.completed", "server_model": "glm-5.3"},
+			)
+			if _, err := parseCodexEvents(raw, "nonce", "", false); err == nil {
+				t.Fatalf("status %q was accepted", status)
+			}
+		})
+	}
+}
+
+func TestRunCodexStructuredRejectsAmbiguousExpectedCommandDenial(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		status   string
+		exitCode any
+	}{
+		{name: "failed_missing_exit", status: "failed"},
+		{name: "failed_zero_exit", status: "failed", exitCode: 0},
+		{name: "declined_with_exit", status: "declined", exitCode: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &codexRunnerFixture{}
+			spec := codexFixtureSpec(t, runner)
+			spec.ExpectedToolCommand = "cat -- .qualification-secret"
+			item := map[string]any{"id": "tool-1", "type": "command_execution", "command": spec.ExpectedToolCommand, "status": test.status}
+			if test.exitCode != nil {
+				item["exit_code"] = test.exitCode
+			}
+			runner.outcome.Stdout = codexJSONL(t,
+				map[string]any{"type": "thread.started", "thread_id": codexTestSession},
+				map[string]any{"type": "turn.started"},
+				map[string]any{"type": "item.completed", "item": item},
+				map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": spec.ExpectedNonce}},
+				map[string]any{"type": "turn.completed", "server_model": "glm-5.3"},
+			)
+			if receipt, err := RunCodexStructured(context.Background(), spec); err == nil || receipt.ExpectedToolDenied {
+				t.Fatalf("ambiguous denial was accepted: receipt=%+v err=%v", receipt, err)
+			}
+		})
 	}
 }
 

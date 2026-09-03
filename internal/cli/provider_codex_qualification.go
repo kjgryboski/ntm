@@ -77,7 +77,8 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	if deps.attest == nil || deps.credentialStatus == nil || deps.pinnedSigner == nil || deps.run == nil || deps.newNonce == nil || deps.prepare == nil || deps.cleanup == nil || deps.verifier == nil || deps.store == nil || deps.admission == nil || deps.now == nil {
 		return errors.New("Codex qualification dependencies are incomplete")
 	}
-	ctx := providerCommandContext(cmd)
+	ctx, suiteCancel := context.WithTimeout(providerCommandContext(cmd), opts.suiteTimeout)
+	defer suiteCancel()
 	// All three preflights deliberately occur before creating a worktree or
 	// requesting a token. The status bridge exposes no credential material.
 	manifestExpectation := zai.CodexManifestExpectation{RuntimeHome: profile.RuntimeHome, Account: identity.AccountAlias(), Model: identity.Model(), BrokerCredentialID: profile.BrokerCredentialID, Binary: profile.Command, BinarySHA256: profile.RuntimeSHA256, BrokerCommand: profile.BrokerCommand, BrokerCommandSHA256: profile.BrokerCommandSHA256, CredentialBridgeCommand: profile.CredentialBridgeCommand, CredentialBridgeCommandSHA256: profile.CredentialBridgeCommandSHA256, Version: profile.RuntimeVersion, ConfigSHA256: profile.ConfigSHA256}
