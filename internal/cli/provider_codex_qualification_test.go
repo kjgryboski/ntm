@@ -22,11 +22,11 @@ import (
 )
 
 type codexQualificationAdmissionFake struct {
-	decision                                               ratelimit.SubscriptionDecision
-	status                                                 ratelimit.CapacityStatus
-	acquires, releases, successes, usages, unknownReserved int
-	canceledReservations                                   int
-	usageErr, unknownErr, cancelErr                        error
+	decision                                                             ratelimit.SubscriptionDecision
+	status                                                               ratelimit.CapacityStatus
+	acquires, releases, successes, usages, conservative, unknownReserved int
+	canceledReservations                                                 int
+	usageErr, unknownErr, cancelErr                                      error
 }
 
 func (f *codexQualificationAdmissionFake) Acquire(provider.Identity) ratelimit.SubscriptionDecision {
@@ -38,6 +38,10 @@ func (f *codexQualificationAdmissionFake) Release(provider.Identity, ratelimit.S
 }
 func (f *codexQualificationAdmissionFake) RecordUsage(provider.Identity, ratelimit.SubscriptionDecision, string, ratelimit.TokenUsage, time.Time) error {
 	f.usages++
+	return f.usageErr
+}
+func (f *codexQualificationAdmissionFake) RecordConservativeUsage(provider.Identity, ratelimit.SubscriptionDecision, ratelimit.TokenUsage, time.Time) error {
+	f.conservative++
 	return f.usageErr
 }
 func (f *codexQualificationAdmissionFake) RecordUnknownUsage(provider.Identity, ratelimit.SubscriptionDecision) error {
@@ -61,6 +65,7 @@ func TestProviderCodexQualificationProducesTenGateReceiptAndCleansGeneratedRoot(
 	var workspace providerCodexQualificationWorkspace
 	var storedPath string
 	var storedChecks int
+	var accountingDetail string
 	calls := 0
 	deps := codexQualificationDepsForTest(profile, admission, func(ctx context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		calls++
@@ -117,6 +122,11 @@ func TestProviderCodexQualificationProducesTenGateReceiptAndCleansGeneratedRoot(
 	}
 	deps.store = func(_ string, receipt providerqualification.Receipt) (string, error) {
 		storedChecks = countPassedQualificationChecks(receipt)
+		for _, check := range receipt.Checks {
+			if check.Name == "capacity_accounting" {
+				accountingDetail = check.Detail
+			}
+		}
 		storedPath = filepath.Join(workspace.Root, "receipt.json")
 		return storedPath, nil
 	}
@@ -126,11 +136,28 @@ func TestProviderCodexQualificationProducesTenGateReceiptAndCleansGeneratedRoot(
 	if err := runProviderCodexQualification(cmd, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Minute}, profile, identity, deps); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 5 || storedChecks != 10 || admission.acquires != 5 || admission.releases != 5 || admission.successes != 1 || admission.usages != 4 || admission.unknownReserved != 1 || admission.canceledReservations != 0 || !strings.Contains(output.String(), "10/10") {
+	if calls != 5 || storedChecks != 10 || admission.acquires != 5 || admission.releases != 5 || admission.successes != 1 || admission.usages != 4 || admission.unknownReserved != 1 || admission.canceledReservations != 0 || !strings.Contains(accountingDetail, "provider_usage_reconciled=4") || !strings.Contains(output.String(), "10/10") {
 		t.Fatalf("calls=%d checks=%d admission=%+v output=%q", calls, storedChecks, admission, output.String())
 	}
 	if !codexQualificationWorkspaceRemoved(workspace) || strings.Contains(storedPath, "qualification.go") {
 		t.Fatalf("unsafe cleanup/path: root=%q stored=%q", workspace.Root, storedPath)
+	}
+}
+
+func TestProviderCodexQualificationAccountingRequiresProviderStart(t *testing.T) {
+	profile := providerCodexProfile(t.TempDir())
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := successfulProviderCodexReceipt(zai.CodexRunSpec{RequestedModel: identity.Model()})
+	receipt.ProviderStarted = false
+	admission := &codexQualificationAdmissionFake{}
+	state, err := reconcileProviderCodexQualificationUsage(admission, identity, codexQualificationTurn{
+		receipt: receipt, admitted: true, decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true},
+	})
+	if err != nil || admission.usages != 0 || admission.conservative != 0 || admission.unknownReserved != 1 || !strings.Contains(state, "unknown_full_week_reserved=1") {
+		t.Fatalf("state=%q err=%v admission=%+v", state, err, admission)
 	}
 }
 
@@ -243,7 +270,7 @@ func TestProviderCodexQualificationStoresSignedModelGapNoGo(t *testing.T) {
 	}
 	err = runProviderCodexQualification(&cobra.Command{}, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Minute}, profile, identity, deps)
 	var noGo *providerQualificationExitError
-	if !errors.As(err, &noGo) || !stored || calls != 5 || admission.acquires != 5 || admission.releases != 5 || admission.usages != 0 || admission.unknownReserved != 5 || admission.successes != 0 || !codexQualificationWorkspaceRemoved(workspace) {
+	if !errors.As(err, &noGo) || !stored || calls != 5 || admission.acquires != 5 || admission.releases != 5 || admission.usages != 0 || admission.conservative != 4 || admission.unknownReserved != 1 || admission.successes != 0 || !codexQualificationWorkspaceRemoved(workspace) {
 		t.Fatalf("err=%v stored=%t calls=%d success=%d root=%q", err, stored, calls, admission.successes, workspace.Root)
 	}
 }

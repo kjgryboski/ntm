@@ -40,6 +40,10 @@ type providerCodexSubscriptionAdmissionFake struct {
 	successes            int
 	reconciliations      []providerCodexUsageReconciliation
 	reconcileErr         error
+	conservative         []providerCodexUsageReconciliation
+	conservativeErr      error
+	bindings             int
+	bindErr              error
 	unknownReservations  []providerCodexUnknownUsageReservation
 	unknownErr           error
 	canceledReservations int
@@ -71,6 +75,16 @@ func (f *providerCodexSubscriptionAdmissionFake) Release(provider.Identity, rate
 func (f *providerCodexSubscriptionAdmissionFake) RecordUsage(identity provider.Identity, decision ratelimit.SubscriptionDecision, resolvedModel string, usage ratelimit.TokenUsage, observedAt time.Time) error {
 	f.reconciliations = append(f.reconciliations, providerCodexUsageReconciliation{identity: identity, decision: decision, resolvedModel: resolvedModel, usage: usage, observedAt: observedAt})
 	return f.reconcileErr
+}
+
+func (f *providerCodexSubscriptionAdmissionFake) RecordConservativeUsage(identity provider.Identity, decision ratelimit.SubscriptionDecision, usage ratelimit.TokenUsage, observedAt time.Time) error {
+	f.conservative = append(f.conservative, providerCodexUsageReconciliation{identity: identity, decision: decision, usage: usage, observedAt: observedAt})
+	return f.conservativeErr
+}
+
+func (f *providerCodexSubscriptionAdmissionFake) BindReservation(provider.Identity, ratelimit.SubscriptionDecision, string, string) error {
+	f.bindings++
+	return f.bindErr
 }
 
 func (f *providerCodexSubscriptionAdmissionFake) RecordUnknownUsage(identity provider.Identity, decision ratelimit.SubscriptionDecision) error {
@@ -148,6 +162,26 @@ func TestProviderCodexRunRequiresLiveOptIn(t *testing.T) {
 	}
 }
 
+func TestProviderCodexRunFailsBeforeDispatchWhenCapacityBindingFails(t *testing.T) {
+	root := t.TempDir()
+	ledger := &providerNativeLedgerFake{}
+	admission := &providerCodexSubscriptionAdmissionFake{
+		decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true},
+		status:   ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared},
+		bindErr:  errors.New("shared binding unavailable"),
+	}
+	deps := providerCodexTestDeps(providerCodexProfile(root), admission, ledger)
+	called := false
+	deps.run = func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		called = true
+		return zai.CodexRunReceipt{}, nil
+	}
+	err := runProviderCodex(&cobra.Command{}, providerCodexRunOptions{profile: "zai-codex", prompt: "p", cwd: root, operationID: "codex-bind-fail", live: true, timeout: time.Minute}, deps)
+	if err == nil || called || admission.bindings != 1 || admission.canceledReservations != 1 || len(ledger.ops) != 0 {
+		t.Fatalf("err=%v called=%t admission=%+v ledger=%+v", err, called, admission, ledger.ops)
+	}
+}
+
 func TestProviderCodexRunAttestsAdmitsAndPersistsStructuredReceipt(t *testing.T) {
 	root := t.TempDir()
 	profile := providerCodexProfile(root)
@@ -166,7 +200,7 @@ func TestProviderCodexRunAttestsAdmitsAndPersistsStructuredReceipt(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observed.Binary != profile.Command || observed.BrokerCommand != profile.BrokerCommand || observed.BrokerCommandSHA256 != profile.BrokerCommandSHA256 || observed.CredentialBridgeCommand != profile.CredentialBridgeCommand || observed.CredentialBridgeCommandSHA256 != profile.CredentialBridgeCommandSHA256 || observed.RuntimeHome != profile.RuntimeHome || observed.RequestedModel != profile.Model || admission.acquires != 1 || admission.releases != 1 || admission.successes != 1 || len(admission.reconciliations) != 1 {
+	if observed.Binary != profile.Command || observed.BrokerCommand != profile.BrokerCommand || observed.BrokerCommandSHA256 != profile.BrokerCommandSHA256 || observed.CredentialBridgeCommand != profile.CredentialBridgeCommand || observed.CredentialBridgeCommandSHA256 != profile.CredentialBridgeCommandSHA256 || observed.RuntimeHome != profile.RuntimeHome || observed.RequestedModel != profile.Model || admission.acquires != 1 || admission.bindings != 1 || admission.releases != 1 || admission.successes != 1 || len(admission.reconciliations) != 1 {
 		t.Fatalf("spec=%+v admission=%+v", observed, admission)
 	}
 	reconciliation := admission.reconciliations[0]
@@ -194,12 +228,51 @@ func TestProviderCodexRunPersistsCompletedButUnqualifiedModelGap(t *testing.T) {
 	if err == nil {
 		t.Fatal("unqualified model gap was promoted")
 	}
-	if len(admission.reconciliations) != 0 || len(admission.unknownReservations) != 1 || admission.unknownReservations[0].identity.Hash() == "" {
-		t.Fatalf("model-gap receipt reconciled requested-model usage: %+v", admission.reconciliations)
+	if len(admission.reconciliations) != 0 || len(admission.conservative) != 1 || len(admission.unknownReservations) != 0 || admission.conservative[0].identity.Hash() == "" {
+		t.Fatalf("model-gap receipt was not conservatively reconciled: %+v", admission)
 	}
 	op := ledger.ops[providerCodexOperationScope+"\x00codex-model-gap"]
 	if op == nil || op.Status != "completed" || !strings.Contains(op.OutcomeJSON, `"state":"completed_unqualified"`) || strings.Contains(op.OutcomeJSON, `"success":true`) {
 		t.Fatalf("durable unqualified receipt = %+v", op)
+	}
+}
+
+func TestProviderCodexRunFreezesUnknownWhenConservativeModelGapAccountingFails(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		zeroUsage       bool
+		conservativeErr error
+	}{
+		{name: "non_positive_usage", zeroUsage: true, conservativeErr: errors.New("invalid conservative usage")},
+		{name: "shared_store_failure", conservativeErr: errors.New("shared store unavailable")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			profile := providerCodexProfile(root)
+			ledger := &providerNativeLedgerFake{}
+			admission := &providerCodexSubscriptionAdmissionFake{
+				decision:        ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true},
+				status:          ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared},
+				conservativeErr: test.conservativeErr,
+			}
+			deps := providerCodexTestDeps(profile, admission, ledger)
+			deps.run = func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+				receipt := successfulProviderCodexReceipt(spec)
+				receipt.ResolvedModel, receipt.ModelEvidence, receipt.ModelVerified = "", "", false
+				if test.zeroUsage {
+					receipt.Usage = zai.CodexUsage{}
+				}
+				return receipt, errors.New("provider-reported model identity unavailable")
+			}
+			err := runProviderCodex(&cobra.Command{}, providerCodexRunOptions{profile: "zai-codex", prompt: "p", cwd: root, operationID: "codex-model-gap-failure", live: true, timeout: time.Minute}, deps)
+			if err == nil || len(admission.conservative) != 1 || len(admission.unknownReservations) != 1 {
+				t.Fatalf("err=%v admission=%+v", err, admission)
+			}
+			operation := ledger.ops[providerCodexOperationScope+"\x00codex-model-gap-failure"]
+			if operation == nil || operation.Status != state.SendOperationInProgress {
+				t.Fatalf("failed accounting must keep the operation blocked: %+v", operation)
+			}
+		})
 	}
 }
 

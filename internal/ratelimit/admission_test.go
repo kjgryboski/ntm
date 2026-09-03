@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -212,6 +213,67 @@ func TestSubscriptionAdmissionReconcilesReservationAndUsesRollingFiveHourWindow(
 	}
 }
 
+func TestSubscriptionAdmissionConservativelyReconcilesMissingModelEvidence(t *testing.T) {
+	now := time.Date(2026, 9, 7, 7, 0, 0, 0, time.UTC)
+	cfg := DefaultSubscriptionAdmissionConfig()
+	cfg.Exact.MaxConcurrent, cfg.Exact.TokenCapacity, cfg.Exact.TokensPerSecond = 2, 10, 10
+	controller, err := NewSubscriptionAdmissionController(cfg, "", func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	decision := controller.Acquire(id)
+	if !decision.Allowed {
+		t.Fatalf("reservation admission=%+v", decision)
+	}
+	usage := TokenUsage{InputTokens: 1000, CachedInputTokens: 500, OutputTokens: 100}
+	want, err := ZAICodingPlanCredits("glm-5.3", usage, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.RecordConservativeUsage(id, decision, usage, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.RecordConservativeUsage(id, decision, usage, now); err == nil {
+		t.Fatal("duplicate conservative reconciliation succeeded")
+	}
+	controller.Release(id, decision)
+	snapshot := controller.Snapshot(id)
+	if math.Abs(snapshot.FiveHourCreditsUsed-want) > 1e-9 || !snapshot.ConservativeUsage || snapshot.UnknownUsageReserved {
+		t.Fatalf("conservative snapshot=%+v want=%v", snapshot, want)
+	}
+}
+
+func TestSubscriptionAdmissionBindsReservationBeforeDispatch(t *testing.T) {
+	now := time.Date(2026, 9, 7, 7, 0, 0, 0, time.UTC)
+	cfg := DefaultSubscriptionAdmissionConfig()
+	cfg.Exact.MaxConcurrent, cfg.Exact.TokenCapacity, cfg.Exact.TokensPerSecond = 1, 10, 10
+	controller, err := NewSubscriptionAdmissionController(cfg, "", func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	decision := controller.Acquire(id)
+	if !decision.Allowed {
+		t.Fatalf("admission=%+v", decision)
+	}
+	binding, nonce := strings.Repeat("d", 64), strings.Repeat("e", 64)
+	if err := controller.BindReservation(id, decision, binding, nonce); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.BindReservation(id, decision, binding, nonce); err == nil {
+		t.Fatal("duplicate reservation binding succeeded")
+	}
+	state, ok, err := controller.plan.subscriptionState(id.SubscriptionCapacityScope())
+	if err != nil || !ok || len(state.subscriptionUsage) != 1 || state.subscriptionUsage[0].OperationBindingSHA256 != binding || state.subscriptionUsage[0].NonceSHA256 != nonce {
+		t.Fatalf("state=%+v ok=%t err=%v", state, ok, err)
+	}
+	if err := controller.CancelReservation(id, decision); err != nil {
+		t.Fatal(err)
+	}
+	controller.Release(id, decision)
+}
+
 func TestSubscriptionAdmissionSnapshotReportsConfiguredScopeBeforeFirstUse(t *testing.T) {
 	now := time.Date(2026, 9, 7, 7, 0, 0, 0, time.UTC)
 	cfg := DefaultSubscriptionAdmissionConfig()
@@ -261,6 +323,126 @@ func TestSubscriptionAdmissionUnknownUsageConservativelyReservesWeeklyScope(t *t
 	now = now.Add(7*24*time.Hour + time.Nanosecond)
 	if allowed := controller.Acquire(id); !allowed.Allowed {
 		t.Fatalf("weekly unknown reservation did not expire: %+v", allowed)
+	}
+}
+
+func TestSubscriptionAdmissionRecoversExactlyOneRecentUnknownUsage(t *testing.T) {
+	now := time.Date(2026, 9, 7, 7, 2, 0, 0, time.UTC)
+	completedAt := now.Add(-2 * time.Minute)
+	cfg := DefaultSubscriptionAdmissionConfig()
+	cfg.Exact.MaxConcurrent, cfg.Exact.TokenCapacity, cfg.Exact.TokensPerSecond = 2, 10, 10
+	controller, err := NewSubscriptionAdmissionController(cfg, "", func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	decision := controller.Acquire(id)
+	if !decision.Allowed {
+		t.Fatalf("admission=%+v", decision)
+	}
+	if err := controller.RecordUnknownUsage(id, decision); err != nil {
+		t.Fatal(err)
+	}
+	controller.Release(id, decision)
+	usage := TokenUsage{InputTokens: 1000, CachedInputTokens: 500, OutputTokens: 100}
+	want, err := ZAICodingPlanCredits("glm-5.3", TokenUsage{OutputTokens: usage.InputTokens + usage.CachedInputTokens + usage.OutputTokens}, completedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization := strings.Repeat("a", 64)
+	got, err := controller.ApplyLegacyUnknownUsageAuthorization(id, usage, completedAt, authorization)
+	if err != nil || math.Abs(got-want) > 1e-9 {
+		t.Fatalf("credits=%v want=%v err=%v", got, want, err)
+	}
+	snapshot := controller.Snapshot(id)
+	if snapshot.UnknownUsageReserved || !snapshot.ConservativeUsage || !snapshot.LegacyRecoveryAuthorized || math.Abs(snapshot.WeeklyCreditsUsed-want) > 1e-9 {
+		t.Fatalf("recovered snapshot=%+v", snapshot)
+	}
+	if _, err := controller.ApplyLegacyUnknownUsageAuthorization(id, usage, completedAt, authorization); err == nil {
+		t.Fatal("duplicate unknown recovery succeeded")
+	}
+}
+
+func TestSubscriptionAdmissionUnknownRecoveryRejectsAmbiguousOrStaleReservation(t *testing.T) {
+	now := time.Date(2026, 9, 7, 7, 0, 0, 0, time.UTC)
+	cfg := DefaultSubscriptionAdmissionConfig()
+	cfg.Exact.MaxConcurrent, cfg.Exact.TokenCapacity, cfg.Exact.TokensPerSecond = 3, 10, 10
+	cfg.MaxConcurrent = 3
+	controller, err := NewSubscriptionAdmissionController(cfg, "", func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	decisions := make([]SubscriptionDecision, 2)
+	for index := range decisions {
+		decision := controller.Acquire(id)
+		if !decision.Allowed {
+			t.Fatalf("admission=%+v", decision)
+		}
+		decisions[index] = decision
+	}
+	for _, decision := range decisions {
+		if err := controller.RecordUnknownUsage(id, decision); err != nil {
+			t.Fatal(err)
+		}
+		controller.Release(id, decision)
+	}
+	usage := TokenUsage{OutputTokens: 1}
+	if _, err := controller.ApplyLegacyUnknownUsageAuthorization(id, usage, now, strings.Repeat("b", 64)); err == nil {
+		t.Fatal("ambiguous unknown reservations were recovered")
+	}
+	if _, err := controller.ApplyLegacyUnknownUsageAuthorization(id, usage, now.Add(-8*24*time.Hour), strings.Repeat("b", 64)); err == nil {
+		t.Fatal("stale completion was recovered")
+	}
+}
+
+func TestSubscriptionAdmissionLegacyRecoveryRejectsOverLimitBeforeMutation(t *testing.T) {
+	now := time.Date(2026, 9, 7, 7, 2, 0, 0, time.UTC)
+	cfg := DefaultSubscriptionAdmissionConfig()
+	cfg.Exact.MaxConcurrent, cfg.Exact.TokenCapacity, cfg.Exact.TokensPerSecond = 1, 10, 10
+	cfg.FiveHourCreditLimit, cfg.WeeklyCreditLimit = 1, 1
+	controller, err := NewSubscriptionAdmissionController(cfg, "", func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	decision := controller.Acquire(id)
+	if !decision.Allowed {
+		t.Fatalf("admission=%+v", decision)
+	}
+	if err := controller.RecordUnknownUsage(id, decision); err != nil {
+		t.Fatal(err)
+	}
+	controller.Release(id, decision)
+	if _, err := controller.ApplyLegacyUnknownUsageAuthorization(id, TokenUsage{OutputTokens: 10_000}, now.Add(-time.Minute), strings.Repeat("c", 64)); err == nil {
+		t.Fatal("over-limit legacy recovery mutated capacity")
+	}
+	snapshot := controller.Snapshot(id)
+	if !snapshot.UnknownUsageReserved || snapshot.ConservativeUsage || snapshot.LegacyRecoveryAuthorized || snapshot.WeeklyCreditsUsed != cfg.WeeklyCreditLimit {
+		t.Fatalf("over-limit recovery changed state: %+v", snapshot)
+	}
+}
+
+func TestSubscriptionAdmissionUnknownUsagePrunesExpiredReservation(t *testing.T) {
+	now := time.Date(2026, 9, 1, 7, 0, 0, 0, time.UTC)
+	cfg := DefaultSubscriptionAdmissionConfig()
+	cfg.Exact.MaxConcurrent, cfg.Exact.TokenCapacity, cfg.Exact.TokensPerSecond = 1, 10, 10
+	controller, err := NewSubscriptionAdmissionController(cfg, "", func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	decision := controller.Acquire(id)
+	if !decision.Allowed {
+		t.Fatalf("admission=%+v", decision)
+	}
+	now = now.Add(8 * 24 * time.Hour)
+	if err := controller.RecordUnknownUsage(id, decision); err == nil {
+		t.Fatal("expired reservation was converted into an active unknown charge")
+	}
+	controller.Release(id, decision)
+	if snapshot := controller.Snapshot(id); snapshot.UnknownUsageReserved || snapshot.WeeklyCreditsUsed != 0 {
+		t.Fatalf("expired reservation survived pruning: %+v", snapshot)
 	}
 }
 

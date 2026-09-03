@@ -51,6 +51,7 @@ type providerNativeOperationLedger interface {
 	ClaimSendOperation(*state.SendOperation) (*state.SendOperation, bool, error)
 	ReleaseSendOperation(operationID, sessionName string) error
 	CompleteSendOperation(operationID, sessionName, outcomeJSON string, completedAt time.Time) error
+	GetSendOperation(operationID, sessionName string) (*state.SendOperation, error)
 }
 
 type providerNativeAdmission interface {

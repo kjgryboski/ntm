@@ -34,6 +34,7 @@ type providerCodexQualificationAdmission interface {
 	Acquire(provider.Identity) ratelimit.SubscriptionDecision
 	Release(provider.Identity, ratelimit.SubscriptionDecision)
 	RecordUsage(provider.Identity, ratelimit.SubscriptionDecision, string, ratelimit.TokenUsage, time.Time) error
+	RecordConservativeUsage(provider.Identity, ratelimit.SubscriptionDecision, ratelimit.TokenUsage, time.Time) error
 	RecordUnknownUsage(provider.Identity, ratelimit.SubscriptionDecision) error
 	CancelReservation(provider.Identity, ratelimit.SubscriptionDecision) error
 	RecordSuccess(provider.Identity)
@@ -207,6 +208,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	accountingState, accountingErr := reconcileProviderCodexQualificationUsage(deps.admission, identity, capacityTurns...)
 	capacityFinalized = true
 	setCodexQualificationCheck(&receipt, "capacity_accounting", accountingErr == nil, "local_authoritative", sha256StringCLI("codex-capacity-accounting-v1:"+accountingState))
+	setCodexQualificationCheckDetail(&receipt, "capacity_accounting", "Bounded subscription accounting: "+accountingState)
 
 	cleanupErr := deps.cleanup(ctx, workspace)
 	cleanupOK := cleanupErr == nil && codexQualificationWorkspaceRemoved(workspace)
@@ -294,7 +296,7 @@ func reconcileProviderCodexQualificationUsage(admission providerCodexQualificati
 	if admission == nil {
 		return "invalid_admission", errors.New("Codex qualification capacity admission is invalid")
 	}
-	dispatched, reconciled, unknown, canceled := 0, 0, 0, 0
+	dispatched, reconciled, conservative, unknown, canceled := 0, 0, 0, 0, 0
 	unknownTurns := make([]codexQualificationTurn, 0, len(turns))
 	for _, turn := range turns {
 		if !turn.admitted || !turn.decision.Allowed || !turn.decision.NoFailover {
@@ -310,11 +312,20 @@ func reconcileProviderCodexQualificationUsage(admission providerCodexQualificati
 		}
 		dispatched++
 		turnTokens := r.Usage.InputTokens + r.Usage.CachedInputTokens + r.Usage.OutputTokens
-		if turn.err != nil || !r.OutcomeKnown || !r.CompletionConfirmed || !r.ModelVerified || r.ResolvedModel != identity.Model() || r.CompletedAt.IsZero() || turnTokens <= 0 {
+		lifecycleComplete := r.ProviderStarted && r.OutcomeKnown && r.CompletionConfirmed && r.NonceVerified && r.LineageVerified && r.ZeroResiduals && r.ExitCode == 0 && !r.CompletedAt.IsZero() && turnTokens > 0
+		if !lifecycleComplete {
 			unknownTurns = append(unknownTurns, turn)
 			continue
 		}
 		usage := ratelimit.TokenUsage{InputTokens: r.Usage.InputTokens, CachedInputTokens: r.Usage.CachedInputTokens, OutputTokens: r.Usage.OutputTokens}
+		if strings.TrimSpace(r.ResolvedModel) == "" {
+			if err := admission.RecordConservativeUsage(identity, turn.decision, usage, r.CompletedAt); err != nil {
+				unknownTurns = append(unknownTurns, turn)
+				continue
+			}
+			conservative++
+			continue
+		}
 		if err := admission.RecordUsage(identity, turn.decision, r.ResolvedModel, usage, r.CompletedAt); err != nil {
 			unknownTurns = append(unknownTurns, turn)
 			continue
@@ -326,12 +337,12 @@ func reconcileProviderCodexQualificationUsage(admission providerCodexQualificati
 	}
 	for _, turn := range unknownTurns {
 		if err := admission.RecordUnknownUsage(identity, turn.decision); err != nil {
-			return fmt.Sprintf("reconciled=%d;unknown_reserved=%d;reservations_canceled=%d", reconciled, unknown, canceled), errors.New("Codex qualification usage could not be conservatively reserved")
+			return fmt.Sprintf("reconciled=%d;conservative=%d;unknown_reserved=%d;reservations_canceled=%d", reconciled, conservative, unknown, canceled), errors.New("Codex qualification usage could not be conservatively reserved")
 		}
 		unknown++
 	}
-	state := fmt.Sprintf("provider_usage_reconciled=%d;unknown_full_week_reserved=%d;reservations_canceled=%d", reconciled, unknown, canceled)
-	if reconciled+unknown != dispatched {
+	state := fmt.Sprintf("provider_usage_reconciled=%d;conservative_max_plan_rate=%d;unknown_full_week_reserved=%d;reservations_canceled=%d", reconciled, conservative, unknown, canceled)
+	if reconciled+conservative+unknown != dispatched {
 		return state, errors.New("Codex qualification did not reconcile every dispatched request")
 	}
 	return state, nil
@@ -352,6 +363,15 @@ func setCodexQualificationCheck(r *providerqualification.Receipt, name string, p
 				evidence = sha256StringCLI(name + ":missing")
 			}
 			r.Checks[i].Passed, r.Checks[i].Provenance, r.Checks[i].EvidenceSHA256, r.Checks[i].Detail = passed, provenance, evidence, "Codex provider qualification gate"
+			return
+		}
+	}
+}
+
+func setCodexQualificationCheckDetail(r *providerqualification.Receipt, name, detail string) {
+	for i := range r.Checks {
+		if r.Checks[i].Name == name {
+			r.Checks[i].Detail = detail
 			return
 		}
 	}

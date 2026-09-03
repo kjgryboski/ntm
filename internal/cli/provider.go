@@ -195,6 +195,8 @@ type providerDoctorSubscriptionCapacity struct {
 	WeeklyCreditsLimit   float64    `json:"weekly_credits_limit"`
 	WeeklyResetsAt       *time.Time `json:"weekly_resets_at,omitempty"`
 	UnknownUsageReserved bool       `json:"unknown_usage_reserved"`
+	ConservativeUsage    bool       `json:"conservative_usage_recorded"`
+	LegacyRecovery       bool       `json:"legacy_owner_authorized_recovery"`
 	LimitEvidence        string     `json:"limit_evidence,omitempty"`
 	ResetEvidence        string     `json:"reset_evidence,omitempty"`
 }
@@ -1234,6 +1236,8 @@ func diagnoseProviderCapacity(identity provider.Identity, deps providerDoctorDep
 			WeeklyCreditsLimit:   codexSnapshot.WeeklyCreditsLimit,
 			WeeklyResetsAt:       codexSnapshot.WeeklyResetsAt,
 			UnknownUsageReserved: codexSnapshot.UnknownUsageReserved,
+			ConservativeUsage:    codexSnapshot.ConservativeUsage,
+			LegacyRecovery:       codexSnapshot.LegacyRecoveryAuthorized,
 			LimitEvidence:        codexSnapshot.LimitEvidence,
 			ResetEvidence:        codexSnapshot.ResetEvidence,
 		}

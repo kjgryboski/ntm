@@ -93,6 +93,16 @@ func (f *providerNativeLedgerFake) CompleteSendOperation(operationID, sessionNam
 	return nil
 }
 
+func (f *providerNativeLedgerFake) GetSendOperation(operationID, sessionName string) (*state.SendOperation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if op := f.ops[sessionName+"\x00"+operationID]; op != nil {
+		copy := *op
+		return &copy, nil
+	}
+	return nil, nil
+}
+
 func providerNativeProfile() config.ProviderProfileConfig {
 	return config.ProviderProfileConfig{
 		Provider: "zai", AccountAlias: "native", Model: "glm-test", Endpoint: zai.NativeChatCompletionsEndpoint,

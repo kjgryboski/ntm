@@ -41,6 +41,8 @@ type providerCodexSubscriptionAdmission interface {
 	Acquire(provider.Identity) ratelimit.SubscriptionDecision
 	Release(provider.Identity, ratelimit.SubscriptionDecision)
 	RecordUsage(provider.Identity, ratelimit.SubscriptionDecision, string, ratelimit.TokenUsage, time.Time) error
+	RecordConservativeUsage(provider.Identity, ratelimit.SubscriptionDecision, ratelimit.TokenUsage, time.Time) error
+	BindReservation(provider.Identity, ratelimit.SubscriptionDecision, string, string) error
 	// RecordUnknownUsage must conservatively reserve/freeze the subscription
 	// scope after a process was dispatched but its cost cannot be reconciled.
 	// It is intentionally not a retry or provider-selection hook.
@@ -153,7 +155,7 @@ type providerCodexSubscriptionAdmissionEvidence struct {
 
 func newProviderCodexCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "codex", Short: "Operate the isolated Z.ai Coding Plan Codex lane"}
-	cmd.AddCommand(newProviderCodexRunCmd())
+	cmd.AddCommand(newProviderCodexRunCmd(), newProviderCodexRecoverCapacityCmd())
 	return cmd
 }
 
@@ -317,6 +319,13 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 		}
 		return err
 	}
+	if err := deps.admission.BindReservation(identity, decision, binding, sha256StringCLI(nonce)); err != nil {
+		_ = ledger.ReleaseSendOperation(claimed.OperationID, claimed.SessionName)
+		if cancelErr := deps.admission.CancelReservation(identity, decision); cancelErr != nil {
+			return errors.New("provider codex reservation binding failed before dispatch and its capacity reservation could not be canceled")
+		}
+		return errors.New("provider codex reservation binding failed before dispatch")
+	}
 	runCtx, cancel := context.WithTimeout(commandCtx, opts.timeout)
 	receipt, runErr := deps.run(runCtx, zai.CodexRunSpec{
 		Binary: profile.Command, BrokerCommand: profile.BrokerCommand, CredentialBridgeCommand: profile.CredentialBridgeCommand, RuntimeHome: profile.RuntimeHome, CWD: cwd,
@@ -362,11 +371,22 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 		}
 	}
 	if runErr != nil {
+		completedWithoutModel := validateProviderCodexTerminalReceipt(receipt, identity, logicalPrompt, nonce, cwd, opts, manifest, false) == nil
 		// A started process may have sent a billable provider request even when
 		// its structured result is incomplete (including stock Codex builds with
 		// no terminal server_model field). Never leave only the normal tiny
 		// admission reservation in place after such a dispatch.
-		if receipt.ProcessStarted {
+		if receipt.ProcessStarted && completedWithoutModel {
+			usage := ratelimit.TokenUsage{InputTokens: receipt.Usage.InputTokens, CachedInputTokens: receipt.Usage.CachedInputTokens, OutputTokens: receipt.Usage.OutputTokens}
+			if reconciliationErr := deps.admission.RecordConservativeUsage(identity, decision, usage, receipt.CompletedAt); reconciliationErr != nil {
+				if reservationErr := reserveUnknownUsage(); reservationErr != nil {
+					output.State, output.ReceiptState = "outcome_unknown", "outcome_unknown"
+					return finishProviderCodex(cmd, output, errors.New("provider codex completed without model evidence, but neither conservative accounting nor an unknown-usage reservation could be recorded; do not redispatch"))
+				}
+				output.State, output.ReceiptState = "outcome_unknown", "outcome_unknown"
+				return finishProviderCodex(cmd, output, errors.New("provider codex completed without model evidence; conservative accounting failed and the subscription was frozen as unknown; do not redispatch"))
+			}
+		} else if receipt.ProcessStarted {
 			if reservationErr := reserveUnknownUsage(); reservationErr != nil {
 				output.State, output.ReceiptState = "outcome_unknown", "outcome_unknown"
 				return finishProviderCodex(cmd, output, errors.New("provider codex dispatched an unreconciled request and the subscription scope could not be conservatively reserved; do not redispatch"))
@@ -377,7 +397,7 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 			return finishProviderCodex(cmd, output, errors.New("provider codex subscription usage is not authoritatively reconciled; do not redispatch"))
 		}
 		switch {
-		case validateProviderCodexTerminalReceipt(receipt, identity, logicalPrompt, nonce, cwd, opts, manifest, false) == nil:
+		case completedWithoutModel:
 			// This is the expected fail-closed state when Codex JSONL does not
 			// expose terminal server_model evidence, so execution can be
 			// recorded but cannot qualify or become primary.
@@ -522,9 +542,22 @@ func validateProviderCodexTerminalReceipt(receipt zai.CodexRunReceipt, identity 
 }
 
 func providerCodexBindingHash(identity provider.Identity, prompt, cwd string, opts providerCodexRunOptions, manifest zai.CodexManifestAttestation) string {
+	return providerCodexBindingHashFromDigests(
+		identity,
+		sha256StringCLI(prompt),
+		sha256StringCLI(filepath.Clean(cwd)),
+		opts.workspaceWrite,
+		opts.workloadClass,
+		strings.TrimSpace(opts.parentSession) != "",
+		sha256StringCLI(strings.TrimSpace(opts.parentSession)),
+		manifest,
+	)
+}
+
+func providerCodexBindingHashFromDigests(identity provider.Identity, promptSHA256, cwdSHA256 string, workspaceWrite bool, workloadClass string, resume bool, parentSessionSHA256 string, manifest zai.CodexManifestAttestation) string {
 	fields := []string{
-		providerCodexRunSchema, identity.Hash(), sha256StringCLI(prompt), sha256StringCLI(filepath.Clean(cwd)),
-		fmt.Sprint(opts.workspaceWrite), opts.workloadClass, fmt.Sprint(strings.TrimSpace(opts.parentSession) != ""), sha256StringCLI(strings.TrimSpace(opts.parentSession)),
+		providerCodexRunSchema, identity.Hash(), promptSHA256, cwdSHA256,
+		fmt.Sprint(workspaceWrite), workloadClass, fmt.Sprint(resume), parentSessionSHA256,
 		manifest.ConfigSHA256, manifest.BinarySHA256, manifest.AuthHelperSHA256, manifest.CredentialBridgeSHA256, providerCodexPolicySHA256(),
 	}
 	return sha256StringCLI(strings.Join(fields, "\x00"))

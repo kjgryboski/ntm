@@ -55,6 +55,19 @@ var codexRequiredChecks = []string{
 	"zero_residual_cleanup",
 }
 
+// codexCapacityRecoveryAuthorizationRequiredChecks is an authorization
+// matrix, not a runtime qualification. It is stored in a separate tree and
+// explicitly records the legacy evidence-link limitation before mutation.
+var codexCapacityRecoveryAuthorizationRequiredChecks = []string{
+	"profile_manifest",
+	"operation_ledger",
+	"isolated_rollout",
+	"nonce_completion",
+	"provider_usage",
+	"unknown_reservation_observed",
+	"owner_authorized_unbound_exception",
+}
+
 var nativeRequiredChecks = []string{
 	"exact_model_request_id",
 	"controller_tool_loop",
@@ -258,6 +271,8 @@ func requiredChecksForTransport(transport string) ([]string, error) {
 		return requiredChecks, nil
 	case "zai_codex_runtime":
 		return codexRequiredChecks, nil
+	case "zai_codex_capacity_recovery_authorization":
+		return codexCapacityRecoveryAuthorizationRequiredChecks, nil
 	case "zai_native_api":
 		return nativeRequiredChecks, nil
 	default:
@@ -273,6 +288,13 @@ func NativeRequiredChecks() []string { return append([]string(nil), nativeRequir
 // Codex matrix. Keeping this exported prevents the live CLI adapter from
 // re-declaring a potentially incomplete gate list.
 func CodexRequiredChecks() []string { return append([]string(nil), codexRequiredChecks...) }
+
+// CodexCapacityRecoveryAuthorizationRequiredChecks returns the one-shot
+// legacy authorization matrix. These records are stored separately and never
+// qualify a runtime.
+func CodexCapacityRecoveryAuthorizationRequiredChecks() []string {
+	return append([]string(nil), codexCapacityRecoveryAuthorizationRequiredChecks...)
+}
 
 func (r Receipt) validateIdentityFields() error {
 	if strings.TrimSpace(r.Provider) == "" || strings.TrimSpace(r.Transport) == "" || strings.TrimSpace(r.RuntimeVersion) == "" {

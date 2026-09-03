@@ -2,6 +2,7 @@ package ratelimit
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -109,6 +110,16 @@ type subscriptionUsageEvent struct {
 	ObservedAt time.Time `json:"observed_at"`
 	Credits    float64   `json:"credits"`
 	Reconciled bool      `json:"reconciled"`
+	// Conservative means the request completed with provider token usage but
+	// without provider-resolved model evidence. Credits are then charged at
+	// the highest supported Coding Plan rate without claiming model identity.
+	Conservative bool `json:"conservative,omitempty"`
+	// RecoveryAuthorizationSHA256 binds an explicit, signed owner
+	// authorization to a legacy unbound accounting repair. It is never model
+	// identity or automatic operation-to-usage evidence.
+	RecoveryAuthorizationSHA256 string `json:"recovery_authorization_sha256,omitempty"`
+	OperationBindingSHA256      string `json:"operation_binding_sha256,omitempty"`
+	NonceSHA256                 string `json:"nonce_sha256,omitempty"`
 	// Unknown records that a dispatched request could not be reconciled to
 	// provider-resolved model and token evidence. Its conservative reservation
 	// deliberately prevents additional spend in the same subscription scope.
@@ -160,21 +171,23 @@ type SubscriptionDecision struct {
 
 // SubscriptionCapacitySnapshot exposes non-secret window use/reset evidence.
 type SubscriptionCapacitySnapshot struct {
-	IdentityHash            string                        `json:"identity_hash"`
-	SubscriptionScopeSHA256 string                        `json:"subscription_scope_sha256"`
-	Exact                   AdmissionSnapshot             `json:"exact"`
-	PlanRunning             int                           `json:"plan_running"`
-	FiveHourCreditsUsed     float64                       `json:"five_hour_credits_used"`
-	FiveHourCreditsLimit    float64                       `json:"five_hour_credits_limit"`
-	FiveHourResetsAt        *time.Time                    `json:"five_hour_resets_at,omitempty"`
-	WeeklyCreditsUsed       float64                       `json:"weekly_credits_used"`
-	WeeklyCreditsLimit      float64                       `json:"weekly_credits_limit"`
-	WeeklyResetsAt          *time.Time                    `json:"weekly_resets_at,omitempty"`
-	Scope                   provider.CapacityControlScope `json:"scope"`
-	FallbackReason          string                        `json:"fallback_reason,omitempty"`
-	LimitEvidence           string                        `json:"limit_evidence,omitempty"`
-	ResetEvidence           string                        `json:"reset_evidence,omitempty"`
-	UnknownUsageReserved    bool                          `json:"unknown_usage_reserved"`
+	IdentityHash             string                        `json:"identity_hash"`
+	SubscriptionScopeSHA256  string                        `json:"subscription_scope_sha256"`
+	Exact                    AdmissionSnapshot             `json:"exact"`
+	PlanRunning              int                           `json:"plan_running"`
+	FiveHourCreditsUsed      float64                       `json:"five_hour_credits_used"`
+	FiveHourCreditsLimit     float64                       `json:"five_hour_credits_limit"`
+	FiveHourResetsAt         *time.Time                    `json:"five_hour_resets_at,omitempty"`
+	WeeklyCreditsUsed        float64                       `json:"weekly_credits_used"`
+	WeeklyCreditsLimit       float64                       `json:"weekly_credits_limit"`
+	WeeklyResetsAt           *time.Time                    `json:"weekly_resets_at,omitempty"`
+	Scope                    provider.CapacityControlScope `json:"scope"`
+	FallbackReason           string                        `json:"fallback_reason,omitempty"`
+	LimitEvidence            string                        `json:"limit_evidence,omitempty"`
+	ResetEvidence            string                        `json:"reset_evidence,omitempty"`
+	UnknownUsageReserved     bool                          `json:"unknown_usage_reserved"`
+	ConservativeUsage        bool                          `json:"conservative_usage_recorded"`
+	LegacyRecoveryAuthorized bool                          `json:"legacy_owner_authorized_recovery"`
 }
 
 // TokenUsage contains provider-reported token counts. Callers must pass a
@@ -272,17 +285,67 @@ func (c *SubscriptionAdmissionController) RecordSuccess(identity provider.Identi
 	c.plan.recordSuccessScope(identity.SubscriptionCapacityScope())
 }
 
+// BindReservation attaches controller-owned operation and nonce digests
+// before provider dispatch. Future recovery can then require an exact link
+// instead of relying on a legacy timestamp coincidence.
+func (c *SubscriptionAdmissionController) BindReservation(identity provider.Identity, decision SubscriptionDecision, operationBindingSHA256, nonceSHA256 string) error {
+	if c == nil || c.plan == nil || !decision.Allowed || !validIdentity(identity) || decision.plan.leaseID == "" || !validSubscriptionEvidenceDigest(operationBindingSHA256) || !validSubscriptionEvidenceDigest(nonceSHA256) {
+		return errors.New("invalid subscription reservation binding")
+	}
+	updated := false
+	if !c.plan.withAuthoritativeState(identity.SubscriptionCapacityScope(), c.plan.now(), func(state *admissionState) {
+		for index := range state.subscriptionUsage {
+			event := &state.subscriptionUsage[index]
+			if event.LeaseID != decision.plan.leaseID {
+				continue
+			}
+			if event.Reconciled || event.Unknown || event.OperationBindingSHA256 != "" || event.NonceSHA256 != "" {
+				return
+			}
+			event.OperationBindingSHA256 = operationBindingSHA256
+			event.NonceSHA256 = nonceSHA256
+			updated = true
+			return
+		}
+	}) {
+		return errors.New("shared subscription reservation binding is unavailable")
+	}
+	if !updated {
+		return errors.New("subscription reservation binding was not applied")
+	}
+	return nil
+}
+
 // RecordUsage replaces one small admission reservation with provider-reported
 // Coding Plan credit usage. resolvedModel must come from the provider receipt,
 // never a configured/requested model. observedAt is retained only as a
 // controller-local rolling-window estimate.
 func (c *SubscriptionAdmissionController) RecordUsage(identity provider.Identity, decision SubscriptionDecision, resolvedModel string, usage TokenUsage, observedAt time.Time) error {
-	if c == nil || c.plan == nil || !decision.Allowed || !validIdentity(identity) || decision.plan.leaseID == "" || observedAt.IsZero() {
-		return errors.New("invalid subscription usage reconciliation")
-	}
 	credits, err := ZAICodingPlanCredits(resolvedModel, usage, observedAt)
 	if err != nil {
 		return err
+	}
+	return c.recordUsageCredits(identity, decision, credits, observedAt, false)
+}
+
+// RecordConservativeUsage reconciles a completed request whose token usage is
+// provider-reported but whose resolved model is unavailable. It charges the
+// larger supported Coding Plan rate and does not establish model identity.
+func (c *SubscriptionAdmissionController) RecordConservativeUsage(identity provider.Identity, decision SubscriptionDecision, usage TokenUsage, observedAt time.Time) error {
+	if _, valid := positiveTokenUsageTotal(usage); !valid {
+		return errors.New("invalid conservative subscription usage")
+	}
+	full, fullErr := ZAICodingPlanCredits("glm-5.3", usage, observedAt)
+	flash, flashErr := ZAICodingPlanCredits("glm-5.3-flash", usage, observedAt)
+	if fullErr != nil || flashErr != nil {
+		return errors.New("calculate conservative subscription usage")
+	}
+	return c.recordUsageCredits(identity, decision, math.Max(full, flash), observedAt, true)
+}
+
+func (c *SubscriptionAdmissionController) recordUsageCredits(identity provider.Identity, decision SubscriptionDecision, credits float64, observedAt time.Time, conservative bool) error {
+	if c == nil || c.plan == nil || !decision.Allowed || !validIdentity(identity) || decision.plan.leaseID == "" || observedAt.IsZero() || math.IsNaN(credits) || math.IsInf(credits, 0) || credits < 0 {
+		return errors.New("invalid subscription usage reconciliation")
 	}
 	scope := identity.SubscriptionCapacityScope()
 	updated := false
@@ -295,7 +358,7 @@ func (c *SubscriptionAdmissionController) RecordUsage(identity provider.Identity
 			if event.Reconciled {
 				return
 			}
-			event.Credits, event.ObservedAt, event.Reconciled = credits, observedAt.UTC(), true
+			event.Credits, event.ObservedAt, event.Reconciled, event.Conservative = credits, observedAt.UTC(), true, conservative
 			updated = true
 			return
 		}
@@ -351,6 +414,7 @@ func (c *SubscriptionAdmissionController) RecordUnknownUsage(identity provider.I
 	scope := identity.SubscriptionCapacityScope()
 	updated := false
 	if !c.plan.withAuthoritativeState(scope, c.plan.now(), func(state *admissionState) {
+		pruneSubscriptionUsage(state, c.plan.now(), c.config.WeeklyWindow)
 		for index := range state.subscriptionUsage {
 			event := &state.subscriptionUsage[index]
 			if event.LeaseID != decision.plan.leaseID {
@@ -385,6 +449,104 @@ func (c *SubscriptionAdmissionController) RecordUnknownUsage(identity provider.I
 		return errors.New("subscription usage reservation is unavailable or already reconciled")
 	}
 	return nil
+}
+
+// ApplyLegacyUnknownUsageAuthorization replaces one recent full-week unknown
+// reservation after a signed owner authorization has already been persisted.
+// Legacy state has no cryptographic operation-to-reservation link, so this is
+// intentionally not automatic evidence recovery and never establishes model
+// identity.
+func (c *SubscriptionAdmissionController) ApplyLegacyUnknownUsageAuthorization(identity provider.Identity, usage TokenUsage, completedAt time.Time, authorizationSHA256 string) (float64, error) {
+	totalTokens, validUsage := positiveTokenUsageTotal(usage)
+	if c == nil || c.plan == nil || !validIdentity(identity) || completedAt.IsZero() || !validUsage || !validSubscriptionEvidenceDigest(authorizationSHA256) {
+		return 0, errors.New("invalid unknown subscription usage recovery")
+	}
+	now := c.plan.now().UTC()
+	completedAt = completedAt.UTC()
+	if completedAt.After(now.Add(time.Minute)) || now.Sub(completedAt) > c.config.WeeklyWindow {
+		return 0, errors.New("unknown subscription usage recovery timestamp is outside the active window")
+	}
+	// This legacy recovery format is not trusted to preserve every future
+	// token category's billing semantics. Charge every reported token at the
+	// most expensive supported GLM-5.3 output rate.
+	worstCase := TokenUsage{OutputTokens: totalTokens}
+	credits, creditErr := ZAICodingPlanCredits("glm-5.3", worstCase, completedAt)
+	if creditErr != nil {
+		return 0, errors.New("calculate recovered subscription usage")
+	}
+	updated := false
+	if !c.plan.withAuthoritativeState(identity.SubscriptionCapacityScope(), now, func(state *admissionState) {
+		pruneSubscriptionUsage(state, now, c.config.WeeklyWindow)
+		unknownCount, candidate := 0, -1
+		for index, event := range state.subscriptionUsage {
+			if !event.Unknown {
+				continue
+			}
+			unknownCount++
+			if event.Reconciled && event.OperationBindingSHA256 == "" && event.NonceSHA256 == "" && !event.ObservedAt.Before(completedAt) && event.ObservedAt.Sub(completedAt) <= 15*time.Minute {
+				candidate = index
+			}
+		}
+		if unknownCount != 1 || candidate < 0 {
+			return
+		}
+		var fiveHourOther, weeklyOther float64
+		for index, other := range state.subscriptionUsage {
+			if index == candidate {
+				continue
+			}
+			if other.ObservedAt.After(now.Add(-c.config.WeeklyWindow)) {
+				weeklyOther += other.Credits
+			}
+			if other.ObservedAt.After(now.Add(-c.config.FiveHourWindow)) {
+				fiveHourOther += other.Credits
+			}
+		}
+		if weeklyOther+credits > c.config.WeeklyCreditLimit || (completedAt.After(now.Add(-c.config.FiveHourWindow)) && fiveHourOther+credits > c.config.FiveHourCreditLimit) {
+			return
+		}
+		event := &state.subscriptionUsage[candidate]
+		event.Credits = credits
+		event.ObservedAt = completedAt
+		event.Conservative = true
+		event.Unknown = false
+		event.RecoveryAuthorizationSHA256 = authorizationSHA256
+		updated = true
+	}) {
+		return 0, errors.New("shared unknown subscription usage recovery is unavailable")
+	}
+	if !updated {
+		return 0, errors.New("exactly one matching unknown subscription reservation is required")
+	}
+	return credits, nil
+}
+
+func validSubscriptionEvidenceDigest(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, char := range value {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func positiveTokenUsageTotal(usage TokenUsage) (int64, bool) {
+	if usage.InputTokens < 0 || usage.CachedInputTokens < 0 || usage.OutputTokens < 0 {
+		return 0, false
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	if usage.InputTokens > maxInt64-usage.CachedInputTokens {
+		return 0, false
+	}
+	total := usage.InputTokens + usage.CachedInputTokens
+	if total > maxInt64-usage.OutputTokens {
+		return 0, false
+	}
+	total += usage.OutputTokens
+	return total, total > 0
 }
 
 var zaiSingapore = time.FixedZone("Asia/Singapore", 8*60*60)
@@ -521,7 +683,12 @@ func (c *SubscriptionAdmissionController) Snapshot(identity provider.Identity) S
 	for _, event := range state.subscriptionUsage {
 		if event.Unknown {
 			snapshot.UnknownUsageReserved = true
-			break
+		}
+		if event.Conservative {
+			snapshot.ConservativeUsage = true
+		}
+		if event.RecoveryAuthorizationSHA256 != "" {
+			snapshot.LegacyRecoveryAuthorized = true
 		}
 	}
 	return snapshot
