@@ -107,11 +107,11 @@ func codexJSONL(t *testing.T, values ...map[string]any) []byte {
 func codexSuccessEvents(t *testing.T, session, model, nonce string) []byte {
 	t.Helper()
 	return codexJSONL(t,
-		map[string]any{"type": "thread.started", "thread_id": session, "resolved_model": model},
+		map[string]any{"type": "thread.started", "thread_id": session},
 		map[string]any{"type": "turn.started"},
 		map[string]any{"type": "item.completed", "item": map[string]any{"id": "tool-1", "type": "command_execution", "aggregated_output": nonce, "exit_code": 0, "status": "completed"}},
 		map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": nonce}},
-		map[string]any{"type": "turn.completed", "usage": map[string]any{"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 3, "total_tokens": 13}},
+		map[string]any{"type": "turn.completed", "server_model": model, "usage": map[string]any{"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 3, "total_tokens": 13}},
 	)
 }
 
@@ -125,6 +125,9 @@ func TestRunCodexStructuredBindsOnlyFinalAgentNonce(t *testing.T) {
 	}
 	if !receipt.CompletionConfirmed || !receipt.NonceVerified || !receipt.ModelVerified || receipt.ToolEventCount != 1 || receipt.ResolvedModel != "glm-5.3" || receipt.Usage.TotalTokens != 13 || receipt.SessionIDSHA256 == "" {
 		t.Fatalf("receipt = %+v", receipt)
+	}
+	if receipt.ModelEvidence != "turn.completed.server_model" {
+		t.Fatalf("model evidence = %q", receipt.ModelEvidence)
 	}
 	joinedEnv := strings.Join(runner.seen.Env, "\n")
 	envBlock := "\n" + joinedEnv + "\n"
@@ -175,6 +178,95 @@ func TestRunCodexStructuredRejectsGenericModelEchoAsResolvedEvidence(t *testing.
 	}
 }
 
+func TestRunCodexStructuredAcceptsOnlyTerminalServerModel(t *testing.T) {
+	runner := &codexRunnerFixture{}
+	spec := codexFixtureSpec(t, runner)
+	runner.outcome.Stdout = codexJSONL(t,
+		map[string]any{"type": "thread.started", "thread_id": codexTestSession, "model": "glm-5.3", "resolved_model": "glm-5.3-flash"},
+		map[string]any{"type": "turn.started", "model": "glm-5.3-flash"},
+		map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": spec.ExpectedNonce}},
+		map[string]any{"type": "turn.completed", "model": "glm-5.3-flash", "resolved_model": "glm-5.3-flash", "server_model": "glm-5.3", "usage": map[string]any{"input_tokens": 1, "output_tokens": 1}},
+	)
+	receipt, err := RunCodexStructured(context.Background(), spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !receipt.ModelVerified || receipt.ResolvedModel != "glm-5.3" || receipt.ModelEvidence != "turn.completed.server_model" {
+		t.Fatalf("terminal server model was not the sole evidence: %+v", receipt)
+	}
+}
+
+func TestRunCodexStructuredRejectsPrematureOrInvalidServerModel(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		first map[string]any
+		last  map[string]any
+	}{
+		{name: "thread_started", first: map[string]any{"server_model": "glm-5.3"}},
+		{name: "turn_started", first: map[string]any{"model": "glm-5.3"}, last: map[string]any{"server_model": "glm-5.3"}},
+		{name: "terminal_non_string", first: map[string]any{}, last: map[string]any{"server_model": 53}},
+		{name: "terminal_conflict", first: map[string]any{}, last: map[string]any{"server_model": "glm-5.3", "server_model_conflict": true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := &codexRunnerFixture{}
+			spec := codexFixtureSpec(t, runner)
+			thread := map[string]any{"type": "thread.started", "thread_id": codexTestSession}
+			for key, value := range test.first {
+				thread[key] = value
+			}
+			turn := map[string]any{"type": "turn.started"}
+			if test.name == "turn_started" {
+				turn["server_model"] = "glm-5.3"
+			}
+			completed := map[string]any{"type": "turn.completed", "usage": map[string]any{"input_tokens": 1, "output_tokens": 1}}
+			for key, value := range test.last {
+				completed[key] = value
+			}
+			runner.outcome.Stdout = codexJSONL(t,
+				thread,
+				turn,
+				map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": spec.ExpectedNonce}},
+				completed,
+			)
+			receipt, err := RunCodexStructured(context.Background(), spec)
+			if err == nil || receipt.ModelVerified {
+				t.Fatalf("invalid server-model evidence accepted: receipt=%+v err=%v", receipt, err)
+			}
+		})
+	}
+}
+
+func TestRunCodexStructuredRejectsNonCanonicalTerminalServerModel(t *testing.T) {
+	for _, serverModel := range []any{"", " glm-5.3", "glm-5.3 ", "GLM-5.3", "glm_5.3", "\tglm-5.3"} {
+		t.Run(fmt.Sprintf("%q", serverModel), func(t *testing.T) {
+			runner := &codexRunnerFixture{}
+			spec := codexFixtureSpec(t, runner)
+			runner.outcome.Stdout = codexJSONL(t,
+				map[string]any{"type": "thread.started", "thread_id": codexTestSession},
+				map[string]any{"type": "turn.started"},
+				map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": spec.ExpectedNonce}},
+				map[string]any{"type": "turn.completed", "server_model": serverModel},
+			)
+			receipt, err := RunCodexStructured(context.Background(), spec)
+			if err == nil || receipt.ModelVerified {
+				t.Fatalf("non-canonical server model accepted: receipt=%+v err=%v", receipt, err)
+			}
+		})
+	}
+}
+
+func TestParseCodexEventsRejectsServerModelOutsideTerminalCompletion(t *testing.T) {
+	raw := codexJSONL(t,
+		map[string]any{"type": "thread.started", "thread_id": codexTestSession},
+		map[string]any{"type": "turn.started"},
+		map[string]any{"type": "item.completed", "server_model": "glm-5.3", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": "nonce"}},
+		map[string]any{"type": "turn.completed", "server_model": "glm-5.3"},
+	)
+	if _, err := parseCodexEvents(raw, "nonce", "", false); err == nil {
+		t.Fatal("non-terminal server_model was accepted")
+	}
+}
+
 func TestRunCodexStructuredFailsClosedOnMissingOrRemappedModel(t *testing.T) {
 	for _, test := range []struct {
 		name  string
@@ -205,11 +297,11 @@ func TestRunCodexStructuredBindsExpectedDeniedCommandWithoutRetainingIt(t *testi
 	var observedSession string
 	spec.SessionObserver = func(session string) { observedSession = session }
 	runner.outcome.Stdout = codexJSONL(t,
-		map[string]any{"type": "thread.started", "thread_id": codexTestSession, "resolved_model": "glm-5.3"},
+		map[string]any{"type": "thread.started", "thread_id": codexTestSession},
 		map[string]any{"type": "turn.started"},
 		map[string]any{"type": "item.completed", "item": map[string]any{"id": "tool-1", "type": "command_execution", "command": spec.ExpectedToolCommand, "aggregated_output": "permission denied", "exit_code": 1, "status": "completed"}},
 		map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": spec.ExpectedNonce}},
-		map[string]any{"type": "turn.completed"},
+		map[string]any{"type": "turn.completed", "server_model": "glm-5.3"},
 	)
 	receipt, err := RunCodexStructured(context.Background(), spec)
 	if err != nil {
@@ -229,11 +321,11 @@ func TestRunCodexStructuredBindsExpectedFileChangeWithoutRetainingPath(t *testin
 	spec := codexFixtureSpec(t, runner)
 	spec.ExpectedFileChange = "qualification.go"
 	runner.outcome.Stdout = codexJSONL(t,
-		map[string]any{"type": "thread.started", "thread_id": codexTestSession, "resolved_model": "glm-5.3"},
+		map[string]any{"type": "thread.started", "thread_id": codexTestSession},
 		map[string]any{"type": "turn.started"},
 		map[string]any{"type": "item.completed", "item": map[string]any{"id": "file-1", "type": "file_change", "changes": []map[string]any{{"path": spec.ExpectedFileChange, "kind": "add"}}, "status": "completed"}},
 		map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": spec.ExpectedNonce}},
-		map[string]any{"type": "turn.completed"},
+		map[string]any{"type": "turn.completed", "server_model": "glm-5.3"},
 	)
 	receipt, err := RunCodexStructured(context.Background(), spec)
 	if err != nil {
@@ -253,11 +345,11 @@ func TestRunCodexStructuredRejectsExpectedCommandThatSucceeded(t *testing.T) {
 	spec := codexFixtureSpec(t, runner)
 	spec.ExpectedToolCommand = "git push"
 	runner.outcome.Stdout = codexJSONL(t,
-		map[string]any{"type": "thread.started", "thread_id": codexTestSession, "resolved_model": "glm-5.3"},
+		map[string]any{"type": "thread.started", "thread_id": codexTestSession},
 		map[string]any{"type": "turn.started"},
 		map[string]any{"type": "item.completed", "item": map[string]any{"id": "tool-1", "type": "command_execution", "command": spec.ExpectedToolCommand, "exit_code": 0, "status": "completed"}},
 		map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": spec.ExpectedNonce}},
-		map[string]any{"type": "turn.completed"},
+		map[string]any{"type": "turn.completed", "server_model": "glm-5.3"},
 	)
 	receipt, err := RunCodexStructured(context.Background(), spec)
 	if err == nil || receipt.ExpectedToolDenied {
@@ -363,11 +455,11 @@ func TestParseCodexEventsRejectsPostTerminalInjection(t *testing.T) {
 
 func TestParseCodexEventsRejectsMultipleAgentMessages(t *testing.T) {
 	raw := codexJSONL(t,
-		map[string]any{"type": "thread.started", "thread_id": codexTestSession, "resolved_model": "glm-5.3"},
+		map[string]any{"type": "thread.started", "thread_id": codexTestSession},
 		map[string]any{"type": "turn.started"},
 		map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": "extra text"}},
 		map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-2", "type": "agent_message", "text": "nonce"}},
-		map[string]any{"type": "turn.completed"},
+		map[string]any{"type": "turn.completed", "server_model": "glm-5.3"},
 	)
 	if _, err := parseCodexEvents(raw, "nonce", "", false); err == nil {
 		t.Fatal("multiple agent messages were accepted as an exact final acknowledgement")
@@ -387,15 +479,17 @@ func TestRunCodexStructuredRejectsOptionShapedResumeSession(t *testing.T) {
 	}
 }
 
-func TestParseCodexEventsRejectsMalformedAndConflictingEvidence(t *testing.T) {
+func TestParseCodexEventsRejectsMalformedAndGenericModelOnlyEvidence(t *testing.T) {
 	if _, err := parseCodexEvents([]byte("not-json\n"), "nonce", "", false); err == nil {
 		t.Fatal("malformed event accepted")
 	}
 	raw := codexJSONL(t,
 		map[string]any{"type": "thread.started", "thread_id": codexTestSession, "resolved_model": "glm-5.3"},
 		map[string]any{"type": "turn.started", "resolved_model": "glm-5.3-flash"},
+		map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": "nonce"}},
+		map[string]any{"type": "turn.completed", "resolved_model": "glm-5.3-flash"},
 	)
 	if _, err := parseCodexEvents(raw, "nonce", "", false); err == nil {
-		t.Fatal("conflicting model evidence accepted")
+		t.Fatal("generic model fields were accepted as provider evidence")
 	}
 }

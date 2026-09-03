@@ -607,6 +607,11 @@ func parseCodexEvents(raw []byte, nonce, parent string, resume bool, expectedCom
 		if !ok || typ == "" {
 			return parsed, errors.New("Codex JSON event has no type")
 		}
+		if typ != "turn.completed" {
+			if err := rejectPrematureCodexServerModel(event, typ); err != nil {
+				return parsed, err
+			}
+		}
 		switch typ {
 		case "thread.started":
 			if linesSeen != 1 {
@@ -621,17 +626,11 @@ func parseCodexEvents(raw []byte, nonce, parent string, resume bool, expectedCom
 			}
 			parsed.sessionID = sessionID
 			parsed.providerStarted = true
-			if err := recordCodexModel(&parsed, event, "thread.started"); err != nil {
-				return parsed, err
-			}
 		case "turn.started":
 			if !parsed.providerStarted || parsed.turnStarted {
 				return parsed, errors.New("Codex turn.started ordering is invalid")
 			}
 			parsed.turnStarted = true
-			if err := recordCodexModel(&parsed, event, "turn.started"); err != nil {
-				return parsed, err
-			}
 		case "item.completed":
 			if !parsed.turnStarted {
 				return parsed, errors.New("Codex item.completed preceded turn.started")
@@ -704,7 +703,10 @@ func parseCodexEvents(raw []byte, nonce, parent string, resume bool, expectedCom
 			if stop, ok := rawJSONString(event["stop_reason"]); ok && stop != "" {
 				parsed.stopReason = stop
 			}
-			if err := recordCodexModel(&parsed, event, "turn.completed"); err != nil {
+			if _, present := event["server_model_conflict"]; present {
+				return parsed, errors.New("Codex terminal server_model_conflict is not valid provider evidence")
+			}
+			if err := recordCodexServerModel(&parsed, event); err != nil {
 				return parsed, err
 			}
 			usage, err := rawJSONObjectOptional(event["usage"])
@@ -779,19 +781,40 @@ func validCodexRelativePath(value string) bool {
 	return clean != "." && clean != ".." && !strings.HasPrefix(clean, ".."+string(filepath.Separator))
 }
 
-func recordCodexModel(parsed *codexParsed, event map[string]json.RawMessage, eventType string) error {
-	model, ok := rawJSONString(event["resolved_model"])
-	if !ok || model == "" {
+// A provider model is authoritative only when the server attests it on the
+// terminal completion event. Requested/configured model fields are deliberately
+// ignored: they are inputs to Codex, not evidence of upstream resolution.
+func recordCodexServerModel(parsed *codexParsed, event map[string]json.RawMessage) error {
+	raw, present := event["server_model"]
+	if !present {
 		return nil
 	}
-	if hasControl(model) {
-		return errors.New("Codex structured event contains an invalid model")
+	model, ok := rawJSONString(raw)
+	if !ok || model == "" {
+		return errors.New("Codex terminal server_model is invalid")
+	}
+	if !validCanonicalCodexServerModel(model) {
+		return errors.New("Codex terminal server_model is invalid")
 	}
 	if parsed.model != "" && parsed.model != model {
-		return errors.New("Codex structured events contain conflicting resolved models")
+		return errors.New("Codex structured events contain conflicting server models")
 	}
 	parsed.model = model
-	parsed.modelEvidence = eventType + ".resolved_model"
+	parsed.modelEvidence = "turn.completed.server_model"
+	return nil
+}
+
+func validCanonicalCodexServerModel(model string) bool {
+	if model != strings.TrimSpace(model) || hasControl(model) {
+		return false
+	}
+	return model == "glm-5.3" || model == "glm-5.3-flash"
+}
+
+func rejectPrematureCodexServerModel(event map[string]json.RawMessage, eventType string) error {
+	if _, present := event["server_model"]; present {
+		return fmt.Errorf("Codex %s emitted server_model before terminal completion", eventType)
+	}
 	return nil
 }
 

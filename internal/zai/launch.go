@@ -60,11 +60,12 @@ func RestrictedCodexLaunchCommand(binary, endpoint, model, runtimeHome string) (
 
 // CodexProbe is a bounded structured no-write readiness check. A successful
 // result proves the isolated Codex process returned the nonce and records a
-// redacted session/output hash. Current Codex event schemas do not guarantee a
-// resolved-model echo, so this probe deliberately does not promote the
-// manifest model into runtime model evidence; production admission remains
-// NO-GO until a versioned model-evidence extractor is qualified. Resume stays
-// unavailable until a dedicated live lineage probe is added.
+// redacted session/output hash. Runtime model evidence is accepted only from a
+// terminal turn.completed.server_model field; requested or configured model
+// values are inputs, not provider evidence. Current Codex builds do not
+// guarantee that terminal field, so production admission remains NO-GO until a
+// versioned model-evidence extractor is qualified. Resume stays unavailable
+// until a dedicated live lineage probe is added.
 func CodexProbe(ctx context.Context, binary, endpoint, model, runtimeHome string) (Receipt, error) {
 	if ctx == nil {
 		return Receipt{FailureClass: "invalid_context"}, errors.New("Z.ai Codex probe requires a context")
@@ -99,12 +100,12 @@ func CodexProbe(ctx context.Context, binary, endpoint, model, runtimeHome string
 		r.FailureClass = "nonce_missing"
 		return r, errors.New("Z.ai Codex probe did not echo its nonce")
 	}
-	// Codex's structured events expose session/thread information but model
-	// echo support varies by CLI build. Hash the output as redacted session
-	// evidence, but never claim the requested model was runtime-confirmed.
+	// Codex's structured events expose session/thread information but terminal
+	// server_model support varies by CLI build. Hash the output as redacted
+	// session evidence, but never claim the requested model was runtime-confirmed.
 	r.SessionIDSHA256 = hash(stdout.Bytes())
 	r.FailureClass = "model_session_evidence_missing"
-	return r, errors.New("Z.ai Codex probe lacks versioned resolved-model evidence")
+	return r, errors.New("Z.ai Codex probe lacks terminal server-model evidence")
 }
 
 func minimalCodexEnvironment(in []string, endpoint, runtimeHome string) []string {

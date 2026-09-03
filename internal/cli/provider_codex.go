@@ -363,8 +363,8 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 	}
 	if runErr != nil {
 		// A started process may have sent a billable provider request even when
-		// its structured result is incomplete (including Codex 0.149's known
-		// missing resolved-model field). Never leave only the normal tiny
+		// its structured result is incomplete (including stock Codex builds with
+		// no terminal server_model field). Never leave only the normal tiny
 		// admission reservation in place after such a dispatch.
 		if receipt.ProcessStarted {
 			if reservationErr := reserveUnknownUsage(); reservationErr != nil {
@@ -378,8 +378,8 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 		}
 		switch {
 		case validateProviderCodexTerminalReceipt(receipt, identity, logicalPrompt, nonce, cwd, opts, manifest, false) == nil:
-			// This is the expected fail-closed state on Codex 0.149: JSONL does
-			// not expose provider-reported model identity, so execution can be
+			// This is the expected fail-closed state when Codex JSONL does not
+			// expose terminal server_model evidence, so execution can be
 			// recorded but cannot qualify or become primary.
 			output.State, output.ReceiptState = "completed_unqualified", "completed"
 		case receipt.ProcessStarted:

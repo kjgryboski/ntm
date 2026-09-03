@@ -41,20 +41,22 @@ probe_required = false
 
 # Primary Z.ai subscription lane. CAAM/the owner provisions the isolated
 # CODEX_HOME and its non-secret config.toml/models.json, then hashes that
-# manifest into config_sha256. Do not place a key in this file.
+# manifest into config_sha256. Do not place a key in this file. The pinned
+# runtime is the local server-model observability fork of official rust-v0.153.0
+# at Codex commit ae8e7ee; the executable digest below is the authority.
 [provider_profiles."zai-codex-kevin-v10"]
 provider = "zai"
 account_alias = "kevin"
 model = "glm-5.3"
 endpoint = "https://api.z.ai/api/v1"
 runtime = "codex"
-runtime_version = "0.149.0"
+runtime_version = "0.153.0"
 credential_class = "coding_plan"
 billing_class = "coding_plan"
 entitlement = "codex_responses"
 config_sha256 = "3c4d0bd7ec1b2e852b2acfd5f7500988f57ba587a3331d742c3fa44719ef4c1e"
-command = "/home/kevin/.local/libexec/ntm/codex-0.149.0/codex-x86_64-unknown-linux-musl"
-runtime_sha256 = "bbc3341e44c9ead340ed9570c17be936e37870f570751a941699ffd04d672827"
+command = "/home/kevin/.local/libexec/ntm/codex-0.153.0-server-model-v1/codex-x86_64-unknown-linux-gnu"
+runtime_sha256 = "b041039d5c6856dd94c649f9fc56d26ec7c83aa60038b323d9299d3e79ce9705"
 broker_command = "/home/kevin/.local/bin/caam-zai-codex-v14"
 broker_command_sha256 = "6cd9fad4fa68a291133014b6ea3c62283f1b6fa077a2aea7349609ea1c1a5472"
 credential_bridge_command = "/home/kevin/.local/libexec/ntm/bridge-zai-codex-v3/ntm-provider-bridge.exe"
@@ -75,13 +77,13 @@ account_alias = "kevin"
 model = "glm-5.3-flash"
 endpoint = "https://api.z.ai/api/v1"
 runtime = "codex"
-runtime_version = "0.149.0"
+runtime_version = "0.153.0"
 credential_class = "coding_plan"
 billing_class = "coding_plan"
 entitlement = "codex_responses"
 config_sha256 = "13adebb50d64fc55f21cda122c716c5eda3bd25dc7abb5920267d00d95793756"
-command = "/home/kevin/.local/libexec/ntm/codex-0.149.0/codex-x86_64-unknown-linux-musl"
-runtime_sha256 = "bbc3341e44c9ead340ed9570c17be936e37870f570751a941699ffd04d672827"
+command = "/home/kevin/.local/libexec/ntm/codex-0.153.0-server-model-v1/codex-x86_64-unknown-linux-gnu"
+runtime_sha256 = "b041039d5c6856dd94c649f9fc56d26ec7c83aa60038b323d9299d3e79ce9705"
 broker_command = "/home/kevin/.local/bin/caam-zai-codex-v14"
 broker_command_sha256 = "6cd9fad4fa68a291133014b6ea3c62283f1b6fa077a2aea7349609ea1c1a5472"
 credential_bridge_command = "/home/kevin/.local/libexec/ntm/bridge-zai-codex-v3/ntm-provider-bridge.exe"
