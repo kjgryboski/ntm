@@ -406,7 +406,7 @@ func validateBridgeQualification(object map[string]json.RawMessage) error {
 			return errors.New("qualification check passed is invalid")
 		}
 		provenance, ok := bridgeString(check, "provenance")
-		if !ok || provenance != "live" && provenance != "local_authoritative" {
+		if !ok || provenance != "live" && provenance != "local_authoritative" && provenance != "local_observed_process_tree" {
 			return errors.New("qualification check provenance is invalid")
 		}
 		if _, ok := check["evidence_sha256"]; ok && !bridgeSHA256(check, "evidence_sha256") {

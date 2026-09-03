@@ -33,6 +33,7 @@ import (
 type providerCodexQualificationAdmission interface {
 	Acquire(provider.Identity) ratelimit.SubscriptionDecision
 	Release(provider.Identity, ratelimit.SubscriptionDecision)
+	BindReservation(provider.Identity, ratelimit.SubscriptionDecision, string, string) error
 	RecordUsage(provider.Identity, ratelimit.SubscriptionDecision, string, ratelimit.TokenUsage, time.Time) error
 	RecordConservativeUsage(provider.Identity, ratelimit.SubscriptionDecision, ratelimit.TokenUsage, time.Time) error
 	RecordUnknownUsage(provider.Identity, ratelimit.SubscriptionDecision) error
@@ -51,6 +52,7 @@ type providerCodexQualificationDependencies struct {
 	cleanup          func(context.Context, providerCodexQualificationWorkspace) error
 	verifier         providerqualification.Verifier
 	store            func(string, providerqualification.Receipt) (string, error)
+	storePreflight   func(providerqualification.Receipt) (string, error)
 	admission        providerCodexQualificationAdmission
 	now              func() time.Time
 }
@@ -64,6 +66,9 @@ var providerCodexQualificationDeps = providerCodexQualificationDependencies{
 	run:          zai.RunCodexStructured, newNonce: providerCodexNonce,
 	prepare: prepareProviderCodexQualificationWorkspace, cleanup: cleanupProviderCodexQualificationWorkspace,
 	verifier: providerqualification.BubblewrapVerifier{}, store: providerqualification.Store,
+	storePreflight: func(receipt providerqualification.Receipt) (string, error) {
+		return providerqualification.Store(providerqualification.DefaultCodexIdentityPreflightStoreDir(), receipt)
+	},
 	admission: defaultProviderCodexSubscriptionAdmission(), now: func() time.Time { return time.Now().UTC() },
 }
 
@@ -75,7 +80,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	if identity.Provider() != "zai" || identity.Runtime() != "codex" || identity.Endpoint() != zai.OfficialCodexEndpoint || identity.CredentialClass() != provider.CredentialClassCodingPlan || identity.BillingClass() != provider.BillingClassCodingPlan || identity.Entitlement() != provider.EntitlementCodexResponses || profile.AutomationPolicy != provider.DefaultZAICodexAutomationPolicyName || !profile.ExactTargetOnly || !profile.ProbeRequired {
 		return errors.New("Codex qualification requires the exact Z.ai Coding Plan Codex profile")
 	}
-	if deps.attest == nil || deps.credentialStatus == nil || deps.pinnedSigner == nil || deps.run == nil || deps.newNonce == nil || deps.prepare == nil || deps.cleanup == nil || deps.verifier == nil || deps.store == nil || deps.admission == nil || deps.now == nil {
+	if deps.attest == nil || deps.credentialStatus == nil || deps.pinnedSigner == nil || deps.run == nil || deps.newNonce == nil || deps.prepare == nil || deps.cleanup == nil || deps.verifier == nil || deps.store == nil || deps.storePreflight == nil || deps.admission == nil || deps.now == nil {
 		return errors.New("Codex qualification dependencies are incomplete")
 	}
 	ctx, suiteCancel := context.WithTimeout(providerCommandContext(cmd), opts.suiteTimeout)
@@ -95,12 +100,70 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	if err != nil {
 		return fmt.Errorf("Codex qualification pinned receipt signer is unavailable: %w", err)
 	}
-	if err := preflightProviderReceiptSigner(ctx, signPayload); err != nil {
+	signerPreflight, err := preflightProviderReceiptSignerMetadata(ctx, signPayload)
+	if err != nil {
 		return fmt.Errorf("Codex qualification requires a working pinned receipt signer before workspace creation: %w", err)
 	}
 	if deps.admission.CapacityStatus().Scope != provider.CapacityControlScopeLocalShared {
 		return errors.New("Codex qualification requires the local shared capacity store")
 	}
+	manifestVerifier := func(verifyCtx context.Context) error {
+		observed, verifyErr := deps.attest(verifyCtx, manifestExpectation)
+		if verifyErr != nil || observed != manifest {
+			return errors.New("Codex qualification manifest re-attestation mismatch")
+		}
+		return nil
+	}
+
+	// Pay for at most one read-only turn until the provider proves the exact
+	// resolved model. This gate intentionally precedes disposable worktree
+	// creation and every edit, denial, cancellation, and resume scenario.
+	preflightRoot, err := os.MkdirTemp("", "ntm-zai-codex-identity-")
+	if err != nil {
+		return fmt.Errorf("create Codex identity preflight directory: %w", err)
+	}
+	preflightRemoved := false
+	defer func() {
+		if !preflightRemoved {
+			_ = os.RemoveAll(preflightRoot)
+		}
+	}()
+	if err := os.Chmod(preflightRoot, 0o700); err != nil {
+		return fmt.Errorf("protect Codex identity preflight directory: %w", err)
+	}
+	preflightNonce, err := deps.newNonce()
+	if err != nil {
+		return err
+	}
+	preflightWorkspace := providerCodexQualificationWorkspace{Worktree: preflightRoot}
+	preflightStarted := deps.now()
+	preflight := runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, preflightWorkspace, manifestVerifier, "Do not call tools or access files. Reply with the nonce only.", preflightNonce, "", false, "", "", nil)
+	preflightAccounting, accountingErr := reconcileProviderCodexQualificationUsage(deps.admission, identity, preflight)
+	entries, readDirErr := os.ReadDir(preflightRoot)
+	removeErr := os.RemoveAll(preflightRoot)
+	preflightRootRemoved := removeErr == nil
+	if preflightRootRemoved {
+		_, statErr := os.Stat(preflightRoot)
+		preflightRootRemoved = os.IsNotExist(statErr)
+	}
+	preflightRemoved = preflightRootRemoved
+	preflightReceipt := buildProviderCodexIdentityPreflightReceipt(identity, manifest, status, preflightRoot, preflightWorkspace, preflightNonce, preflight, preflightAccounting, accountingErr, len(entries), readDirErr, preflightRootRemoved, preflightStarted, deps.now())
+	preflightReceiptCtx, preflightReceiptCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	preflightReceiptPath, err := sealAndStoreProviderCodexIdentityPreflight(preflightReceiptCtx, &preflightReceipt, signPayload, signerPreflight.KeyMetadata, deps.storePreflight)
+	preflightReceiptCancel()
+	if err != nil {
+		return fmt.Errorf("persist signed Codex identity preflight outcome: %w", err)
+	}
+	if !preflightReceipt.Passed {
+		if accountingErr != nil {
+			return fmt.Errorf("Codex qualification stopped after its signed read-only identity preflight; capacity accounting failed and workspace/lifecycle scenarios were not started (receipt %s): %w", preflightReceiptPath, accountingErr)
+		}
+		if removeErr != nil || !preflightRootRemoved {
+			return fmt.Errorf("Codex qualification stopped after its signed read-only identity preflight; local cleanup failed and workspace/lifecycle scenarios were not started (receipt %s)", preflightReceiptPath)
+		}
+		return fmt.Errorf("Codex qualification stopped after its signed read-only identity preflight; one or more identity, nonce, no-tool, empty-workspace, or residual-process gates failed, so workspace/lifecycle scenarios were not started (receipt %s; %s)", preflightReceiptPath, preflightAccounting)
+	}
+
 	editToken, err := deps.newNonce()
 	if err != nil {
 		return err
@@ -121,14 +184,6 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 			_, _ = reconcileProviderCodexQualificationUsage(deps.admission, identity, capacityTurns...)
 		}
 	}()
-	manifestVerifier := func(verifyCtx context.Context) error {
-		observed, verifyErr := deps.attest(verifyCtx, manifestExpectation)
-		if verifyErr != nil || observed != manifest {
-			return errors.New("Codex qualification manifest re-attestation mismatch")
-		}
-		return nil
-	}
-
 	var canceledSession string
 	observeCanceledSession := func(value string) {
 		if canceledSession == "" {
@@ -143,6 +198,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	capacityTurns = append(capacityTurns, edit)
 	contents, readErr := os.ReadFile(filepath.Join(workspace.Worktree, "qualification.go"))
 	setCodexQualificationCheck(&receipt, "model_identity", codexQualificationReceiptOK(edit.receipt, identity, manifest, workspace, editNonce, false) && edit.err == nil, "live", digestSafeJSON(edit.receipt))
+	setCodexQualificationCheckDetail(&receipt, "model_identity", providerCodexQualificationModelGate)
 	setCodexQualificationCheck(&receipt, "workspace_edit", readErr == nil && string(contents) == workspace.ExpectedContent && edit.receipt.ExpectedFileObserved, "live", sha256TextCLI(contents))
 	verifyCtx, verifyCancel := context.WithTimeout(ctx, opts.timeout)
 	verifyOutcome, verifyErr := deps.verifier.Run(verifyCtx, workspace.Worktree)
@@ -168,51 +224,70 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	remoteRefAbsent := providerCodexQualificationRemoteRefAbsent(ctx, workspace.Remote, "refs/heads/qualification-push")
 	setCodexQualificationCheck(&receipt, "push_denied", push.err == nil && codexQualificationReceiptOK(push.receipt, identity, manifest, workspace, pushNonce, false) && push.receipt.ExpectedToolObserved && push.receipt.ExpectedToolDenied && remoteRefAbsent, "live", sha256StringCLI(digestSafeJSON(push.receipt)+":remote-ref-absent="+fmt.Sprint(remoteRefAbsent)))
 
-	cancelNonce, err := deps.newNonce()
-	if err != nil {
-		return err
-	}
-	cancelCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	// The bounded cancellation call is intentionally issued once. It is never
-	// replayed; a resulting unknown outcome is the crash-recovery evidence.
-	cancelResults := make(chan codexQualificationTurn, 1)
-	go func() {
-		cancelResults <- runAdmittedCodexQualificationTurn(cancelCtx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, workspace, manifestVerifier, "Begin work and wait for cancellation.", cancelNonce, "", true, "", "", observeCanceledSession)
-	}()
-	var canceled codexQualificationTurn
-	select {
-	case canceled = <-cancelResults:
-		// A process that completed before cancellation is deliberately not a
-		// successful cancellation observation.
-	case <-time.After(100 * time.Millisecond):
-		cancel()
-		canceled = <-cancelResults
-	}
-	capacityTurns = append(capacityTurns, canceled)
-	cancellationOK := cancelCtx.Err() != nil && canceled.err != nil && canceled.receipt.Cancellation.LocalTermination == "observed_tree_terminated_verified" && canceled.receipt.ZeroResiduals && len(canceled.receipt.Cancellation.ResidualProcessIDs) == 0
-	setCodexQualificationCheck(&receipt, "cancellation", cancellationOK, "local_authoritative", digestSafeJSON(canceled.receipt.Cancellation))
-	setCodexQualificationCheck(&receipt, "crash_recovery", cancelCtx.Err() != nil && canceled.err != nil && !canceled.receipt.OutcomeKnown && canceledSession != "", "live", sha256StringCLI("codex-outcome-unknown-no-replay-v1:"+fmt.Sprint(canceledSession != "")))
+	var canceled, resume codexQualificationTurn
+	lifecycleExercised := opts.exerciseUnknownOutcomeLifecycle && opts.acceptFullWeekReservation
+	if lifecycleExercised {
+		cancelNonce, nonceErr := deps.newNonce()
+		if nonceErr != nil {
+			return nonceErr
+		}
+		cancelCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		// This deliberately risky scenario is available only behind two explicit
+		// flags because a provider-started turn without final usage must reserve
+		// the remaining weekly budget. It is never replayed automatically.
+		cancelResults := make(chan codexQualificationTurn, 1)
+		go func() {
+			cancelResults <- runAdmittedCodexQualificationTurn(cancelCtx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, workspace, manifestVerifier, "Begin work and wait for cancellation.", cancelNonce, "", true, "", "", observeCanceledSession)
+		}()
+		select {
+		case canceled = <-cancelResults:
+			// A process that completed before cancellation is deliberately not a
+			// successful cancellation observation.
+		case <-time.After(100 * time.Millisecond):
+			cancel()
+			canceled = <-cancelResults
+		}
+		capacityTurns = append(capacityTurns, canceled)
+		cancellationOK := cancelCtx.Err() != nil && canceled.err != nil && canceled.receipt.Cancellation.LocalTermination == "observed_tree_terminated_verified" && providerCodexReceiptHasNoResiduals(canceled.receipt)
+		setCodexQualificationCheck(&receipt, "cancellation", cancellationOK, "local_authoritative", digestSafeJSON(canceled.receipt.Cancellation))
+		crashRecoveryOK := cancellationOK && !canceled.receipt.OutcomeKnown && canceledSession != ""
+		setCodexQualificationCheck(&receipt, "crash_recovery", crashRecoveryOK, "live", sha256StringCLI("codex-outcome-unknown-no-replay-v1:"+fmt.Sprint(crashRecoveryOK)))
 
-	resumeNonce, err := deps.newNonce()
-	if err != nil {
-		return err
+		resumeNonce, nonceErr := deps.newNonce()
+		if nonceErr != nil {
+			return nonceErr
+		}
+		if crashRecoveryOK {
+			resume = runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, workspace, manifestVerifier, "Reply with the nonce only.", resumeNonce, canceledSession, false, "", "", nil)
+			capacityTurns = append(capacityTurns, resume)
+		}
+		setCodexQualificationCheck(&receipt, "session_resumption", crashRecoveryOK && resume.err == nil && codexQualificationReceiptOK(resume.receipt, identity, manifest, workspace, resumeNonce, true) && resume.receipt.LineageVerified && resume.receipt.SessionIDSHA256 == sha256StringCLI(canceledSession) && resume.receipt.ParentSessionSHA256 == sha256StringCLI(canceledSession), "live", digestSafeJSON(resume.receipt))
+	} else {
+		const detail = "Not exercised: provider cancellation lacks final usage acknowledgement; rerun only with both lifecycle-risk acceptance flags"
+		setCodexQualificationCheck(&receipt, "cancellation", false, "local_authoritative", sha256StringCLI("codex-lifecycle-not-exercised-v1:cancellation"))
+		setCodexQualificationCheckDetail(&receipt, "cancellation", detail)
+		setCodexQualificationCheck(&receipt, "crash_recovery", false, "local_authoritative", sha256StringCLI("codex-lifecycle-not-exercised-v1:crash-recovery"))
+		setCodexQualificationCheckDetail(&receipt, "crash_recovery", detail)
+		setCodexQualificationCheck(&receipt, "session_resumption", false, "local_authoritative", sha256StringCLI("codex-lifecycle-not-exercised-v1:session-resumption"))
+		setCodexQualificationCheckDetail(&receipt, "session_resumption", detail)
 	}
-	resume := codexQualificationTurn{}
-	if canceledSession != "" {
-		resume = runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, workspace, manifestVerifier, "Reply with the nonce only.", resumeNonce, canceledSession, true, "", "", nil)
-		capacityTurns = append(capacityTurns, resume)
-	}
-	setCodexQualificationCheck(&receipt, "session_resumption", canceledSession != "" && resume.err == nil && codexQualificationReceiptOK(resume.receipt, identity, manifest, workspace, resumeNonce, true) && resume.receipt.LineageVerified && resume.receipt.SessionIDSHA256 == sha256StringCLI(canceledSession) && resume.receipt.ParentSessionSHA256 == sha256StringCLI(canceledSession), "live", digestSafeJSON(resume.receipt))
 
 	accountingState, accountingErr := reconcileProviderCodexQualificationUsage(deps.admission, identity, capacityTurns...)
 	capacityFinalized = true
 	setCodexQualificationCheck(&receipt, "capacity_accounting", accountingErr == nil, "local_authoritative", sha256StringCLI("codex-capacity-accounting-v1:"+accountingState))
-	setCodexQualificationCheckDetail(&receipt, "capacity_accounting", "Bounded subscription accounting: "+accountingState)
+	setCodexQualificationCheckDetail(&receipt, "capacity_accounting", "Identity preflight: "+preflightAccounting+"; preflight receipt: "+preflightReceipt.ReceiptSHA256+"; bounded suite accounting: "+accountingState)
 
 	cleanupErr := deps.cleanup(ctx, workspace)
 	cleanupOK := cleanupErr == nil && codexQualificationWorkspaceRemoved(workspace)
-	setCodexQualificationCheck(&receipt, "zero_residual_cleanup", cleanupOK && canceled.receipt.ZeroResiduals && len(canceled.receipt.Cancellation.ResidualProcessIDs) == 0, "local_observed_process_tree", sha256StringCLI("codex-cleanup-v1:"+fmt.Sprint(cleanupOK)))
+	turnsClean := providerCodexReceiptHasNoResiduals(preflight.receipt) && providerCodexReceiptHasNoResiduals(edit.receipt) && providerCodexReceiptHasNoResiduals(secret.receipt) && providerCodexReceiptHasNoResiduals(push.receipt)
+	if lifecycleExercised {
+		turnsClean = turnsClean && providerCodexReceiptHasNoResiduals(canceled.receipt)
+		if canceledSession != "" {
+			turnsClean = turnsClean && providerCodexReceiptHasNoResiduals(resume.receipt)
+		}
+	}
+	setCodexQualificationCheck(&receipt, "zero_residual_cleanup", cleanupOK && turnsClean, "local_observed_process_tree", sha256StringCLI("codex-cleanup-v1:"+fmt.Sprint(cleanupOK && turnsClean)))
 	receipt.CompletedAt = deps.now()
 	if err := receipt.Finalize(); err != nil {
 		return err
@@ -221,9 +296,17 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	if err != nil {
 		return err
 	}
-	signature, err := signPayload(ctx, payload)
+	if err := providerattestation.ValidateBridgePayload(payload); err != nil {
+		return fmt.Errorf("Codex qualification receipt violates the signing bridge contract: %w", err)
+	}
+	qualificationReceiptCtx, qualificationReceiptCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	signature, err := signPayload(qualificationReceiptCtx, payload)
+	qualificationReceiptCancel()
 	if err != nil {
 		return fmt.Errorf("sign Codex qualification receipt: %w", err)
+	}
+	if signature.KeyMetadata != signerPreflight.KeyMetadata {
+		return errors.New("Codex qualification receipt signer changed after preflight")
 	}
 	if err := receipt.AttachAttestation(signature); err != nil {
 		return err
@@ -266,6 +349,14 @@ func runAdmittedCodexQualificationTurn(ctx context.Context, timeout time.Duratio
 		return codexQualificationTurn{err: errors.New("Codex qualification admission was denied for the exact Coding Plan identity; failover is prohibited")}
 	}
 	defer admission.Release(identity, decision)
+	prompt := codexQualificationPrompt(instruction, nonce, workspace.ExpectedContent)
+	binding := providerCodexBindingHashFromDigests(identity, sha256StringCLI(prompt), sha256StringCLI(filepath.Clean(workspace.Worktree)), write, providerCodexWorkloadImplementation, parent != "", sha256StringCLI(strings.TrimSpace(parent)), manifest)
+	if err := admission.BindReservation(identity, decision, binding, sha256StringCLI(nonce)); err != nil {
+		if cancelErr := admission.CancelReservation(identity, decision); cancelErr != nil {
+			return codexQualificationTurn{err: errors.New("Codex qualification reservation binding failed before dispatch and its capacity reservation could not be canceled")}
+		}
+		return codexQualificationTurn{err: errors.New("Codex qualification reservation binding failed before dispatch")}
+	}
 	turn := runCodexQualificationTurn(ctx, timeout, run, profile, identity, manifest, workspace, manifestVerifier, instruction, nonce, parent, write, expectedCommand, expectedFile, observer)
 	turn.decision, turn.admitted = decision, true
 	return turn
@@ -274,16 +365,106 @@ func runAdmittedCodexQualificationTurn(ctx context.Context, timeout time.Duratio
 func runCodexQualificationTurn(ctx context.Context, timeout time.Duration, run func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error), profile config.ProviderProfileConfig, identity provider.Identity, manifest zai.CodexManifestAttestation, workspace providerCodexQualificationWorkspace, manifestVerifier func(context.Context) error, instruction, nonce, parent string, write bool, expectedCommand, expectedFile string, observer func(string)) codexQualificationTurn {
 	turnCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	prompt := instruction + "\nNONCE: " + nonce + "\nExact file content:\n" + workspace.ExpectedContent
+	prompt := codexQualificationPrompt(instruction, nonce, workspace.ExpectedContent)
 	receipt, err := run(turnCtx, zai.CodexRunSpec{Binary: profile.Command, BrokerCommand: profile.BrokerCommand, CredentialBridgeCommand: profile.CredentialBridgeCommand, RuntimeHome: profile.RuntimeHome, CWD: workspace.Worktree, Prompt: prompt, ExpectedNonce: nonce, RequestedModel: identity.Model(), ParentSession: parent, ConfigSHA256: manifest.ConfigSHA256, BinarySHA256: manifest.BinarySHA256, BrokerCommandSHA256: manifest.AuthHelperSHA256, CredentialBridgeCommandSHA256: manifest.CredentialBridgeSHA256, PolicySHA256: providerCodexPolicySHA256(), RuntimeVersion: manifest.RuntimeVersion, WorkspaceWrite: write, Resume: parent != "", ExpectedToolCommand: expectedCommand, ExpectedFileChange: expectedFile, ManifestVerifier: manifestVerifier, SessionObserver: observer})
 	return codexQualificationTurn{receipt: receipt, err: err}
 }
 
+func codexQualificationPrompt(instruction, nonce, expectedContent string) string {
+	prompt := instruction + "\nNONCE: " + nonce
+	if expectedContent != "" {
+		prompt += "\nExact file content:\n" + expectedContent
+	}
+	return prompt
+}
+
+func buildProviderCodexIdentityPreflightReceipt(identity provider.Identity, manifest zai.CodexManifestAttestation, credentialStatus providercredential.Status, preflightRoot string, workspace providerCodexQualificationWorkspace, nonce string, turn codexQualificationTurn, accountingState string, accountingErr error, entryCount int, readDirErr error, rootRemoved bool, startedAt, completedAt time.Time) providerqualification.Receipt {
+	receipt := providerqualification.Receipt{
+		Mode:               providerqualification.ModeLive,
+		Provider:           "zai",
+		Transport:          "zai_codex_identity_preflight",
+		IdentitySHA256:     identity.Hash(),
+		PolicySHA256:       providerCodexPolicySHA256(),
+		RuntimeVersion:     manifest.RuntimeVersion,
+		StartedAt:          startedAt,
+		CompletedAt:        completedAt,
+		DisposableRepoHash: sha256StringCLI(preflightRoot),
+		Checks:             codexIdentityPreflightChecks(),
+	}
+	receiptDigest := digestSafeJSON(turn.receipt)
+	bindingOK := codexQualificationReceiptBindingOK(turn.receipt, identity, manifest, workspace, nonce)
+	dispatchOK := bindingOK && turn.receipt.ProcessStarted && turn.receipt.ProviderStarted
+	nonceOK := turn.err == nil && dispatchOK && turn.receipt.OutcomeKnown && turn.receipt.CompletionConfirmed && turn.receipt.NonceVerified && turn.receipt.ExitCode == 0 && turn.receipt.SessionIDSHA256 != "" && turn.receipt.EventStreamSHA256 != "" && turn.receipt.StderrSHA256 != ""
+	modelOK := bindingOK && providerCodexReceiptHasExactModelEvidence(turn.receipt, identity)
+	noToolActivity := bindingOK && turn.receipt.ToolEventsSHA256 != "" && turn.receipt.ToolEventCount == 0 && !turn.receipt.ExpectedToolObserved
+	emptyWorkspace := readDirErr == nil && entryCount == 0
+	zeroResidualCleanup := providerCodexReceiptHasNoResiduals(turn.receipt) && rootRemoved
+
+	setCodexQualificationCheck(&receipt, "profile_manifest", true, "local_authoritative", sha256StringCLI("codex-preflight-manifest-v1:"+identity.Hash()+":"+manifest.ConfigSHA256+":"+manifest.BinarySHA256+":"+manifest.AuthHelperSHA256+":"+manifest.CredentialBridgeSHA256+":"+manifest.RuntimeVersion))
+	setCodexQualificationCheck(&receipt, "credential_broker", credentialStatus.Available && credentialStatus.Present && credentialStatus.Evidence == providercredential.EvidenceOSProtectedProcessReadable, "local_authoritative", sha256StringCLI("codex-preflight-credential-v1:"+digestSafeJSON(credentialStatus)))
+	setCodexQualificationCheck(&receipt, "receipt_signer", true, "local_authoritative", sha256StringCLI("codex-preflight-pinned-signer-v1"))
+	setCodexQualificationCheck(&receipt, "shared_capacity_admission", turn.admitted && turn.decision.Allowed && turn.decision.NoFailover, "local_authoritative", sha256StringCLI("codex-preflight-admission-v1:"+digestSafeJSON(turn.decision)))
+	setCodexQualificationCheck(&receipt, "provider_dispatch", dispatchOK, "live", sha256StringCLI("codex-preflight-dispatch-v1:"+receiptDigest))
+	setCodexQualificationCheck(&receipt, "nonce_completion", nonceOK, "live", sha256StringCLI("codex-preflight-nonce-v1:"+receiptDigest))
+	setCodexQualificationCheck(&receipt, "exact_model_identity", modelOK, "live", sha256StringCLI("codex-preflight-model-v1:"+receiptDigest))
+	setCodexQualificationCheckDetail(&receipt, "exact_model_identity", providerCodexQualificationModelGate)
+	setCodexQualificationCheck(&receipt, "no_tool_activity", noToolActivity, "live", sha256StringCLI("codex-preflight-no-tools-v1:"+receiptDigest))
+	setCodexQualificationCheck(&receipt, "empty_workspace", emptyWorkspace, "local_authoritative", sha256StringCLI(fmt.Sprintf("codex-preflight-empty-workspace-v1:%t:%d", readDirErr == nil, entryCount)))
+	setCodexQualificationCheck(&receipt, "zero_residual_cleanup", zeroResidualCleanup, "local_observed_process_tree", sha256StringCLI("codex-preflight-cleanup-v1:"+receiptDigest+":"+fmt.Sprint(rootRemoved)))
+	setCodexQualificationCheck(&receipt, "capacity_accounting", accountingErr == nil, "local_authoritative", sha256StringCLI("codex-preflight-accounting-v1:"+accountingState))
+	setCodexQualificationCheckDetail(&receipt, "capacity_accounting", "Read-only identity preflight accounting: "+accountingState)
+	return receipt
+}
+
+func sealAndStoreProviderCodexIdentityPreflight(ctx context.Context, receipt *providerqualification.Receipt, signPayload func(context.Context, []byte) (providerattestation.SignatureMetadata, error), trustedSigner providerattestation.KeyMetadata, store func(providerqualification.Receipt) (string, error)) (string, error) {
+	if receipt == nil || signPayload == nil || store == nil {
+		return "", errors.New("Codex identity preflight receipt dependencies are incomplete")
+	}
+	if err := receipt.Finalize(); err != nil {
+		return "", err
+	}
+	payload, err := receipt.CanonicalPayload()
+	if err != nil {
+		return "", err
+	}
+	if err := providerattestation.ValidateBridgePayload(payload); err != nil {
+		return "", fmt.Errorf("Codex identity preflight receipt violates the signing bridge contract: %w", err)
+	}
+	signature, err := signPayload(ctx, payload)
+	if err != nil {
+		return "", fmt.Errorf("sign Codex identity preflight receipt: %w", err)
+	}
+	if signature.KeyMetadata != trustedSigner {
+		return "", errors.New("Codex identity preflight receipt signer changed after preflight")
+	}
+	if err := receipt.AttachAttestation(signature); err != nil {
+		return "", err
+	}
+	path, err := store(*receipt)
+	if err != nil {
+		return "", fmt.Errorf("store Codex identity preflight receipt: %w", err)
+	}
+	return path, nil
+}
+
+func codexIdentityPreflightChecks() []providerqualification.Check {
+	names := providerqualification.CodexIdentityPreflightRequiredChecks()
+	out := make([]providerqualification.Check, len(names))
+	for i, name := range names {
+		out[i].Name = name
+	}
+	return out
+}
+
+func codexQualificationReceiptBindingOK(r zai.CodexRunReceipt, identity provider.Identity, manifest zai.CodexManifestAttestation, workspace providerCodexQualificationWorkspace, nonce string) bool {
+	return r.AdapterVersion == zai.CodexRuntimeAdapterVersion && r.RequestedModel == identity.Model() && r.ConfigSHA256 == manifest.ConfigSHA256 && r.BinarySHA256 == manifest.BinarySHA256 && r.BrokerCommandSHA256 == manifest.AuthHelperSHA256 && r.CredentialBridgeSHA256 == manifest.CredentialBridgeSHA256 && r.PolicySHA256 == providerCodexPolicySHA256() && r.RuntimeVersion == manifest.RuntimeVersion && r.CWDSHA256 == sha256StringCLI(filepath.Clean(workspace.Worktree)) && r.NonceSHA256 == sha256StringCLI(nonce)
+}
+
 func codexQualificationReceiptOK(r zai.CodexRunReceipt, identity provider.Identity, manifest zai.CodexManifestAttestation, workspace providerCodexQualificationWorkspace, nonce string, resume bool) bool {
-	if r.AdapterVersion != zai.CodexRuntimeAdapterVersion || r.RequestedModel != identity.Model() || r.ResolvedModel != identity.Model() || !r.ModelVerified || r.ConfigSHA256 != manifest.ConfigSHA256 || r.BinarySHA256 != manifest.BinarySHA256 || r.BrokerCommandSHA256 != manifest.AuthHelperSHA256 || r.CredentialBridgeSHA256 != manifest.CredentialBridgeSHA256 || r.PolicySHA256 != providerCodexPolicySHA256() || r.RuntimeVersion != manifest.RuntimeVersion || r.CWDSHA256 != sha256StringCLI(filepath.Clean(workspace.Worktree)) || r.NonceSHA256 != sha256StringCLI(nonce) {
+	if !codexQualificationReceiptBindingOK(r, identity, manifest, workspace, nonce) || !providerCodexReceiptHasExactModelEvidence(r, identity) {
 		return false
 	}
-	if !r.ProcessStarted || !r.ProviderStarted || !r.OutcomeKnown || !r.CompletionConfirmed || !r.NonceVerified || r.ExitCode != 0 || r.SessionIDSHA256 == "" || r.EventStreamSHA256 == "" || r.StderrSHA256 == "" {
+	if !r.ProcessStarted || !r.ProviderStarted || !r.OutcomeKnown || !r.CompletionConfirmed || !r.NonceVerified || !providerCodexReceiptHasNoResiduals(r) || r.ExitCode != 0 || r.SessionIDSHA256 == "" || r.EventStreamSHA256 == "" || r.StderrSHA256 == "" {
 		return false
 	}
 	if !resume {
@@ -312,13 +493,13 @@ func reconcileProviderCodexQualificationUsage(admission providerCodexQualificati
 		}
 		dispatched++
 		turnTokens := r.Usage.InputTokens + r.Usage.CachedInputTokens + r.Usage.OutputTokens
-		lifecycleComplete := r.ProviderStarted && r.OutcomeKnown && r.CompletionConfirmed && r.NonceVerified && r.LineageVerified && r.ZeroResiduals && r.ExitCode == 0 && !r.CompletedAt.IsZero() && turnTokens > 0
+		lifecycleComplete := r.ProviderStarted && r.OutcomeKnown && r.CompletionConfirmed && r.NonceVerified && r.LineageVerified && providerCodexReceiptHasNoResiduals(r) && r.ExitCode == 0 && !r.CompletedAt.IsZero() && turnTokens > 0
 		if !lifecycleComplete {
 			unknownTurns = append(unknownTurns, turn)
 			continue
 		}
 		usage := ratelimit.TokenUsage{InputTokens: r.Usage.InputTokens, CachedInputTokens: r.Usage.CachedInputTokens, OutputTokens: r.Usage.OutputTokens}
-		if strings.TrimSpace(r.ResolvedModel) == "" {
+		if !providerCodexReceiptHasExactModelEvidence(r, identity) {
 			if err := admission.RecordConservativeUsage(identity, turn.decision, usage, r.CompletedAt); err != nil {
 				unknownTurns = append(unknownTurns, turn)
 				continue

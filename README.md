@@ -444,6 +444,9 @@ acknowledged authoritatively by the provider. `GO_SCOPED` means every required
 gate for the declared operation scope passed, but lifecycle control is local or
 unavailable; doctor deliberately exits non-zero so automation cannot mistake
 that narrower result for Claude/Codex-equivalent lifecycle authority.
+Doctor also remains `NO_GO` whenever the exact or shared subscription admission
+state would reject a new request, including an active lease, transient circuit,
+unknown-usage reservation, or exhausted five-hour/weekly plan window.
 The Claude-compatible Z.ai pane transport cannot earn either `GO` state: its
 opaque runtime exposes neither per-request capacity/circuit enforcement nor
 structured live error feedback. A successful pane preflight or coding
@@ -489,6 +492,17 @@ and read only from the OS credential broker; native execution does not fall
 back to environment variables. Coding Plan credentials are not accepted for
 the native lane. Native API structured completion, usage, and error records do
 not confer provider-side cancellation or resume evidence.
+
+The primary Coding Plan automation lane is the isolated Codex Responses
+runtime. Before creating an editable worktree, `ntm provider qualify` makes one
+admission-controlled, read-only, no-tool identity request and stores its signed
+diagnostic receipt separately under
+`~/.local/state/ntm/provider-codex-identity-preflights`. A preflight receipt can
+explain a failure, but it cannot qualify or promote the runtime. Promotion
+requires the terminal Codex JSONL event to contain an exact
+`turn.completed.server_model` value matching the requested model; configured or
+requested model names are never accepted as provider-resolved evidence. Missing
+identity evidence stops the suite before any workspace mutation.
 
 Initialize receipt signing explicitly before any live native request or Grok
 session operation:
@@ -568,6 +582,11 @@ provider-side cancellation, resume, or coding-policy authority. Do not use a
 Coding Plan credential in this lane, and do not infer a live Z.ai qualification
 from this command.
 
+Codex durable-operation replay additionally requires the receipt signer to
+match the profile-pinned signer observed immediately before the operation. A
+receipt with a mathematically valid signature from another local key is rejected
+and is never redispatched automatically.
+
 The controller-tools lane additionally requires an exact linked disposable
 worktree, its current revision, and a fixed verifier manifest:
 
@@ -586,6 +605,7 @@ operations; it is not an OS-wide lock against unrelated host processes.
 Run the applicable live suite explicitly in its disposable repository:
 
 ```bash
+ntm provider qualify --profile=zai-codex-kevin-v10 --live
 ntm provider qualify --profile=zai-team-model --live
 ntm provider qualify --profile=zai-native-tools --live
 ```

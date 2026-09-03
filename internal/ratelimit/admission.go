@@ -175,6 +175,8 @@ type SubscriptionCapacitySnapshot struct {
 	SubscriptionScopeSHA256  string                        `json:"subscription_scope_sha256"`
 	Exact                    AdmissionSnapshot             `json:"exact"`
 	PlanRunning              int                           `json:"plan_running"`
+	PlanMaxConcurrent        int                           `json:"plan_max_concurrent"`
+	AdmissionReservation     float64                       `json:"admission_reservation"`
 	FiveHourCreditsUsed      float64                       `json:"five_hour_credits_used"`
 	FiveHourCreditsLimit     float64                       `json:"five_hour_credits_limit"`
 	FiveHourResetsAt         *time.Time                    `json:"five_hour_resets_at,omitempty"`
@@ -656,6 +658,8 @@ func (c *SubscriptionAdmissionController) Snapshot(identity provider.Identity) S
 		Exact:                c.exact.Snapshot(identity),
 		IdentityHash:         identity.Hash(),
 		Scope:                c.exact.CapacityStatus().Scope,
+		PlanMaxConcurrent:    c.config.MaxConcurrent,
+		AdmissionReservation: c.config.AdmissionReservation,
 		FiveHourCreditsLimit: c.config.FiveHourCreditLimit,
 		WeeklyCreditsLimit:   c.config.WeeklyCreditLimit,
 		LimitEvidence:        "documented_zai_lite_floor_controller_local_estimate",

@@ -36,6 +36,13 @@ func TestValidateBridgePayloadAllowsOnlyNamedReceiptSchemas(t *testing.T) {
 	}
 }
 
+func TestValidateBridgePayloadAcceptsObservedProcessTreeQualificationEvidence(t *testing.T) {
+	payload := bytes.Replace(validBridgeQualificationPayload(), []byte(`"provenance":"live"`), []byte(`"provenance":"local_observed_process_tree"`), 1)
+	if err := ValidateBridgePayload(payload); err != nil {
+		t.Fatalf("observed-process-tree qualification evidence rejected: %v", err)
+	}
+}
+
 func TestValidateBridgePayloadRejectsCodexRawOrUnboundFields(t *testing.T) {
 	for _, payload := range [][]byte{
 		bytes.Replace(validBridgeCodexRunPayload(), []byte(`"binding_sha256":"`+bridgeTestDigest+`"`), []byte(`"binding_sha256":"not-a-digest"`), 1),

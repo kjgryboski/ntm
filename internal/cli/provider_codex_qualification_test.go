@@ -22,11 +22,11 @@ import (
 )
 
 type codexQualificationAdmissionFake struct {
-	decision                                                             ratelimit.SubscriptionDecision
-	status                                                               ratelimit.CapacityStatus
-	acquires, releases, successes, usages, conservative, unknownReserved int
-	canceledReservations                                                 int
-	usageErr, unknownErr, cancelErr                                      error
+	decision                                                                       ratelimit.SubscriptionDecision
+	status                                                                         ratelimit.CapacityStatus
+	acquires, releases, bindings, successes, usages, conservative, unknownReserved int
+	canceledReservations                                                           int
+	bindErr, usageErr, unknownErr, cancelErr                                       error
 }
 
 func (f *codexQualificationAdmissionFake) Acquire(provider.Identity) ratelimit.SubscriptionDecision {
@@ -35,6 +35,10 @@ func (f *codexQualificationAdmissionFake) Acquire(provider.Identity) ratelimit.S
 }
 func (f *codexQualificationAdmissionFake) Release(provider.Identity, ratelimit.SubscriptionDecision) {
 	f.releases++
+}
+func (f *codexQualificationAdmissionFake) BindReservation(provider.Identity, ratelimit.SubscriptionDecision, string, string) error {
+	f.bindings++
+	return f.bindErr
 }
 func (f *codexQualificationAdmissionFake) RecordUsage(provider.Identity, ratelimit.SubscriptionDecision, string, ratelimit.TokenUsage, time.Time) error {
 	f.usages++
@@ -66,13 +70,21 @@ func TestProviderCodexQualificationProducesTenGateReceiptAndCleansGeneratedRoot(
 	var storedPath string
 	var storedChecks int
 	var accountingDetail string
+	var preflightStored providerqualification.Receipt
 	calls := 0
+	var preflightCWD string
 	deps := codexQualificationDepsForTest(profile, admission, func(ctx context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		calls++
 		if spec.ManifestVerifier == nil || spec.ManifestVerifier(ctx) != nil {
 			t.Fatal("qualification turn omitted its manifest verifier")
 		}
 		if calls == 1 {
+			preflightCWD = spec.CWD
+			if spec.WorkspaceWrite || spec.ExpectedFileChange != "" || spec.ExpectedToolCommand != "" {
+				t.Fatal("identity preflight was not read-only and no-tool")
+			}
+		}
+		if calls == 2 {
 			if !spec.WorkspaceWrite {
 				t.Fatal("edit turn did not receive workspace write")
 			}
@@ -83,13 +95,13 @@ func TestProviderCodexQualificationProducesTenGateReceiptAndCleansGeneratedRoot(
 				t.Fatal(err)
 			}
 		}
-		if calls == 3 && spec.ExpectedToolCommand != "git push origin HEAD:refs/heads/qualification-push" {
+		if calls == 4 && spec.ExpectedToolCommand != "git push origin HEAD:refs/heads/qualification-push" {
 			t.Fatalf("push command=%q", spec.ExpectedToolCommand)
 		}
-		if calls == 3 && !providerCodexQualificationRemoteRefAbsent(ctx, workspace.Remote, "refs/heads/qualification-push") {
+		if calls == 4 && !providerCodexQualificationRemoteRefAbsent(ctx, workspace.Remote, "refs/heads/qualification-push") {
 			t.Fatal("controlled remote unexpectedly contains the qualification ref")
 		}
-		if calls == 4 { // cancellation turn
+		if calls == 5 { // cancellation turn
 			if spec.SessionObserver == nil {
 				t.Fatal("cancellation session observer missing")
 			}
@@ -102,14 +114,18 @@ func TestProviderCodexQualificationProducesTenGateReceiptAndCleansGeneratedRoot(
 			return r, ctx.Err()
 		}
 		r := successfulProviderCodexReceipt(spec)
-		r.ToolEventCount = 1
 		if spec.ExpectedFileChange != "" {
+			r.ToolEventCount = 1
 			r.ExpectedFileObserved = true
 		}
 		if spec.ExpectedToolCommand != "" {
+			r.ToolEventCount = 1
 			r.ExpectedToolObserved, r.ExpectedToolDenied = true, true
 		}
 		if spec.Resume {
+			if spec.WorkspaceWrite {
+				t.Fatal("resume turn must be read-only")
+			}
 			r.SessionIDSHA256 = sha256StringCLI(spec.ParentSession)
 			r.ParentSessionSHA256 = sha256StringCLI(spec.ParentSession)
 		}
@@ -130,17 +146,134 @@ func TestProviderCodexQualificationProducesTenGateReceiptAndCleansGeneratedRoot(
 		storedPath = filepath.Join(workspace.Root, "receipt.json")
 		return storedPath, nil
 	}
+	deps.storePreflight = func(receipt providerqualification.Receipt) (string, error) {
+		preflightStored = receipt
+		return "/redacted/passed-identity-preflight.json", nil
+	}
 	cmd := &cobra.Command{}
 	var output bytes.Buffer
 	cmd.SetOut(&output)
-	if err := runProviderCodexQualification(cmd, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Minute}, profile, identity, deps); err != nil {
+	if err := runProviderCodexQualification(cmd, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Minute, exerciseUnknownOutcomeLifecycle: true, acceptFullWeekReservation: true}, profile, identity, deps); err != nil {
 		t.Fatal(err)
 	}
-	if calls != 5 || storedChecks != 10 || admission.acquires != 5 || admission.releases != 5 || admission.successes != 1 || admission.usages != 4 || admission.unknownReserved != 1 || admission.canceledReservations != 0 || !strings.Contains(accountingDetail, "provider_usage_reconciled=4") || !strings.Contains(output.String(), "10/10") {
+	if calls != 6 || storedChecks != 10 || admission.acquires != 6 || admission.releases != 6 || admission.bindings != 6 || admission.successes != 1 || admission.usages != 5 || admission.unknownReserved != 1 || admission.canceledReservations != 0 || !strings.Contains(accountingDetail, "Identity preflight: provider_usage_reconciled=1") || !strings.Contains(accountingDetail, "provider_usage_reconciled=4") || !strings.Contains(output.String(), "10/10") {
 		t.Fatalf("calls=%d checks=%d admission=%+v output=%q", calls, storedChecks, admission, output.String())
 	}
-	if !codexQualificationWorkspaceRemoved(workspace) || strings.Contains(storedPath, "qualification.go") {
+	if !codexQualificationWorkspaceRemoved(workspace) || strings.Contains(storedPath, "qualification.go") || preflightCWD == "" {
 		t.Fatalf("unsafe cleanup/path: root=%q stored=%q", workspace.Root, storedPath)
+	}
+	if _, err := os.Stat(preflightCWD); !os.IsNotExist(err) {
+		t.Fatalf("identity preflight directory was not removed: %q err=%v", preflightCWD, err)
+	}
+	if preflightStored.Transport != "zai_codex_identity_preflight" || !preflightStored.Passed || preflightStored.Attestation == nil || preflightStored.Validate() != nil {
+		t.Fatalf("signed passed preflight receipt=%+v validate=%v", preflightStored, preflightStored.Validate())
+	}
+}
+
+func TestProviderCodexQualificationRejectsSignerChangeOnFinalReceipt(t *testing.T) {
+	profile := providerCodexProfile(t.TempDir())
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := &codexQualificationAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	var workspace providerCodexQualificationWorkspace
+	providerCalls, signCalls := 0, 0
+	finalStored := false
+	deps := codexQualificationDepsForTest(profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		providerCalls++
+		if spec.ExpectedFileChange != "" {
+			if err := os.WriteFile(filepath.Join(spec.CWD, spec.ExpectedFileChange), []byte(workspace.ExpectedContent), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		receipt := successfulProviderCodexReceipt(spec)
+		if spec.ExpectedFileChange != "" {
+			receipt.ToolEventCount, receipt.ExpectedFileObserved = 1, true
+		}
+		if spec.ExpectedToolCommand != "" {
+			receipt.ToolEventCount, receipt.ExpectedToolObserved, receipt.ExpectedToolDenied = 1, true, true
+		}
+		return receipt, nil
+	})
+	deps.prepare = func(ctx context.Context, token string) (providerCodexQualificationWorkspace, error) {
+		var prepareErr error
+		workspace, prepareErr = prepareProviderCodexQualificationWorkspace(ctx, token)
+		return workspace, prepareErr
+	}
+	firstSigner, secondSigner := newProviderNativeTestSigner(), newProviderNativeTestSigner()
+	deps.pinnedSigner = func(config.ProviderProfileConfig) (func(context.Context, []byte) (providerattestation.SignatureMetadata, error), error) {
+		return func(ctx context.Context, payload []byte) (providerattestation.SignatureMetadata, error) {
+			signCalls++
+			if signCalls <= 2 {
+				return firstSigner(ctx, payload)
+			}
+			return secondSigner(ctx, payload)
+		}, nil
+	}
+	deps.store = func(string, providerqualification.Receipt) (string, error) {
+		finalStored = true
+		return "/redacted/unexpected-final.json", nil
+	}
+	err = runProviderCodexQualification(&cobra.Command{}, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Minute}, profile, identity, deps)
+	if err == nil || !strings.Contains(err.Error(), "signer changed after preflight") || providerCalls != 4 || signCalls != 3 || finalStored || !codexQualificationWorkspaceRemoved(workspace) {
+		t.Fatalf("err=%v provider_calls=%d sign_calls=%d final_stored=%t workspace=%+v", err, providerCalls, signCalls, finalStored, workspace)
+	}
+}
+
+func TestProviderCodexQualificationSkipsUnknownOutcomeLifecycleByDefault(t *testing.T) {
+	profile := providerCodexProfile(t.TempDir())
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := &codexQualificationAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	var workspace providerCodexQualificationWorkspace
+	var stored providerqualification.Receipt
+	calls := 0
+	deps := codexQualificationDepsForTest(profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		calls++
+		if calls == 2 {
+			if err := os.WriteFile(filepath.Join(spec.CWD, "qualification.go"), []byte(workspace.ExpectedContent), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		receipt := successfulProviderCodexReceipt(spec)
+		if spec.ExpectedFileChange != "" {
+			receipt.ExpectedFileObserved = true
+		}
+		if spec.ExpectedToolCommand != "" {
+			receipt.ExpectedToolObserved, receipt.ExpectedToolDenied = true, true
+		}
+		return receipt, nil
+	})
+	deps.prepare = func(ctx context.Context, token string) (providerCodexQualificationWorkspace, error) {
+		var prepareErr error
+		workspace, prepareErr = prepareProviderCodexQualificationWorkspace(ctx, token)
+		return workspace, prepareErr
+	}
+	deps.store = func(_ string, receipt providerqualification.Receipt) (string, error) {
+		stored = receipt
+		return "/redacted/scoped-no-go.json", nil
+	}
+	err = runProviderCodexQualification(&cobra.Command{}, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Minute}, profile, identity, deps)
+	var noGo *providerQualificationExitError
+	if !errors.As(err, &noGo) || calls != 4 || admission.bindings != 4 || admission.usages != 4 || admission.unknownReserved != 0 || stored.Passed || stored.Attestation == nil || stored.Validate() != nil || !codexQualificationWorkspaceRemoved(workspace) {
+		t.Fatalf("err=%v calls=%d admission=%+v receipt=%+v", err, calls, admission, stored)
+	}
+	for _, name := range []string{"cancellation", "crash_recovery", "session_resumption"} {
+		found := false
+		for _, check := range stored.Checks {
+			if check.Name == name {
+				found = true
+				if check.Passed || !strings.Contains(check.Detail, "Not exercised") {
+					t.Fatalf("unsafe default lifecycle check %s=%+v", name, check)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("missing lifecycle check %q", name)
+		}
 	}
 }
 
@@ -183,6 +316,43 @@ func TestProviderCodexQualificationPreflightsBrokerBeforeWorkspace(t *testing.T)
 	}
 }
 
+func TestProviderCodexQualificationRejectsSignerChangeOnIdentityPreflight(t *testing.T) {
+	profile := providerCodexProfile(t.TempDir())
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := &codexQualificationAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	providerCalls, signCalls := 0, 0
+	prepared, stored := false, false
+	deps := codexQualificationDepsForTest(profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		providerCalls++
+		return successfulProviderCodexReceipt(spec), nil
+	})
+	firstSigner, secondSigner := newProviderNativeTestSigner(), newProviderNativeTestSigner()
+	deps.pinnedSigner = func(config.ProviderProfileConfig) (func(context.Context, []byte) (providerattestation.SignatureMetadata, error), error) {
+		return func(ctx context.Context, payload []byte) (providerattestation.SignatureMetadata, error) {
+			signCalls++
+			if signCalls == 1 {
+				return firstSigner(ctx, payload)
+			}
+			return secondSigner(ctx, payload)
+		}, nil
+	}
+	deps.prepare = func(context.Context, string) (providerCodexQualificationWorkspace, error) {
+		prepared = true
+		return providerCodexQualificationWorkspace{}, nil
+	}
+	deps.storePreflight = func(providerqualification.Receipt) (string, error) {
+		stored = true
+		return "/redacted/unexpected.json", nil
+	}
+	err = runProviderCodexQualification(&cobra.Command{}, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Minute}, profile, identity, deps)
+	if err == nil || !strings.Contains(err.Error(), "signer changed after preflight") || providerCalls != 1 || signCalls != 2 || prepared || stored {
+		t.Fatalf("err=%v provider_calls=%d sign_calls=%d prepared=%t stored=%t", err, providerCalls, signCalls, prepared, stored)
+	}
+}
+
 func TestProviderCodexQualificationAppliesSuiteTimeoutBeforeWorkspace(t *testing.T) {
 	profile := providerCodexProfile(t.TempDir())
 	identity, err := profile.Identity()
@@ -207,36 +377,21 @@ func TestProviderCodexQualificationAppliesSuiteTimeoutBeforeWorkspace(t *testing
 	}
 }
 
-func TestProviderCodexQualificationStoresSignedModelGapNoGo(t *testing.T) {
+func TestProviderCodexQualificationModelGapStopsBeforeWorkspace(t *testing.T) {
 	profile := providerCodexProfile(t.TempDir())
 	identity, err := profile.Identity()
 	if err != nil {
 		t.Fatal(err)
 	}
 	admission := &codexQualificationAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
-	var workspace providerCodexQualificationWorkspace
+	prepared := false
 	stored := false
+	var preflightStored providerqualification.Receipt
 	calls := 0
 	deps := codexQualificationDepsForTest(profile, admission, func(ctx context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		calls++
 		if spec.ManifestVerifier == nil || spec.ManifestVerifier(ctx) != nil {
 			t.Fatal("missing manifest verifier")
-		}
-		if calls == 1 {
-			if err := os.WriteFile(filepath.Join(spec.CWD, "qualification.go"), []byte(workspace.ExpectedContent), 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if calls == 4 {
-			if spec.SessionObserver != nil {
-				spec.SessionObserver("22222222-2222-2222-2222-222222222222")
-			}
-			<-ctx.Done()
-			r := successfulProviderCodexReceipt(spec)
-			r.OutcomeKnown = false
-			r.Cancellation.LocalTermination = "observed_tree_terminated_verified"
-			r.ZeroResiduals = true
-			return r, ctx.Err()
 		}
 		r := successfulProviderCodexReceipt(spec)
 		r.ResolvedModel = ""
@@ -257,9 +412,8 @@ func TestProviderCodexQualificationStoresSignedModelGapNoGo(t *testing.T) {
 		return r, nil
 	})
 	deps.prepare = func(ctx context.Context, token string) (providerCodexQualificationWorkspace, error) {
-		var e error
-		workspace, e = prepareProviderCodexQualificationWorkspace(ctx, token)
-		return workspace, e
+		prepared = true
+		return prepareProviderCodexQualificationWorkspace(ctx, token)
 	}
 	deps.store = func(_ string, receipt providerqualification.Receipt) (string, error) {
 		stored = true
@@ -268,10 +422,126 @@ func TestProviderCodexQualificationStoresSignedModelGapNoGo(t *testing.T) {
 		}
 		return "/redacted/model-gap.json", nil
 	}
+	deps.storePreflight = func(receipt providerqualification.Receipt) (string, error) {
+		preflightStored = receipt
+		return "/redacted/model-gap-preflight.json", nil
+	}
 	err = runProviderCodexQualification(&cobra.Command{}, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Minute}, profile, identity, deps)
-	var noGo *providerQualificationExitError
-	if !errors.As(err, &noGo) || !stored || calls != 5 || admission.acquires != 5 || admission.releases != 5 || admission.usages != 0 || admission.conservative != 4 || admission.unknownReserved != 1 || admission.successes != 0 || !codexQualificationWorkspaceRemoved(workspace) {
-		t.Fatalf("err=%v stored=%t calls=%d success=%d root=%q", err, stored, calls, admission.successes, workspace.Root)
+	if err == nil || !strings.Contains(err.Error(), "signed read-only identity preflight") || prepared || stored || calls != 1 || admission.acquires != 1 || admission.releases != 1 || admission.bindings != 1 || admission.usages != 0 || admission.conservative != 1 || admission.unknownReserved != 0 || admission.successes != 0 {
+		t.Fatalf("err=%v prepared=%t stored=%t calls=%d admission=%+v", err, prepared, stored, calls, admission)
+	}
+	if preflightStored.Transport != "zai_codex_identity_preflight" || preflightStored.Passed || preflightStored.Attestation == nil || preflightStored.Validate() != nil {
+		t.Fatalf("signed model-gap preflight receipt=%+v validate=%v", preflightStored, preflightStored.Validate())
+	}
+}
+
+func TestProviderCodexQualificationBindingFailureCancelsBeforeDispatch(t *testing.T) {
+	profile := providerCodexProfile(t.TempDir())
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := &codexQualificationAdmissionFake{
+		decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true},
+		status:   ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared},
+		bindErr:  errors.New("binding unavailable"),
+	}
+	prepared, calls := false, 0
+	deps := codexQualificationDepsForTest(profile, admission, func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		calls++
+		return zai.CodexRunReceipt{}, nil
+	})
+	deps.prepare = func(context.Context, string) (providerCodexQualificationWorkspace, error) {
+		prepared = true
+		return providerCodexQualificationWorkspace{}, nil
+	}
+	var preflightStored providerqualification.Receipt
+	deps.storePreflight = func(receipt providerqualification.Receipt) (string, error) {
+		preflightStored = receipt
+		return "/redacted/binding-failure-preflight.json", nil
+	}
+	err = runProviderCodexQualification(&cobra.Command{}, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Minute}, profile, identity, deps)
+	if err == nil || !strings.Contains(err.Error(), "capacity accounting failed") || prepared || calls != 0 || admission.acquires != 1 || admission.releases != 1 || admission.bindings != 1 || admission.canceledReservations != 1 {
+		t.Fatalf("err=%v prepared=%t calls=%d admission=%+v", err, prepared, calls, admission)
+	}
+	if preflightStored.Transport != "zai_codex_identity_preflight" || preflightStored.Passed || preflightStored.Attestation == nil || preflightStored.Validate() != nil {
+		t.Fatalf("signed binding-failure preflight receipt=%+v validate=%v", preflightStored, preflightStored.Validate())
+	}
+}
+
+func TestProviderCodexQualificationRejectsPreflightToolActivityBeforeWorkspace(t *testing.T) {
+	profile := providerCodexProfile(t.TempDir())
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := &codexQualificationAdmissionFake{
+		decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true},
+		status:   ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared},
+	}
+	prepared, calls := false, 0
+	deps := codexQualificationDepsForTest(profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		calls++
+		receipt := successfulProviderCodexReceipt(spec)
+		receipt.ToolEventCount = 1
+		return receipt, nil
+	})
+	deps.prepare = func(context.Context, string) (providerCodexQualificationWorkspace, error) {
+		prepared = true
+		return providerCodexQualificationWorkspace{}, nil
+	}
+	var preflightStored providerqualification.Receipt
+	deps.storePreflight = func(receipt providerqualification.Receipt) (string, error) {
+		preflightStored = receipt
+		return "/redacted/tool-activity-preflight.json", nil
+	}
+	err = runProviderCodexQualification(&cobra.Command{}, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Minute}, profile, identity, deps)
+	if err == nil || !strings.Contains(err.Error(), "signed read-only identity preflight") || prepared || calls != 1 || admission.bindings != 1 || admission.usages != 1 || admission.unknownReserved != 0 {
+		t.Fatalf("err=%v prepared=%t calls=%d admission=%+v", err, prepared, calls, admission)
+	}
+	if preflightStored.Transport != "zai_codex_identity_preflight" || preflightStored.Passed || preflightStored.Attestation == nil || preflightStored.Validate() != nil {
+		t.Fatalf("signed tool-activity preflight receipt=%+v validate=%v", preflightStored, preflightStored.Validate())
+	}
+}
+
+func TestProviderCodexQualificationRejectsContradictoryPreflightResidualsBeforeWorkspace(t *testing.T) {
+	profile := providerCodexProfile(t.TempDir())
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := &codexQualificationAdmissionFake{
+		decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true},
+		status:   ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared},
+	}
+	prepared, calls := false, 0
+	deps := codexQualificationDepsForTest(profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		calls++
+		receipt := successfulProviderCodexReceipt(spec)
+		receipt.ZeroResiduals = true
+		receipt.Cancellation.ResidualProcessIDs = []int{4242}
+		return receipt, nil
+	})
+	deps.prepare = func(context.Context, string) (providerCodexQualificationWorkspace, error) {
+		prepared = true
+		return providerCodexQualificationWorkspace{}, nil
+	}
+	var preflightStored providerqualification.Receipt
+	deps.storePreflight = func(receipt providerqualification.Receipt) (string, error) {
+		preflightStored = receipt
+		return "/redacted/residual-preflight.json", nil
+	}
+	err = runProviderCodexQualification(&cobra.Command{}, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Minute}, profile, identity, deps)
+	if err == nil || !strings.Contains(err.Error(), "signed read-only identity preflight") || prepared || calls != 1 || admission.usages != 0 || admission.unknownReserved != 1 {
+		t.Fatalf("err=%v prepared=%t calls=%d admission=%+v", err, prepared, calls, admission)
+	}
+	if preflightStored.Passed || preflightStored.Attestation == nil || preflightStored.Validate() != nil {
+		t.Fatalf("signed residual preflight receipt=%+v validate=%v", preflightStored, preflightStored.Validate())
+	}
+	for _, check := range preflightStored.Checks {
+		if check.Name == "zero_residual_cleanup" && check.Passed {
+			t.Fatalf("contradictory residual process receipt passed cleanup: %+v", check)
+		}
 	}
 }
 
@@ -288,7 +558,12 @@ func codexQualificationDepsForTest(profile config.ProviderProfileConfig, admissi
 		},
 		run: run, newNonce: func() (string, error) { return "NTM_ACK_0123456789abcdef0123456789abcdef", nil },
 		prepare: prepareProviderCodexQualificationWorkspace, cleanup: cleanupProviderCodexQualificationWorkspace,
-		verifier: codexQualificationVerifierFake{}, store: func(string, providerqualification.Receipt) (string, error) { return "/redacted/receipt.json", nil }, admission: admission, now: func() time.Time { return time.Unix(2_000_000_000, 0).UTC() },
+		verifier: codexQualificationVerifierFake{},
+		store:    func(string, providerqualification.Receipt) (string, error) { return "/redacted/receipt.json", nil },
+		storePreflight: func(providerqualification.Receipt) (string, error) {
+			return "/redacted/identity-preflight.json", nil
+		},
+		admission: admission, now: func() time.Time { return time.Unix(2_000_000_000, 0).UTC() },
 	}
 }
 

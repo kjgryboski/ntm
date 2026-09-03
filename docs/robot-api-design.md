@@ -262,6 +262,16 @@ NTM keeps the whole lane NO-GO for promotion until a signed live exact-identity
 qualification proves the required receipt semantics. No transport may silently fall back to Claude, OpenAI
 Codex, or the separately billed Z.ai native API lane.
 
+Qualification starts with an admission-controlled read-only, no-tool identity
+request before creating a disposable worktree. NTM signs and stores that
+diagnostic result in the separate `provider-codex-identity-preflights` receipt
+tree. It cannot be replayed as a qualification receipt or promote the runtime.
+The identity gate accepts only an exact model from the terminal
+`turn.completed.server_model` JSONL field; requested configuration, generic
+response bodies, and documentation are not provider-resolved model evidence.
+If the field is absent or cleanup leaves a residual process ID, qualification
+stops before any editable workspace is prepared.
+
 Capacity claims follow the transport boundary. Native Grok ACP calls have
 exact-identity request admission with independent concurrency/token buckets,
 backoff, circuits, and renewable crash-recoverable leases shared by cooperating

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
+	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/zai"
@@ -134,7 +136,7 @@ func successfulProviderCodexReceipt(spec zai.CodexRunSpec) zai.CodexRunReceipt {
 	}
 	return zai.CodexRunReceipt{
 		AdapterVersion: zai.CodexRuntimeAdapterVersion, Action: action, RequestedModel: spec.RequestedModel,
-		ResolvedModel: spec.RequestedModel, ModelEvidence: "provider_response.model", ConfigSHA256: spec.ConfigSHA256,
+		ResolvedModel: spec.RequestedModel, ModelEvidence: "turn.completed.server_model", ConfigSHA256: spec.ConfigSHA256,
 		BinarySHA256: spec.BinarySHA256, BrokerCommandSHA256: spec.BrokerCommandSHA256, CredentialBridgeSHA256: spec.CredentialBridgeCommandSHA256,
 		PolicySHA256: spec.PolicySHA256, RuntimeVersion: spec.RuntimeVersion,
 		CWDSHA256: sha256StringCLI(filepath.Clean(spec.CWD)), PromptSHA256: sha256StringCLI(strings.TrimSpace(spec.Prompt)), SessionIDSHA256: strings.Repeat("f", 64), ParentSessionSHA256: parent,
@@ -159,6 +161,154 @@ func TestProviderCodexRunRequiresLiveOptIn(t *testing.T) {
 	err := runProviderCodex(&cobra.Command{}, providerCodexRunOptions{profile: "zai-codex", prompt: "p", cwd: root, operationID: "codex-1"}, deps)
 	if err == nil || called || admission.acquires != 0 {
 		t.Fatalf("err=%v called=%t admission=%+v", err, called, admission)
+	}
+}
+
+func TestProviderCodexTerminalReceiptRequiresExactModelEvidenceAndEmptyResidualList(t *testing.T) {
+	root := t.TempDir()
+	profile := providerCodexProfile(root)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := zai.CodexManifestAttestation{
+		ConfigSHA256: profile.ConfigSHA256, BinarySHA256: profile.RuntimeSHA256,
+		AuthHelperSHA256: profile.BrokerCommandSHA256, CredentialBridgeSHA256: profile.CredentialBridgeCommandSHA256,
+		RuntimeVersion: profile.RuntimeVersion,
+	}
+	const prompt = "bounded receipt check"
+	const nonce = "NTM_ACK_0123456789abcdef0123456789abcdef"
+	spec := zai.CodexRunSpec{
+		CWD: root, Prompt: prompt, ExpectedNonce: nonce, RequestedModel: identity.Model(),
+		ConfigSHA256: manifest.ConfigSHA256, BinarySHA256: manifest.BinarySHA256,
+		BrokerCommandSHA256: manifest.AuthHelperSHA256, CredentialBridgeCommandSHA256: manifest.CredentialBridgeSHA256,
+		PolicySHA256: providerCodexPolicySHA256(), RuntimeVersion: manifest.RuntimeVersion,
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*zai.CodexRunReceipt)
+	}{
+		{name: "contradictory residual pid", mutate: func(receipt *zai.CodexRunReceipt) {
+			receipt.ZeroResiduals = true
+			receipt.Cancellation.ResidualProcessIDs = []int{4242}
+		}},
+		{name: "non-terminal model claim", mutate: func(receipt *zai.CodexRunReceipt) {
+			receipt.ModelEvidence = "provider_response.model"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			receipt := successfulProviderCodexReceipt(spec)
+			test.mutate(&receipt)
+			if err := validateProviderCodexTerminalReceipt(receipt, identity, prompt, nonce, root, providerCodexRunOptions{}, manifest, true); err == nil {
+				t.Fatalf("invalid terminal receipt was accepted: %+v", receipt)
+			}
+		})
+	}
+}
+
+func TestValidRecordedProviderCodexOutputRejectsContradictoryResidualPID(t *testing.T) {
+	root := t.TempDir()
+	profile := providerCodexProfile(root)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := &providerNativeLedgerFake{}
+	admission := &providerCodexSubscriptionAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	deps := providerCodexTestDeps(profile, admission, ledger)
+	deps.run = func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		return successfulProviderCodexReceipt(spec), nil
+	}
+	if err := runProviderCodex(&cobra.Command{}, providerCodexRunOptions{profile: "zai-codex", prompt: "bounded replay", cwd: root, operationID: "codex-residual-replay", live: true, timeout: time.Minute}, deps); err != nil {
+		t.Fatal(err)
+	}
+	operation := ledger.ops[providerCodexOperationScope+"\x00codex-residual-replay"]
+	if operation == nil {
+		t.Fatal("missing recorded operation")
+	}
+	var recorded providerCodexRunOutput
+	if err := json.Unmarshal([]byte(operation.OutcomeJSON), &recorded); err != nil {
+		t.Fatal(err)
+	}
+	expected := recorded
+	recorded.Receipt.ZeroResiduals = true
+	recorded.Receipt.Cancellation.ResidualProcessIDs = []int{4242}
+	recorded.Attestation = nil
+	payload, err := canonicalProviderCodexOutput(recorded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature, err := deps.sign(context.Background(), payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded.Attestation = &signature
+	if validRecordedProviderCodexOutput(recorded, expected, identity, expected.Attestation.KeyMetadata) {
+		t.Fatal("signed replay with contradictory residual PID was accepted")
+	}
+}
+
+func TestValidRecordedProviderCodexOutputRejectsDifferentValidSigner(t *testing.T) {
+	root := t.TempDir()
+	profile := providerCodexProfile(root)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := &providerNativeLedgerFake{}
+	admission := &providerCodexSubscriptionAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	deps := providerCodexTestDeps(profile, admission, ledger)
+	deps.run = func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		return successfulProviderCodexReceipt(spec), nil
+	}
+	if err := runProviderCodex(&cobra.Command{}, providerCodexRunOptions{profile: "zai-codex", prompt: "bounded replay", cwd: root, operationID: "codex-signer-replay", live: true, timeout: time.Minute}, deps); err != nil {
+		t.Fatal(err)
+	}
+	operation := ledger.ops[providerCodexOperationScope+"\x00codex-signer-replay"]
+	if operation == nil {
+		t.Fatal("missing recorded operation")
+	}
+	var recorded providerCodexRunOutput
+	if err := json.Unmarshal([]byte(operation.OutcomeJSON), &recorded); err != nil {
+		t.Fatal(err)
+	}
+	expected := recorded
+	recorded.Attestation = nil
+	payload, err := canonicalProviderCodexOutput(recorded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongSignature, err := newProviderNativeTestSigner()(context.Background(), payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorded.Attestation = &wrongSignature
+	if validRecordedProviderCodexOutput(recorded, expected, identity, expected.Attestation.KeyMetadata) {
+		t.Fatal("replay signed by a different valid key was accepted")
+	}
+}
+
+func TestProviderCodexRunRejectsSignerChangeAfterPreflight(t *testing.T) {
+	root := t.TempDir()
+	profile := providerCodexProfile(root)
+	ledger := &providerNativeLedgerFake{}
+	admission := &providerCodexSubscriptionAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	deps := providerCodexTestDeps(profile, admission, ledger)
+	deps.run = func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		return successfulProviderCodexReceipt(spec), nil
+	}
+	firstSigner, secondSigner := newProviderNativeTestSigner(), newProviderNativeTestSigner()
+	signCalls := 0
+	deps.sign = func(ctx context.Context, payload []byte) (providerattestation.SignatureMetadata, error) {
+		signCalls++
+		if signCalls == 1 {
+			return firstSigner(ctx, payload)
+		}
+		return secondSigner(ctx, payload)
+	}
+	err := runProviderCodex(&cobra.Command{}, providerCodexRunOptions{profile: "zai-codex", prompt: "bounded signer change", cwd: root, operationID: "codex-signer-change", live: true, timeout: time.Minute}, deps)
+	if err == nil || !strings.Contains(err.Error(), "could not be attested") || signCalls != 2 {
+		t.Fatalf("signer change err=%v sign_calls=%d", err, signCalls)
 	}
 }
 

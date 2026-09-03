@@ -47,11 +47,13 @@ type providerCommandOptions struct {
 }
 
 type providerQualificationOptions struct {
-	profile          string
-	live             bool
-	timeout          time.Duration
-	suiteTimeout     time.Duration
-	qualificationDir string
+	profile                         string
+	live                            bool
+	exerciseUnknownOutcomeLifecycle bool
+	acceptFullWeekReservation       bool
+	timeout                         time.Duration
+	suiteTimeout                    time.Duration
+	qualificationDir                string
 }
 
 type providerDoctorStatus string
@@ -144,14 +146,15 @@ type providerDoctorRuntime struct {
 }
 
 type providerDoctorQualification struct {
-	State         string    `json:"state"`
-	Passed        bool      `json:"passed"`
-	PolicySHA256  string    `json:"policy_sha256,omitempty"`
-	CompletedAt   time.Time `json:"completed_at,omitempty"`
-	AgeSeconds    int64     `json:"age_seconds,omitempty"`
-	ReceiptSHA256 string    `json:"receipt_sha256,omitempty"`
-	ChecksPassed  int       `json:"checks_passed"`
-	ChecksTotal   int       `json:"checks_total"`
+	State                 string    `json:"state"`
+	Passed                bool      `json:"passed"`
+	ModelIdentityVerified bool      `json:"model_identity_verified"`
+	PolicySHA256          string    `json:"policy_sha256,omitempty"`
+	CompletedAt           time.Time `json:"completed_at,omitempty"`
+	AgeSeconds            int64     `json:"age_seconds,omitempty"`
+	ReceiptSHA256         string    `json:"receipt_sha256,omitempty"`
+	ChecksPassed          int       `json:"checks_passed"`
+	ChecksTotal           int       `json:"checks_total"`
 }
 
 type providerQualificationRunOutput struct {
@@ -188,6 +191,9 @@ type providerDoctorCapacity struct {
 // credential material, store paths, or raw provider output.
 type providerDoctorSubscriptionCapacity struct {
 	ScopeSHA256          string     `json:"scope_sha256"`
+	PlanRunning          int        `json:"plan_running"`
+	PlanMaxConcurrent    int        `json:"plan_max_concurrent"`
+	AdmissionReservation float64    `json:"admission_reservation"`
 	FiveHourCreditsUsed  float64    `json:"five_hour_credits_used"`
 	FiveHourCreditsLimit float64    `json:"five_hour_credits_limit"`
 	FiveHourResetsAt     *time.Time `json:"five_hour_resets_at,omitempty"`
@@ -368,6 +374,8 @@ requires the controller-owned tools policy and OS-protected credential broker.`,
 	}
 	cmd.Flags().StringVar(&opts.profile, "profile", "", "Exact configured Z.ai provider profile (required)")
 	cmd.Flags().BoolVar(&opts.live, "live", false, "Explicitly authorize real provider calls in a disposable repository")
+	cmd.Flags().BoolVar(&opts.exerciseUnknownOutcomeLifecycle, "exercise-unknown-outcome-lifecycle", false, "Exercise Codex cancellation and resume despite unavailable provider-final usage acknowledgement")
+	cmd.Flags().BoolVar(&opts.acceptFullWeekReservation, "accept-full-week-reservation", false, "Accept that an interrupted Codex turn can reserve the remaining local weekly plan budget")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", opts.timeout, "Timeout for each provider scenario")
 	cmd.Flags().DurationVar(&opts.suiteTimeout, "suite-timeout", opts.suiteTimeout, "Overall qualification timeout")
 	cmd.Flags().StringVar(&opts.qualificationDir, "qualification-store", "", "Override qualification receipt directory")
@@ -383,6 +391,9 @@ func runProviderQualification(cmd *cobra.Command, opts providerQualificationOpti
 	}
 	if opts.timeout <= 0 || opts.suiteTimeout <= 0 {
 		return errors.New("provider qualification timeouts must be positive")
+	}
+	if opts.exerciseUnknownOutcomeLifecycle != opts.acceptFullWeekReservation {
+		return errors.New("Codex lifecycle qualification requires both --exercise-unknown-outcome-lifecycle and --accept-full-week-reservation")
 	}
 	if deps.loadConfig == nil || deps.lookPath == nil || deps.version == nil || deps.lookupEnv == nil || deps.run == nil || deps.store == nil || deps.sign == nil || deps.preflight == nil || deps.admission == nil {
 		return errors.New("provider qualification dependencies are incomplete")
@@ -403,6 +414,9 @@ func runProviderQualification(cmd *cobra.Command, opts providerQualificationOpti
 	transport, err := providerTransportForIdentity(identity)
 	if err != nil {
 		return err
+	}
+	if transport != "zai_codex_runtime" && (opts.exerciseUnknownOutcomeLifecycle || opts.acceptFullWeekReservation) {
+		return errors.New("the Codex lifecycle-risk flags apply only to zai_codex_runtime profiles")
 	}
 	if transport == "zai_native_api" {
 		return runProviderNativeQualification(cmd, opts, profile, identity, providerNativeQualificationDeps)
@@ -833,45 +847,57 @@ func buildProviderDoctorReport(ctx context.Context, cfg *config.Config, opts pro
 			return deps.codexAttestationPreflight(ctx, profile)
 		}
 	}
-	report.Checks = append(report.Checks, diagnoseProviderReceiptAttestation(ctx, attestationPreflight))
+	attestationCheck, trustedQualificationSigner := diagnoseProviderReceiptAttestationWithKey(ctx, attestationPreflight)
+	report.Checks = append(report.Checks, attestationCheck)
 	report.Capacity, report.Checks = diagnoseProviderCapacity(identity, deps, report.Checks)
+	qualificationPolicySHA := report.Policy.SHA256
+	if report.Transport == "zai_claude_runtime" {
+		qualificationPolicySHA = providerqualification.QualificationPolicySHA256()
+	}
+	report.Qualification, report.Checks = diagnoseQualification(identity, report.Transport, qualificationPolicySHA, trustedQualificationSigner, opts, deps, report.Checks)
 
 	if opts.online {
-		var probePreflightErr error
-		switch {
-		case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementCodexResponses:
-			probePreflightErr = errors.New("Z.ai Codex online doctor probes are disabled; use provider codex run or provider qualify so subscription admission, the durable no-replay ledger, signed receipts, and usage reconciliation remain mandatory")
-		case deps.onlineProbe == nil || deps.admission == nil:
-			probePreflightErr = errors.New("online provider probe dependencies are incomplete")
-		case executionAuthorityErr != nil:
-			probePreflightErr = executionAuthorityErr
-		case report.Capacity.Scope != provider.CapacityControlScopeLocalShared:
-			probePreflightErr = errors.New("online provider probe requires the cross-process local shared capacity store")
-		case report.Runtime.Drift != "none":
-			probePreflightErr = errors.New("online provider probe requires the exact pinned runtime")
-		case authCheck.Status == providerDoctorFail:
-			probePreflightErr = errors.New("online provider probe requires the exact provider credential lane")
-		case identity.Provider() == "xai" && (policyCheck.Status != providerDoctorPass || !policy.BypassLockAuthoritative):
-			probePreflightErr = errors.New("online Grok probe requires root-owned managed requirements discovered by the pinned runtime")
-		}
-		if probePreflightErr != nil {
-			report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "preflight", Summary: "live no-tool identity/model probe was blocked before provider dispatch", Evidence: safeErrorDigest(probePreflightErr), Remediation: "Repair the failed policy, runtime, credential, or capacity gate before a live probe"})
-		} else if decision := deps.admission.Acquire(identity); !decision.Allowed || !decision.NoFailover {
-			report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "local_shared_admission", Summary: "live no-tool identity/model probe was denied before provider dispatch", Evidence: sha256StringCLI(string(decision.Reason)), Remediation: "Honor the exact identity retry/circuit state; provider failover is prohibited"})
-		} else {
-			probeCtx, cancel := context.WithTimeout(ctx, opts.timeout)
-			live, probeErr := deps.onlineProbe(probeCtx, executionProfile, identity)
-			cancel()
-			deps.admission.Release(identity, decision)
-			if probeErr != nil {
-				report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "live", Summary: "live no-tool identity/model probe failed", Evidence: safeErrorDigest(probeErr), Remediation: "Check the exact credential entitlement, endpoint, model, and provider CLI diagnostics"})
-			} else if !live.ModelVerified || !live.AuthVerified {
-				report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "live", Summary: "live probe lacked exact model or authentication evidence", Evidence: live.SHA256})
+		if report.Transport == "zai_codex_runtime" {
+			if report.Qualification.State == "current_pass" && report.Qualification.ModelIdentityVerified {
+				report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorPass, Provenance: "signed_live_qualification", Summary: "current signed qualification observed the exact provider-reported model and authenticated Coding Plan lane", Evidence: report.Qualification.ReceiptSHA256})
 			} else {
-				deps.admission.RecordSuccess(identity)
-				report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorPass, Provenance: "live", Summary: "exact model and authentication were observed", Evidence: live.SHA256})
-				authCheck = providerDoctorCheck{ID: "auth_presence", Status: providerDoctorPass, Provenance: "live", Summary: "credential was accepted for the exact provider lane", Evidence: live.SHA256}
-				replaceProviderDoctorCheck(report.Checks, authCheck)
+				report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "signed_live_qualification", Summary: "a current signed qualification with exact provider-reported model evidence is required; Codex doctor dispatch remains disabled", Evidence: report.Qualification.ReceiptSHA256, Remediation: "Run the explicit provider qualification suite after reviewing the pinned Codex runtime and policy"})
+			}
+		} else {
+			var probePreflightErr error
+			switch {
+			case deps.onlineProbe == nil || deps.admission == nil:
+				probePreflightErr = errors.New("online provider probe dependencies are incomplete")
+			case executionAuthorityErr != nil:
+				probePreflightErr = executionAuthorityErr
+			case report.Capacity.Scope != provider.CapacityControlScopeLocalShared:
+				probePreflightErr = errors.New("online provider probe requires the cross-process local shared capacity store")
+			case report.Runtime.Drift != "none":
+				probePreflightErr = errors.New("online provider probe requires the exact pinned runtime")
+			case authCheck.Status == providerDoctorFail:
+				probePreflightErr = errors.New("online provider probe requires the exact provider credential lane")
+			case identity.Provider() == "xai" && (policyCheck.Status != providerDoctorPass || !policy.BypassLockAuthoritative):
+				probePreflightErr = errors.New("online Grok probe requires root-owned managed requirements discovered by the pinned runtime")
+			}
+			if probePreflightErr != nil {
+				report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "preflight", Summary: "live no-tool identity/model probe was blocked before provider dispatch", Evidence: safeErrorDigest(probePreflightErr), Remediation: "Repair the failed policy, runtime, credential, or capacity gate before a live probe"})
+			} else if decision := deps.admission.Acquire(identity); !decision.Allowed || !decision.NoFailover {
+				report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "local_shared_admission", Summary: "live no-tool identity/model probe was denied before provider dispatch", Evidence: sha256StringCLI(string(decision.Reason)), Remediation: "Honor the exact identity retry/circuit state; provider failover is prohibited"})
+			} else {
+				probeCtx, cancel := context.WithTimeout(ctx, opts.timeout)
+				live, probeErr := deps.onlineProbe(probeCtx, executionProfile, identity)
+				cancel()
+				deps.admission.Release(identity, decision)
+				if probeErr != nil {
+					report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "live", Summary: "live no-tool identity/model probe failed", Evidence: safeErrorDigest(probeErr), Remediation: "Check the exact credential entitlement, endpoint, model, and provider CLI diagnostics"})
+				} else if !live.ModelVerified || !live.AuthVerified {
+					report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "live", Summary: "live probe lacked exact model or authentication evidence", Evidence: live.SHA256})
+				} else {
+					deps.admission.RecordSuccess(identity)
+					report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorPass, Provenance: "live", Summary: "exact model and authentication were observed", Evidence: live.SHA256})
+					authCheck = providerDoctorCheck{ID: "auth_presence", Status: providerDoctorPass, Provenance: "live", Summary: "credential was accepted for the exact provider lane", Evidence: live.SHA256}
+					replaceProviderDoctorCheck(report.Checks, authCheck)
+				}
 			}
 		}
 	} else {
@@ -882,11 +908,6 @@ func buildProviderDoctorReport(ctx context.Context, cfg *config.Config, opts pro
 		report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorUnavailable, Provenance: "offline", Summary: "model entitlement was not probed", Remediation: remediation})
 	}
 
-	qualificationPolicySHA := report.Policy.SHA256
-	if report.Transport == "zai_claude_runtime" {
-		qualificationPolicySHA = providerqualification.QualificationPolicySHA256()
-	}
-	report.Qualification, report.Checks = diagnoseQualification(identity, report.Transport, qualificationPolicySHA, opts, deps, report.Checks)
 	if report.Transport == "zai_claude_runtime" {
 		report.Checks = append(report.Checks, diagnoseZAIClaudeRequestAuthority(capability))
 	}
@@ -1152,12 +1173,17 @@ func diagnoseCodexProviderCredential(ctx context.Context, profile config.Provide
 }
 
 func diagnoseProviderReceiptAttestation(ctx context.Context, preflight func(context.Context) (providerattestation.SignatureMetadata, error)) providerDoctorCheck {
+	check, _ := diagnoseProviderReceiptAttestationWithKey(ctx, preflight)
+	return check
+}
+
+func diagnoseProviderReceiptAttestationWithKey(ctx context.Context, preflight func(context.Context) (providerattestation.SignatureMetadata, error)) (providerDoctorCheck, *providerattestation.KeyMetadata) {
 	if preflight == nil {
-		return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorFail, Provenance: "local_attestation", Summary: "provider receipt signing preflight is unavailable", Remediation: "Run ntm provider attestation init on a supported local attestation backend"}
+		return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorFail, Provenance: "local_attestation", Summary: "provider receipt signing preflight is unavailable", Remediation: "Run ntm provider attestation init on a supported local attestation backend"}, nil
 	}
 	signature, err := preflight(ctx)
 	if err != nil {
-		return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorFail, Provenance: "local_attestation", Summary: "provider receipt signing key is absent or unavailable", Evidence: safeErrorDigest(err), Remediation: "Run ntm provider attestation init before live provider execution"}
+		return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorFail, Provenance: "local_attestation", Summary: "provider receipt signing key is absent or unavailable", Evidence: safeErrorDigest(err), Remediation: "Run ntm provider attestation init before live provider execution"}, nil
 	}
 	provenance := "os_credential_broker"
 	summary := "OS-protected process-readable receipt key produced a locally verifiable signature"
@@ -1165,10 +1191,11 @@ func diagnoseProviderReceiptAttestation(ctx context.Context, preflight func(cont
 		provenance = "hardware_local_controller"
 		summary = "hardware-backed non-exportable local-controller key produced a locally verifiable signature"
 	}
-	return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorPass, Provenance: provenance, Summary: summary, Evidence: digestSafeJSON(signature.KeyMetadata)}
+	key := signature.KeyMetadata
+	return providerDoctorCheck{ID: "receipt_attestation", Status: providerDoctorPass, Provenance: provenance, Summary: summary, Evidence: digestSafeJSON(key)}, &key
 }
 
-func diagnoseQualification(identity provider.Identity, transport, policySHA string, opts providerCommandOptions, deps providerDoctorDependencies, checks []providerDoctorCheck) (providerDoctorQualification, []providerDoctorCheck) {
+func diagnoseQualification(identity provider.Identity, transport, policySHA string, trustedSigner *providerattestation.KeyMetadata, opts providerCommandOptions, deps providerDoctorDependencies, checks []providerDoctorCheck) (providerDoctorQualification, []providerDoctorCheck) {
 	result := providerDoctorQualification{State: "missing", PolicySHA256: policySHA}
 	qualificationRequired := transport == "zai_claude_runtime" || transport == "zai_codex_runtime" || transport == "zai_native_api" && policySHA == providerNativeToolsPolicySHA256()
 	if !qualificationRequired {
@@ -1179,6 +1206,10 @@ func diagnoseQualification(identity provider.Identity, transport, policySHA stri
 	receipt, _, err := deps.qualificationStore(opts.qualificationDir, identity.Hash())
 	if err != nil {
 		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "unavailable", Summary: "no valid live qualification receipt exists", Remediation: "Run the explicit live provider qualification suite in a disposable repository"})
+		return result, checks
+	}
+	if err := receipt.Validate(); err != nil {
+		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "live_receipt", Summary: "qualification receipt failed integrity validation", Evidence: safeErrorDigest(err), Remediation: "Run a fresh live qualification with the pinned receipt signer"})
 		return result, checks
 	}
 	result.Passed = receipt.Passed
@@ -1195,6 +1226,9 @@ func diagnoseQualification(identity provider.Identity, transport, policySHA stri
 	case receipt.Attestation == nil:
 		result.State = "unsigned"
 		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "live_receipt", Summary: "qualification receipt is not cryptographically attested", Evidence: receipt.ReceiptSHA256, Remediation: "Initialize provider receipt signing and run a fresh live qualification"})
+	case trustedSigner == nil || receipt.Attestation.KeyMetadata != *trustedSigner:
+		result.State = "signer_mismatch"
+		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "live_receipt", Summary: "qualification receipt was not signed by the profile-pinned local attestation key", Evidence: receipt.ReceiptSHA256, Remediation: "Run a fresh live qualification with the currently pinned receipt signer"})
 	case receipt.Transport != transport || receipt.IdentitySHA256 != identity.Hash() || receipt.PolicySHA256 != policySHA:
 		result.State = "identity_or_policy_mismatch"
 		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "live_receipt", Summary: "qualification receipt does not bind this exact identity, transport, and policy", Evidence: receipt.ReceiptSHA256})
@@ -1207,11 +1241,28 @@ func diagnoseQualification(identity provider.Identity, transport, policySHA stri
 	case !receipt.Passed:
 		result.State = "failed"
 		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "live_receipt", Summary: "one or more mandatory live qualification checks failed", Evidence: receipt.ReceiptSHA256})
+	case transport == "zai_codex_runtime" && !qualificationModelIdentityVerified(receipt):
+		result.State = "model_identity_unverified"
+		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "live_receipt", Summary: "qualification receipt lacks provider-live exact model identity evidence", Evidence: receipt.ReceiptSHA256, Remediation: "Run a fresh live qualification with the pinned Codex runtime"})
 	default:
 		result.State = "current_pass"
+		result.ModelIdentityVerified = transport != "zai_codex_runtime" || qualificationModelIdentityVerified(receipt)
 		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorPass, Provenance: "live_receipt", Summary: "all mandatory live qualification checks passed and are current", Evidence: receipt.ReceiptSHA256})
 	}
 	return result, checks
+}
+
+// qualificationModelIdentityVerified requires the signed receipt's dedicated
+// model-identity gate. The bound identity includes the configured model; the
+// Codex qualification producer only marks this provider-live check passed
+// after it observes an exact terminal provider-reported model.
+func qualificationModelIdentityVerified(receipt providerqualification.Receipt) bool {
+	for _, check := range receipt.Checks {
+		if check.Name == providerqualification.CheckIdentity {
+			return check.Passed && check.Provenance == "live" && check.EvidenceSHA256 != "" && check.Detail == providerCodexQualificationModelGate
+		}
+	}
+	return false
 }
 
 func diagnoseProviderCapacity(identity provider.Identity, deps providerDoctorDependencies, checks []providerDoctorCheck) (providerDoctorCapacity, []providerDoctorCheck) {
@@ -1229,6 +1280,9 @@ func diagnoseProviderCapacity(identity provider.Identity, deps providerDoctorDep
 		snapshot = codexSnapshot.Exact
 		subscription = &providerDoctorSubscriptionCapacity{
 			ScopeSHA256:          codexSnapshot.SubscriptionScopeSHA256,
+			PlanRunning:          codexSnapshot.PlanRunning,
+			PlanMaxConcurrent:    codexSnapshot.PlanMaxConcurrent,
+			AdmissionReservation: codexSnapshot.AdmissionReservation,
 			FiveHourCreditsUsed:  codexSnapshot.FiveHourCreditsUsed,
 			FiveHourCreditsLimit: codexSnapshot.FiveHourCreditsLimit,
 			FiveHourResetsAt:     codexSnapshot.FiveHourResetsAt,
@@ -1271,12 +1325,43 @@ func diagnoseProviderCapacity(identity provider.Identity, deps providerDoctorDep
 	}
 	statusValue := providerDoctorPass
 	remediation := ""
-	if result.CircuitState != "closed" {
-		statusValue = providerDoctorWarn
-		remediation = "Wait for transient backoff or remediate the exact credential, entitlement, model, or quota before resetting this identity"
+	summary := "identity-keyed local shared capacity store is active; circuit=" + result.CircuitState
+	if block := providerDoctorCapacityAdmissionBlock(result); block != "" {
+		statusValue = providerDoctorFail
+		summary += "; admission_block=" + block
+		remediation = "Wait for active leases or quota reset, or complete the explicit owner-authorized capacity recovery; do not dispatch or fail over while admission is blocked"
 	}
-	checks = append(checks, providerDoctorCheck{ID: "capacity", Status: statusValue, Provenance: "live_local_shared", Summary: "identity-keyed local shared capacity store is active; circuit=" + result.CircuitState, Evidence: sha256StringCLI(identity.CapacityScope().String()), Remediation: remediation})
+	checks = append(checks, providerDoctorCheck{ID: "capacity", Status: statusValue, Provenance: "live_local_shared", Summary: summary, Evidence: sha256StringCLI(identity.CapacityScope().String()), Remediation: remediation})
 	return result, checks
+}
+
+func providerDoctorCapacityAdmissionBlock(capacity providerDoctorCapacity) string {
+	if capacity.CircuitState != "closed" {
+		return "identity_" + capacity.CircuitState
+	}
+	if capacity.Running > 0 {
+		return "identity_concurrency_busy"
+	}
+	subscription := capacity.Subscription
+	if subscription == nil {
+		return ""
+	}
+	if subscription.PlanMaxConcurrent < 1 || subscription.AdmissionReservation <= 0 || subscription.FiveHourCreditsLimit <= 0 || subscription.WeeklyCreditsLimit <= 0 || subscription.FiveHourCreditsUsed < 0 || subscription.WeeklyCreditsUsed < 0 {
+		return "subscription_snapshot_invalid"
+	}
+	if subscription.UnknownUsageReserved {
+		return "subscription_unknown_usage_reserved"
+	}
+	if subscription.PlanRunning >= subscription.PlanMaxConcurrent {
+		return "subscription_concurrency_busy"
+	}
+	if subscription.FiveHourCreditsUsed+subscription.AdmissionReservation > subscription.FiveHourCreditsLimit {
+		return "subscription_five_hour_quota"
+	}
+	if subscription.WeeklyCreditsUsed+subscription.AdmissionReservation > subscription.WeeklyCreditsLimit {
+		return "subscription_weekly_quota"
+	}
+	return ""
 }
 
 func diagnoseLifecycleAuthority(capability provider.OperationCapabilities) providerDoctorCheck {
@@ -1297,7 +1382,13 @@ func providerDoctorReady(report providerDoctorReport) bool {
 	if report.Mode != "online" || report.Runtime.Drift != "none" || report.Capacity.Scope != provider.CapacityControlScopeLocalShared {
 		return false
 	}
-	if (report.Transport == "zai_claude_runtime" || report.Transport == "zai_native_api" && report.Policy.Name == provider.NativeZAIToolsPolicyName) && (!report.Qualification.Passed || report.Qualification.State != "current_pass") {
+	if providerDoctorCapacityAdmissionBlock(report.Capacity) != "" {
+		return false
+	}
+	if (report.Transport == "zai_claude_runtime" || report.Transport == "zai_codex_runtime" || report.Transport == "zai_native_api" && report.Policy.Name == provider.NativeZAIToolsPolicyName) && (!report.Qualification.Passed || report.Qualification.State != "current_pass") {
+		return false
+	}
+	if report.Transport == "zai_codex_runtime" && !report.Qualification.ModelIdentityVerified {
 		return false
 	}
 	// A Claude-compatible Z.ai pane can be admission-controlled only while NTM

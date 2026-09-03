@@ -68,6 +68,25 @@ var codexCapacityRecoveryAuthorizationRequiredChecks = []string{
 	"owner_authorized_unbound_exception",
 }
 
+// codexIdentityPreflightRequiredChecks is a narrow, paid read-only probe
+// matrix. It is deliberately not a runtime qualification: it proves only the
+// exact identity and no-tool safety boundary before a disposable-worktree
+// suite may begin. These receipts live outside the qualification store and
+// must never be used as readiness evidence.
+var codexIdentityPreflightRequiredChecks = []string{
+	"profile_manifest",
+	"credential_broker",
+	"receipt_signer",
+	"shared_capacity_admission",
+	"provider_dispatch",
+	"nonce_completion",
+	"exact_model_identity",
+	"no_tool_activity",
+	"empty_workspace",
+	"zero_residual_cleanup",
+	"capacity_accounting",
+}
+
 var nativeRequiredChecks = []string{
 	"exact_model_request_id",
 	"controller_tool_loop",
@@ -273,6 +292,8 @@ func requiredChecksForTransport(transport string) ([]string, error) {
 		return codexRequiredChecks, nil
 	case "zai_codex_capacity_recovery_authorization":
 		return codexCapacityRecoveryAuthorizationRequiredChecks, nil
+	case "zai_codex_identity_preflight":
+		return codexIdentityPreflightRequiredChecks, nil
 	case "zai_native_api":
 		return nativeRequiredChecks, nil
 	default:
@@ -294,6 +315,13 @@ func CodexRequiredChecks() []string { return append([]string(nil), codexRequired
 // qualify a runtime.
 func CodexCapacityRecoveryAuthorizationRequiredChecks() []string {
 	return append([]string(nil), codexCapacityRecoveryAuthorizationRequiredChecks...)
+}
+
+// CodexIdentityPreflightRequiredChecks returns the narrow, non-qualifying
+// preflight matrix. A passed preflight never substitutes for the complete
+// zai_codex_runtime qualification matrix.
+func CodexIdentityPreflightRequiredChecks() []string {
+	return append([]string(nil), codexIdentityPreflightRequiredChecks...)
 }
 
 func (r Receipt) validateIdentityFields() error {
@@ -335,6 +363,14 @@ func DefaultStoreDir() string {
 		}
 	}
 	return filepath.Join(base, "ntm", "provider-qualifications")
+}
+
+// DefaultCodexIdentityPreflightStoreDir is intentionally a sibling of the
+// qualification store. This physical separation, together with the distinct
+// transport matrix, prevents a paid identity probe from being mistaken for a
+// full runtime qualification by callers that load readiness receipts.
+func DefaultCodexIdentityPreflightStoreDir() string {
+	return filepath.Join(filepath.Dir(DefaultStoreDir()), "provider-codex-identity-preflights")
 }
 
 // Store writes a create-only local receipt under the exact identity.

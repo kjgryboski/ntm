@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io/fs"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -65,6 +66,45 @@ func TestReceiptFinalizeRecognizesZaiCodexRuntimeMatrix(t *testing.T) {
 	}
 	if !receipt.Passed || receipt.Validate() != nil {
 		t.Fatalf("Codex receipt = %#v, validate=%v", receipt, receipt.Validate())
+	}
+}
+
+func TestReceiptFinalizeRecognizesDistinctCodexIdentityPreflightMatrix(t *testing.T) {
+	completed := time.Unix(1_800_000_000, 0).UTC()
+	checks := make([]Check, 0, len(codexIdentityPreflightRequiredChecks))
+	for _, name := range codexIdentityPreflightRequiredChecks {
+		checks = append(checks, Check{Name: name, Passed: true, Provenance: "live", EvidenceSHA256: testHash("preflight-" + name)})
+	}
+	receipt := Receipt{
+		Mode: ModeLive, Provider: "zai", Transport: "zai_codex_identity_preflight",
+		IdentitySHA256: testHash("preflight-identity"), PolicySHA256: testHash("preflight-policy"), RuntimeVersion: "0.149.0",
+		StartedAt: completed.Add(-time.Minute), CompletedAt: completed, DisposableRepoHash: testHash("preflight-root"), Checks: checks,
+	}
+	if err := receipt.Finalize(); err != nil {
+		t.Fatalf("Finalize() error: %v", err)
+	}
+	if !receipt.Passed || receipt.Validate() != nil {
+		t.Fatalf("preflight receipt = %#v, validate=%v", receipt, receipt.Validate())
+	}
+
+	// A complete preflight has a smaller, distinct matrix and cannot validate
+	// if relabeled as the full runtime qualification transport.
+	relabeled := receipt
+	relabeled.Transport = "zai_codex_runtime"
+	if err := relabeled.Finalize(); err != nil || relabeled.Passed || relabeled.Validate() != nil {
+		t.Fatalf("preflight matrix was accepted as a full runtime qualification: receipt=%#v finalize=%v validate=%v", relabeled, err, relabeled.Validate())
+	}
+}
+
+func TestCodexIdentityPreflightStoreIsSeparateFromQualificationStore(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	qualificationDir := DefaultStoreDir()
+	preflightDir := DefaultCodexIdentityPreflightStoreDir()
+	if filepath.Dir(qualificationDir) != filepath.Dir(preflightDir) || qualificationDir == preflightDir {
+		t.Fatalf("store dirs are not distinct siblings: qualification=%q preflight=%q", qualificationDir, preflightDir)
+	}
+	if filepath.Base(preflightDir) != "provider-codex-identity-preflights" {
+		t.Fatalf("preflight directory = %q", preflightDir)
 	}
 }
 

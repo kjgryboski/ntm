@@ -31,6 +31,8 @@ const (
 	providerCodexWorkloadImplementation = "implementation"
 	providerCodexWorkloadReview         = "review"
 	providerCodexWorkloadBulk           = "bulk"
+	providerCodexTerminalModelEvidence  = "turn.completed.server_model"
+	providerCodexQualificationModelGate = "terminal_turn_completed_server_model_exact_match"
 )
 
 // providerCodexSubscriptionAdmission is intentionally distinct from the
@@ -257,7 +259,8 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 			return fmt.Errorf("provider codex pinned receipt signer is unavailable: %w", err)
 		}
 	}
-	if err := preflightProviderReceiptSigner(commandCtx, sign); err != nil {
+	signerPreflight, err := preflightProviderReceiptSignerMetadata(commandCtx, sign)
+	if err != nil {
 		return fmt.Errorf("provider codex run requires an initialized receipt signing key before dispatch: %w", err)
 	}
 	status := deps.admission.CapacityStatus()
@@ -292,7 +295,7 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 		return finishProviderCodex(cmd, output, errors.New("provider codex durable operation claim failed before dispatch"))
 	}
 	if !won {
-		return replayProviderCodex(cmd, output, claimed, identity)
+		return replayProviderCodex(cmd, output, claimed, identity, signerPreflight.KeyMetadata)
 	}
 	output.ReceiptState, output.State = "claimed", "admission_pending"
 	decision := deps.admission.Acquire(identity)
@@ -417,7 +420,7 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 			return finishProviderCodex(cmd, output, runErr)
 		}
 	}
-	if err := sealProviderCodexOutput(commandCtx, &output, sign); err != nil {
+	if err := sealProviderCodexOutput(commandCtx, &output, sign, signerPreflight.KeyMetadata); err != nil {
 		output.Success, output.State, output.ReceiptState = false, "outcome_unknown", "attestation_failed"
 		return finishProviderCodex(cmd, output, errors.New("provider codex outcome could not be attested; do not redispatch"))
 	}
@@ -434,7 +437,7 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 }
 
 func reconcileProviderCodexSubscriptionUsage(admission providerCodexSubscriptionAdmission, identity provider.Identity, decision ratelimit.SubscriptionDecision, receipt zai.CodexRunReceipt) error {
-	if admission == nil || !decision.Allowed || !decision.NoFailover || !receipt.ModelVerified || strings.TrimSpace(receipt.ResolvedModel) == "" || receipt.CompletedAt.IsZero() {
+	if admission == nil || !decision.Allowed || !decision.NoFailover || !providerCodexReceiptHasExactModelEvidence(receipt, identity) || receipt.CompletedAt.IsZero() {
 		return errors.New("authoritative model, completion time, or subscription decision is unavailable")
 	}
 	usage := ratelimit.TokenUsage{InputTokens: receipt.Usage.InputTokens, CachedInputTokens: receipt.Usage.CachedInputTokens, OutputTokens: receipt.Usage.OutputTokens}
@@ -454,13 +457,13 @@ func providerCodexPinnedSigner(profile config.ProviderProfileConfig) (func(conte
 	}, nil
 }
 
-func replayProviderCodex(cmd *cobra.Command, expected providerCodexRunOutput, claimed *state.SendOperation, identity provider.Identity) error {
+func replayProviderCodex(cmd *cobra.Command, expected providerCodexRunOutput, claimed *state.SendOperation, identity provider.Identity, trustedSigner providerattestation.KeyMetadata) error {
 	if claimed == nil || claimed.BindingHash != expected.BindingSHA256 {
 		expected.State, expected.ReceiptState = "binding_conflict", "conflict"
 		return finishProviderCodex(cmd, expected, errors.New("operation ID is already bound to a different Z.ai Codex operation"))
 	}
 	var recorded providerCodexRunOutput
-	if claimed.Status != state.SendOperationCompleted || json.Unmarshal([]byte(claimed.OutcomeJSON), &recorded) != nil || !validRecordedProviderCodexOutput(recorded, expected, identity) {
+	if claimed.Status != state.SendOperationCompleted || json.Unmarshal([]byte(claimed.OutcomeJSON), &recorded) != nil || !validRecordedProviderCodexOutput(recorded, expected, identity, trustedSigner) {
 		expected.Success, expected.State, expected.ReceiptState = false, "outcome_unknown", "corrupt"
 		return finishProviderCodex(cmd, expected, errors.New("stored Z.ai Codex operation is incomplete or invalid; do not redispatch"))
 	}
@@ -470,19 +473,21 @@ func replayProviderCodex(cmd *cobra.Command, expected providerCodexRunOutput, cl
 	return finishProviderCodex(cmd, recorded, errors.New("replayed Z.ai Codex operation did not qualify"))
 }
 
-func validRecordedProviderCodexOutput(output, expected providerCodexRunOutput, identity provider.Identity) bool {
+func validRecordedProviderCodexOutput(output, expected providerCodexRunOutput, identity provider.Identity, trustedSigner providerattestation.KeyMetadata) bool {
 	if output.SchemaVersion != providerCodexRunSchema || output.Transport != "zai_codex_runtime" || output.IdentitySHA256 != identity.Hash() || output.Attestation == nil ||
+		output.Attestation.KeyMetadata != trustedSigner ||
 		output.Profile != expected.Profile || output.ConfigSHA256 != expected.ConfigSHA256 || output.BinarySHA256 != expected.BinarySHA256 ||
 		output.BrokerCommandSHA256 != expected.BrokerCommandSHA256 || output.CredentialBridgeSHA256 != expected.CredentialBridgeSHA256 ||
 		output.RuntimeVersion != expected.RuntimeVersion || output.BrokerCredentialSHA256 != expected.BrokerCredentialSHA256 ||
-		output.OperationIDSHA256 != expected.OperationIDSHA256 || output.BindingSHA256 != expected.BindingSHA256 {
+		output.OperationIDSHA256 != expected.OperationIDSHA256 || output.BindingSHA256 != expected.BindingSHA256 ||
+		!providerCodexReceiptHasNoResiduals(output.Receipt) {
 		return false
 	}
 	payload, err := canonicalProviderCodexOutput(output)
 	return err == nil && providerattestation.ValidateBridgePayload(payload) == nil && providerattestation.Verify(payload, *output.Attestation) == nil
 }
 
-func sealProviderCodexOutput(ctx context.Context, output *providerCodexRunOutput, sign func(context.Context, []byte) (providerattestation.SignatureMetadata, error)) error {
+func sealProviderCodexOutput(ctx context.Context, output *providerCodexRunOutput, sign func(context.Context, []byte) (providerattestation.SignatureMetadata, error), trustedSigner providerattestation.KeyMetadata) error {
 	payload, err := canonicalProviderCodexOutput(*output)
 	if err != nil {
 		return err
@@ -493,6 +498,9 @@ func sealProviderCodexOutput(ctx context.Context, output *providerCodexRunOutput
 	signature, err := sign(ctx, payload)
 	if err != nil {
 		return err
+	}
+	if signature.KeyMetadata != trustedSigner {
+		return errors.New("Codex receipt signer changed after preflight")
 	}
 	if err := providerattestation.Verify(payload, signature); err != nil {
 		return err
@@ -521,8 +529,8 @@ func validateProviderCodexTerminalReceipt(receipt zai.CodexRunReceipt, identity 
 	}
 	if receipt.SessionIDSHA256 == "" || receipt.OutputSHA256 == "" || receipt.EventStreamSHA256 == "" || receipt.StderrSHA256 == "" || receipt.ToolEventsSHA256 == "" ||
 		receipt.StartedAt.IsZero() || receipt.CompletedAt.IsZero() || receipt.CompletedAt.Before(receipt.StartedAt) || receipt.Cancellation.ObservedAt.IsZero() ||
-		receipt.Cancellation.ResidualProcessIDs == nil || !receipt.ProcessStarted || !receipt.ProviderStarted || !receipt.OutcomeKnown ||
-		!receipt.CompletionConfirmed || !receipt.NonceVerified || !receipt.LineageVerified || !receipt.ZeroResiduals || receipt.ExitCode != 0 || strings.TrimSpace(receipt.StopReason) == "" {
+		!receipt.ProcessStarted || !receipt.ProviderStarted || !receipt.OutcomeKnown || !receipt.CompletionConfirmed || !receipt.NonceVerified ||
+		!receipt.LineageVerified || !providerCodexReceiptHasNoResiduals(receipt) || receipt.ExitCode != 0 || strings.TrimSpace(receipt.StopReason) == "" {
 		return errors.New("receipt lifecycle evidence is incomplete")
 	}
 	if action == "resume" {
@@ -532,13 +540,21 @@ func validateProviderCodexTerminalReceipt(receipt zai.CodexRunReceipt, identity 
 	} else if receipt.ParentSessionSHA256 != "" {
 		return errors.New("receipt start unexpectedly contains parent lineage")
 	}
-	if requireModel && (!receipt.ModelVerified || receipt.ResolvedModel != identity.Model() || strings.TrimSpace(receipt.ModelEvidence) == "") {
+	if requireModel && !providerCodexReceiptHasExactModelEvidence(receipt, identity) {
 		return errors.New("receipt lacks exact provider-reported model evidence")
 	}
 	if !requireModel && receipt.ModelVerified {
 		return errors.New("unqualified receipt unexpectedly claims verified model identity")
 	}
 	return nil
+}
+
+func providerCodexReceiptHasNoResiduals(receipt zai.CodexRunReceipt) bool {
+	return receipt.ZeroResiduals && receipt.Cancellation.ResidualProcessIDs != nil && len(receipt.Cancellation.ResidualProcessIDs) == 0
+}
+
+func providerCodexReceiptHasExactModelEvidence(receipt zai.CodexRunReceipt, identity provider.Identity) bool {
+	return receipt.ModelVerified && receipt.RequestedModel == identity.Model() && receipt.ResolvedModel == identity.Model() && receipt.ModelEvidence == providerCodexTerminalModelEvidence
 }
 
 func providerCodexBindingHash(identity provider.Identity, prompt, cwd string, opts providerCodexRunOptions, manifest zai.CodexManifestAttestation) string {

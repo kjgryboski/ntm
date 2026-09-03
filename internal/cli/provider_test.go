@@ -86,6 +86,23 @@ func TestProviderQualificationRequiresExplicitLiveOptIn(t *testing.T) {
 	}
 }
 
+func TestProviderQualificationRequiresPairedCodexLifecycleRiskFlags(t *testing.T) {
+	for _, opts := range []providerQualificationOptions{
+		{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Second, exerciseUnknownOutcomeLifecycle: true},
+		{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Second, acceptFullWeekReservation: true},
+	} {
+		called := false
+		deps := providerQualificationDependencies{loadConfig: func() *config.Config {
+			called = true
+			return &config.Config{}
+		}}
+		err := runProviderQualification(&cobra.Command{}, opts, deps)
+		if err == nil || !strings.Contains(err.Error(), "requires both") || called {
+			t.Fatalf("unpaired lifecycle flags err=%v load_called=%t opts=%+v", err, called, opts)
+		}
+	}
+}
+
 func TestZAIAuthPresenceRejectsGenericAnthropicToken(t *testing.T) {
 	identity, err := providerTestProfile().Identity()
 	if err != nil {
@@ -130,7 +147,7 @@ func TestProviderDoctorDoesNotRequireZAICodingQualificationForProviderNativeTran
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, checks := diagnoseQualification(identity, "xai_acp", providerTestHash("policy"), providerCommandOptions{}, providerDoctorDependencies{}, nil)
+	result, checks := diagnoseQualification(identity, "xai_acp", providerTestHash("policy"), nil, providerCommandOptions{}, providerDoctorDependencies{}, nil)
 	if result.State != "not_required" || len(checks) != 1 || checks[0].Status != providerDoctorPass {
 		t.Fatalf("provider-native qualification gate=%+v checks=%+v", result, checks)
 	}
@@ -617,6 +634,66 @@ func providerTestReceipt(t *testing.T, identity provider.Identity, at time.Time)
 	return receipt
 }
 
+func providerCodexDoctorReceipt(t *testing.T, identity provider.Identity, at time.Time) providerqualification.Receipt {
+	t.Helper()
+	checks := make([]providerqualification.Check, 0, len(providerqualification.CodexRequiredChecks()))
+	for _, name := range providerqualification.CodexRequiredChecks() {
+		provenance := "live"
+		if name == "capacity_accounting" {
+			provenance = "local_authoritative"
+		}
+		check := providerqualification.Check{Name: name, Passed: true, Provenance: provenance, EvidenceSHA256: providerTestHash("codex-" + name)}
+		if name == providerqualification.CheckIdentity {
+			check.Detail = providerCodexQualificationModelGate
+		}
+		checks = append(checks, check)
+	}
+	receipt := providerqualification.Receipt{
+		Provider: "zai", Transport: "zai_codex_runtime", IdentitySHA256: identity.Hash(), PolicySHA256: providerCodexPolicySHA256(),
+		RuntimeVersion: "0.149.0", StartedAt: at.Add(-time.Minute), CompletedAt: at,
+		DisposableRepoHash: providerTestHash("codex-repo"), Checks: checks,
+	}
+	if err := receipt.Finalize(); err != nil {
+		t.Fatalf("Finalize() error: %v", err)
+	}
+	payload, err := receipt.CanonicalPayload()
+	if err != nil {
+		t.Fatalf("CanonicalPayload() error: %v", err)
+	}
+	signature, err := newProviderNativeTestSigner()(context.Background(), payload)
+	if err != nil {
+		t.Fatalf("sign test Codex qualification receipt: %v", err)
+	}
+	if err := receipt.AttachAttestation(signature); err != nil {
+		t.Fatalf("AttachAttestation() error: %v", err)
+	}
+	return receipt
+}
+
+func healthyProviderCodexSubscriptionSnapshot(identity provider.Identity) ratelimit.SubscriptionCapacitySnapshot {
+	config := ratelimit.DefaultSubscriptionAdmissionConfig()
+	return ratelimit.SubscriptionCapacitySnapshot{
+		IdentityHash: identity.Hash(), SubscriptionScopeSHA256: providerTestHash("zai-coding-plan"),
+		Exact:             ratelimit.AdmissionSnapshot{IdentityHash: identity.Hash(), Scope: provider.CapacityControlScopeLocalShared, Tokens: 1},
+		PlanMaxConcurrent: config.MaxConcurrent, AdmissionReservation: config.AdmissionReservation,
+		FiveHourCreditsLimit: config.FiveHourCreditLimit, WeeklyCreditsLimit: config.WeeklyCreditLimit,
+	}
+}
+
+func TestQualificationModelIdentityVerifiedRequiresTerminalServerModelContract(t *testing.T) {
+	receipt := providerqualification.Receipt{Checks: []providerqualification.Check{{
+		Name: providerqualification.CheckIdentity, Passed: true, Provenance: "live",
+		EvidenceSHA256: providerTestHash("terminal-model"), Detail: providerCodexQualificationModelGate,
+	}}}
+	if !qualificationModelIdentityVerified(receipt) {
+		t.Fatal("exact terminal server-model contract was rejected")
+	}
+	receipt.Checks[0].Detail = "configured_or_requested_model"
+	if qualificationModelIdentityVerified(receipt) {
+		t.Fatal("non-terminal model evidence was promoted")
+	}
+}
+
 func TestProviderDoctorRejectsUnsignedQualificationReceipt(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0).UTC()
 	profile := providerTestProfile()
@@ -627,7 +704,7 @@ func TestProviderDoctorRejectsUnsignedQualificationReceipt(t *testing.T) {
 	receipt := providerTestReceipt(t, identity, now)
 	receipt.Attestation = nil
 	deps := providerTestDeps(t, now, receipt)
-	result, checks := diagnoseQualification(identity, "zai_claude_runtime", providerqualification.QualificationPolicySHA256(), providerCommandOptions{qualificationAge: 24 * time.Hour}, deps, nil)
+	result, checks := diagnoseQualification(identity, "zai_claude_runtime", providerqualification.QualificationPolicySHA256(), nil, providerCommandOptions{qualificationAge: 24 * time.Hour}, deps, nil)
 	if result.State != "unsigned" || len(checks) != 1 || checks[0].Status != providerDoctorFail {
 		t.Fatalf("unsigned qualification was accepted: result=%+v checks=%+v", result, checks)
 	}
@@ -668,6 +745,9 @@ func providerTestDeps(t *testing.T, now time.Time, receipt providerqualification
 			return ratelimit.AdmissionSnapshot{IdentityHash: identity.Hash(), Scope: provider.CapacityControlScopeLocalShared, Tokens: 1}
 		},
 		attestationPreflight: func(context.Context) (providerattestation.SignatureMetadata, error) {
+			if receipt.Attestation != nil {
+				return providerattestation.SignatureMetadata{KeyMetadata: receipt.Attestation.KeyMetadata}, nil
+			}
 			return providerattestation.SignatureMetadata{KeyMetadata: providerattestation.KeyMetadata{Algorithm: providerattestation.AlgorithmEd25519, ProtectionEvidence: providerattestation.ProtectionOSProcessRead}}, nil
 		},
 		admission: admission,
@@ -694,18 +774,21 @@ func TestProviderDoctorCodexCapacityUsesSubscriptionControllerSnapshot(t *testin
 			}
 			return ratelimit.SubscriptionCapacitySnapshot{
 				IdentityHash: identity.Hash(), SubscriptionScopeSHA256: strings.Repeat("b", 64),
-				Exact:               ratelimit.AdmissionSnapshot{IdentityHash: identity.Hash(), Scope: provider.CapacityControlScopeLocalShared, Tokens: 0.5, Running: 1, ConsecutiveFailures: 2},
-				FiveHourCreditsUsed: 1999.5, FiveHourCreditsLimit: 2000, FiveHourResetsAt: &fiveReset,
+				Exact:                ratelimit.AdmissionSnapshot{IdentityHash: identity.Hash(), Scope: provider.CapacityControlScopeLocalShared, Tokens: 0.5, Running: 1, ConsecutiveFailures: 2},
+				PlanRunning:          1,
+				PlanMaxConcurrent:    1,
+				AdmissionReservation: 0.01,
+				FiveHourCreditsUsed:  1999.5, FiveHourCreditsLimit: 2000, FiveHourResetsAt: &fiveReset,
 				WeeklyCreditsUsed: 10000, WeeklyCreditsLimit: 10000, WeeklyResetsAt: &weeklyReset,
 				UnknownUsageReserved: true, LimitEvidence: "documented_zai_lite_floor_controller_local_estimate", ResetEvidence: "controller_local_rolling_window_estimate",
 			}
 		},
 	}
 	capacity, checks := diagnoseProviderCapacity(identity, deps, nil)
-	if capacity.Subscription == nil || capacity.Subscription.ScopeSHA256 != strings.Repeat("b", 64) || capacity.Subscription.FiveHourCreditsUsed != 1999.5 || capacity.Subscription.WeeklyCreditsLimit != 10000 || !capacity.Subscription.UnknownUsageReserved || capacity.Subscription.FiveHourResetsAt == nil || !capacity.Subscription.FiveHourResetsAt.Equal(fiveReset) || capacity.Running != 1 || capacity.Tokens != 0.5 || capacity.ConsecutiveFailures != 2 {
+	if capacity.Subscription == nil || capacity.Subscription.ScopeSHA256 != strings.Repeat("b", 64) || capacity.Subscription.PlanRunning != 1 || capacity.Subscription.PlanMaxConcurrent != 1 || capacity.Subscription.AdmissionReservation != 0.01 || capacity.Subscription.FiveHourCreditsUsed != 1999.5 || capacity.Subscription.WeeklyCreditsLimit != 10000 || !capacity.Subscription.UnknownUsageReserved || capacity.Subscription.FiveHourResetsAt == nil || !capacity.Subscription.FiveHourResetsAt.Equal(fiveReset) || capacity.Running != 1 || capacity.Tokens != 0.5 || capacity.ConsecutiveFailures != 2 {
 		t.Fatalf("capacity=%+v", capacity)
 	}
-	if len(checks) != 1 || checks[0].ID != "capacity" || checks[0].Status != providerDoctorPass {
+	if len(checks) != 1 || checks[0].ID != "capacity" || checks[0].Status != providerDoctorFail || !strings.Contains(checks[0].Summary, "admission_block=") {
 		t.Fatalf("capacity checks=%+v", checks)
 	}
 	encoded := string(mustJSON(t, capacity))
@@ -713,6 +796,41 @@ func TestProviderDoctorCodexCapacityUsesSubscriptionControllerSnapshot(t *testin
 		if strings.Contains(encoded, forbidden) {
 			t.Fatalf("subscription capacity leaked %q: %s", forbidden, encoded)
 		}
+	}
+}
+
+func TestProviderDoctorCapacityBlocksEverySubscriptionAdmissionDenial(t *testing.T) {
+	newHealthy := func() providerDoctorCapacity {
+		return providerDoctorCapacity{
+			Scope: provider.CapacityControlScopeLocalShared, CircuitState: "closed",
+			Subscription: &providerDoctorSubscriptionCapacity{
+				PlanMaxConcurrent: 1, AdmissionReservation: 0.01,
+				FiveHourCreditsLimit: 2000, WeeklyCreditsLimit: 10000,
+			},
+		}
+	}
+	if block := providerDoctorCapacityAdmissionBlock(newHealthy()); block != "" {
+		t.Fatalf("healthy capacity blocked: %s", block)
+	}
+	for _, test := range []struct {
+		name   string
+		want   string
+		mutate func(*providerDoctorCapacity)
+	}{
+		{name: "unknown usage", want: "subscription_unknown_usage_reserved", mutate: func(capacity *providerDoctorCapacity) { capacity.Subscription.UnknownUsageReserved = true }},
+		{name: "five hour quota", want: "subscription_five_hour_quota", mutate: func(capacity *providerDoctorCapacity) { capacity.Subscription.FiveHourCreditsUsed = 1999.995 }},
+		{name: "weekly quota", want: "subscription_weekly_quota", mutate: func(capacity *providerDoctorCapacity) { capacity.Subscription.WeeklyCreditsUsed = 9999.995 }},
+		{name: "plan concurrency", want: "subscription_concurrency_busy", mutate: func(capacity *providerDoctorCapacity) { capacity.Subscription.PlanRunning = 1 }},
+		{name: "exact concurrency", want: "identity_concurrency_busy", mutate: func(capacity *providerDoctorCapacity) { capacity.Running = 1 }},
+		{name: "circuit backoff", want: "identity_backoff", mutate: func(capacity *providerDoctorCapacity) { capacity.CircuitState = "backoff" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			capacity := newHealthy()
+			test.mutate(&capacity)
+			if block := providerDoctorCapacityAdmissionBlock(capacity); block != test.want {
+				t.Fatalf("block=%q want %q capacity=%+v", block, test.want, capacity)
+			}
+		})
 	}
 }
 
@@ -743,7 +861,7 @@ func TestProviderDoctorNeverDispatchesCodexOnlineProbeOutsideRunLane(t *testing.
 			return ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared, SharedStorePath: filepath.Join(root, "capacity.json")}
 		},
 		codexSubscriptionSnapshot: func(provider.Identity) ratelimit.SubscriptionCapacitySnapshot {
-			return ratelimit.SubscriptionCapacitySnapshot{Exact: ratelimit.AdmissionSnapshot{IdentityHash: identity.Hash(), Scope: provider.CapacityControlScopeLocalShared}}
+			return healthyProviderCodexSubscriptionSnapshot(identity)
 		},
 		codexCredentialStatus: func(context.Context, config.ProviderProfileConfig) (providercredential.Status, error) {
 			return providercredential.Status{Available: true, Present: true, Evidence: providercredential.EvidenceOSProtectedProcessReadable}, nil
@@ -759,6 +877,157 @@ func TestProviderDoctorNeverDispatchesCodexOnlineProbeOutsideRunLane(t *testing.
 	}
 	if probeCalls != 0 || admission.acquires != 0 || report.Readiness != providerReadinessNoGo || checkStatus(report.Checks, "model_entitlement") != providerDoctorFail {
 		t.Fatalf("unsafe Codex doctor dispatch: calls=%d admission=%+v report=%+v", probeCalls, admission, report)
+	}
+}
+
+func TestProviderDoctorUsesCurrentCodexQualificationForModelEntitlementWithoutDispatch(t *testing.T) {
+	root := t.TempDir()
+	profile := providerCodexProfile(root)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 3, 17, 0, 0, 0, time.UTC)
+	receipt := providerCodexDoctorReceipt(t, identity, now.Add(-time.Minute))
+	probeCalls := 0
+	admission := &providerSessionAdmissionFake{decision: ratelimit.Decision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	deps := providerDoctorDependencies{
+		now:       func() time.Time { return now },
+		lookPath:  func(string) (string, error) { return profile.Command, nil },
+		version:   func(context.Context, string) (string, error) { return "codex-cli 0.149.0", nil },
+		lookupEnv: func(string) (string, bool) { return "", false },
+		onlineProbe: func(context.Context, config.ProviderProfileConfig, provider.Identity) (providerDoctorLiveEvidence, error) {
+			probeCalls++
+			return providerDoctorLiveEvidence{}, nil
+		},
+		qualificationStore: func(_ string, got string) (providerqualification.Receipt, string, error) {
+			if got != identity.Hash() {
+				t.Fatalf("qualification identity=%s want %s", got, identity.Hash())
+			}
+			return receipt, "/redacted/codex-qualification.json", nil
+		},
+		codexSubscriptionStatus: func() ratelimit.CapacityStatus {
+			return ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared, SharedStorePath: filepath.Join(root, "capacity.json")}
+		},
+		codexSubscriptionSnapshot: func(provider.Identity) ratelimit.SubscriptionCapacitySnapshot {
+			return healthyProviderCodexSubscriptionSnapshot(identity)
+		},
+		codexCredentialStatus: func(context.Context, config.ProviderProfileConfig) (providercredential.Status, error) {
+			return providercredential.Status{Available: true, Present: true, Evidence: providercredential.EvidenceOSProtectedProcessReadable}, nil
+		},
+		codexAttestationPreflight: func(context.Context, config.ProviderProfileConfig) (providerattestation.SignatureMetadata, error) {
+			return providerattestation.SignatureMetadata{KeyMetadata: receipt.Attestation.KeyMetadata}, nil
+		},
+		admission: admission,
+	}
+	report, err := buildProviderDoctorReport(context.Background(), &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{"zai-codex": profile}}, providerCommandOptions{profile: "zai-codex", online: true, timeout: time.Second, qualificationAge: time.Hour}, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probeCalls != 0 || admission.acquires != 0 || report.Readiness != providerReadinessGoScoped || !report.Qualification.ModelIdentityVerified || checkStatus(report.Checks, "model_entitlement") != providerDoctorPass || checkStatus(report.Checks, "lifecycle_authority") != providerDoctorWarn {
+		t.Fatalf("report=%+v probeCalls=%d admission=%+v", report, probeCalls, admission)
+	}
+}
+
+func TestProviderDoctorCodexModelEntitlementRejectsReceiptWithoutProviderLiveIdentityCheck(t *testing.T) {
+	root := t.TempDir()
+	profile := providerCodexProfile(root)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 3, 17, 0, 0, 0, time.UTC)
+	receipt := providerCodexDoctorReceipt(t, identity, now.Add(-time.Minute))
+	for i := range receipt.Checks {
+		if receipt.Checks[i].Name == providerqualification.CheckIdentity {
+			receipt.Checks[i].Provenance = "local_authoritative"
+		}
+	}
+	if err := receipt.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := receipt.CanonicalPayload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature, err := newProviderNativeTestSigner()(context.Background(), payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := receipt.AttachAttestation(signature); err != nil {
+		t.Fatal(err)
+	}
+	probeCalls := 0
+	admission := &providerSessionAdmissionFake{decision: ratelimit.Decision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	deps := providerDoctorDependencies{
+		now:       func() time.Time { return now },
+		lookPath:  func(string) (string, error) { return profile.Command, nil },
+		version:   func(context.Context, string) (string, error) { return "codex-cli 0.149.0", nil },
+		lookupEnv: func(string) (string, bool) { return "", false },
+		onlineProbe: func(context.Context, config.ProviderProfileConfig, provider.Identity) (providerDoctorLiveEvidence, error) {
+			probeCalls++
+			return providerDoctorLiveEvidence{}, nil
+		},
+		qualificationStore: func(string, string) (providerqualification.Receipt, string, error) {
+			return receipt, "/redacted/codex-qualification.json", nil
+		},
+		codexSubscriptionStatus: func() ratelimit.CapacityStatus {
+			return ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared, SharedStorePath: filepath.Join(root, "capacity.json")}
+		},
+		codexSubscriptionSnapshot: func(provider.Identity) ratelimit.SubscriptionCapacitySnapshot {
+			return healthyProviderCodexSubscriptionSnapshot(identity)
+		},
+		codexCredentialStatus: func(context.Context, config.ProviderProfileConfig) (providercredential.Status, error) {
+			return providercredential.Status{Available: true, Present: true, Evidence: providercredential.EvidenceOSProtectedProcessReadable}, nil
+		},
+		codexAttestationPreflight: func(context.Context, config.ProviderProfileConfig) (providerattestation.SignatureMetadata, error) {
+			return providerattestation.SignatureMetadata{KeyMetadata: receipt.Attestation.KeyMetadata}, nil
+		},
+		admission: admission,
+	}
+	report, err := buildProviderDoctorReport(context.Background(), &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{"zai-codex": profile}}, providerCommandOptions{profile: "zai-codex", online: true, timeout: time.Second, qualificationAge: time.Hour}, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probeCalls != 0 || admission.acquires != 0 || report.Readiness != providerReadinessNoGo || report.Qualification.State != "model_identity_unverified" || checkStatus(report.Checks, "model_entitlement") != providerDoctorFail {
+		t.Fatalf("report=%+v probeCalls=%d admission=%+v", report, probeCalls, admission)
+	}
+}
+
+func TestProviderDoctorRejectsCodexQualificationFromDifferentValidSigner(t *testing.T) {
+	profile := providerCodexProfile(t.TempDir())
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 3, 17, 0, 0, 0, time.UTC)
+	receipt := providerCodexDoctorReceipt(t, identity, now.Add(-time.Minute))
+	otherSignature, err := newProviderNativeTestSigner()(context.Background(), []byte("pinned-signer-preflight"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherSignature.KeyMetadata == receipt.Attestation.KeyMetadata {
+		t.Fatal("test setup did not produce a distinct signer")
+	}
+	deps := providerDoctorDependencies{
+		now: func() time.Time { return now },
+		qualificationStore: func(string, string) (providerqualification.Receipt, string, error) {
+			return receipt, "/redacted/attacker-signed.json", nil
+		},
+	}
+	result, checks := diagnoseQualification(identity, "zai_codex_runtime", providerCodexPolicySHA256(), &otherSignature.KeyMetadata, providerCommandOptions{qualificationAge: time.Hour}, deps, nil)
+	if result.State != "signer_mismatch" || len(checks) != 1 || checks[0].Status != providerDoctorFail {
+		t.Fatalf("different valid signer was accepted: result=%+v checks=%+v", result, checks)
+	}
+	report := providerDoctorReport{
+		Mode: "online", Transport: "zai_codex_runtime",
+		Runtime:       providerDoctorRuntime{Drift: "none"},
+		Capacity:      providerDoctorCapacity{Scope: provider.CapacityControlScopeLocalShared},
+		Qualification: result,
+		Checks:        append(checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorPass}),
+	}
+	if providerDoctorReady(report) {
+		t.Fatal("different valid signer promoted Codex readiness")
 	}
 }
 
