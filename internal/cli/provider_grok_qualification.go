@@ -200,6 +200,7 @@ func runProviderGrokQualification(cmd *cobra.Command, opts providerQualification
 	expectedResolvedModel := grok.ExpectedResolvedModel(profile.RuntimeVersion, identity.Model())
 	modelObserved := runErr == nil && result.Success && result.AcknowledgementVerified && result.Authenticated && result.RuntimeEventContract.Passed && result.Model == identity.Model() && grokDoctorModelEvidenceConfirmed(result.ModelEvidence) && result.ResolvedModel == expectedResolvedModel && result.ResolvedModelEvidence == "completion_metadata.usage.model_usage_singleton"
 	setGrokQualificationCheck(&receipt, providerqualification.CheckIdentity, modelObserved, "live", observed, grokQualificationModelDetail(result, runErr, identity.Model(), expectedResolvedModel))
+	setGrokProtocolFailure(&receipt, result, runErr)
 	cleanupObserved := !result.Cleanup.ObservedAt.IsZero() && result.Cleanup.Reaped && result.Cleanup.ResidualPIDs != nil && len(result.Cleanup.ResidualPIDs) == 0
 	setGrokQualificationCheck(&receipt, providerqualification.CheckProcessCleanup, cleanupObserved, "local_observed_process_tree", observed, "launched ACP process-tree cleanup observation")
 	if err := receipt.Finalize(); err != nil {
@@ -399,6 +400,7 @@ Do not call any other tool. After all four calls, reply with this exact nonce an
 		Checks: grokQualificationChecksForProducer("xai-acp-workspace-write"),
 	}
 	setGrokQualificationCheck(&receipt, providerqualification.CheckIdentity, modelObserved, "live", resultEvidence, grokQualificationModelDetail(result, runErr, identity.Model(), expectedResolvedModel))
+	setGrokProtocolFailure(&receipt, result, runErr)
 	setGrokQualificationCheck(&receipt, providerqualification.CheckWorkspaceEdit, runErr == nil && result.Success && exactToolLifecycle && assertions.ReadObserved && assertions.EditObserved && finalContentOK, "live", auditEvidence, "exact four-call ACP lifecycle, audited optimistic-hash edit, and controller readback")
 	setGrokQualificationCheck(&receipt, providerqualification.CheckTestCommand, runErr == nil && result.Success && exactToolLifecycle && assertions.TestObserved, "local_authoritative", auditEvidence, "fixed network-isolated go-test/go-vet manifest passed after the final write")
 	setGrokQualificationCheck(&receipt, providerqualification.CheckSecretDenied, exactToolLifecycle && assertions.SecretDenied, "local_authoritative", auditEvidence, "exact four-call lifecycle includes audited broker rejection of the synthetic protected path")
@@ -860,6 +862,22 @@ func cleanupProviderGrokLineageWorkspace(ctx context.Context, workspace provider
 func providerGrokLineageWorkspaceRemoved(workspace providerGrokLineageWorkspace) bool {
 	_, err := os.Stat(workspace.Root)
 	return errors.Is(err, os.ErrNotExist)
+}
+
+func setGrokProtocolFailure(receipt *providerqualification.Receipt, result grok.Result, runErr error) {
+	if runErr == nil {
+		return
+	}
+	reason := result.ProtocolFailureReason
+	if !reason.Valid() || (reason == "" && result.FailureCode == grok.ErrProtocol) {
+		reason = provider.ProtocolOther
+	}
+	for i := range receipt.Checks {
+		if receipt.Checks[i].Name == providerqualification.CheckIdentity && !receipt.Checks[i].Passed {
+			receipt.Checks[i].FailureReason = reason
+			return
+		}
+	}
 }
 
 func grokQualificationModelDetail(result grok.Result, runErr error, expectedPublicModel, expectedResolvedModel string) string {

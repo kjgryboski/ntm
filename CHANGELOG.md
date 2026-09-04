@@ -53,6 +53,10 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
   The pinned ACP schema's underscore-prefixed flat payloads are accepted
   alongside the reviewed nested leader envelopes; explicit envelope methods
   must still match exactly.
+- Grok protocol failures now carry a closed, structured reason into signed
+  qualification checks without retaining rejected methods, payloads, session
+  identifiers, or provider error text. Unexpected reverse requests and foreign
+  standard ACP session updates fail closed with distinct diagnostic reasons.
 
 ---
 

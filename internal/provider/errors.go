@@ -1,5 +1,42 @@
 package provider
 
+// ProtocolFailureReason is a closed controller-owned diagnostic vocabulary.
+// It never contains method names, session IDs, payload fragments, or error text.
+type ProtocolFailureReason string
+
+const (
+	ProtocolUnknownMethod          ProtocolFailureReason = "unknown_method"
+	ProtocolUnexpectedRequest      ProtocolFailureReason = "unexpected_request"
+	ProtocolMalformedMessage       ProtocolFailureReason = "malformed_message"
+	ProtocolInvalidVersion         ProtocolFailureReason = "invalid_protocol_version"
+	ProtocolResponseIDMismatch     ProtocolFailureReason = "response_id_mismatch"
+	ProtocolMissingResult          ProtocolFailureReason = "missing_result"
+	ProtocolMalformedEnvelope      ProtocolFailureReason = "malformed_envelope"
+	ProtocolEnvelopeMethodMismatch ProtocolFailureReason = "envelope_method_mismatch"
+	ProtocolMalformedSessionUpdate ProtocolFailureReason = "malformed_session_update"
+	ProtocolSessionMismatch        ProtocolFailureReason = "session_mismatch"
+	ProtocolInvalidToolLifecycle   ProtocolFailureReason = "invalid_tool_lifecycle"
+	ProtocolInvalidResult          ProtocolFailureReason = "invalid_result"
+	ProtocolStreamClosed           ProtocolFailureReason = "stream_closed"
+	ProtocolStreamRead             ProtocolFailureReason = "stream_read_failed"
+	ProtocolOther                  ProtocolFailureReason = "other_protocol_error"
+)
+
+// Valid permits omission on successful runs and older receipts, but rejects
+// arbitrary strings rather than treating provider text as a diagnostic label.
+func (r ProtocolFailureReason) Valid() bool {
+	switch r {
+	case "", ProtocolUnknownMethod, ProtocolUnexpectedRequest, ProtocolMalformedMessage,
+		ProtocolInvalidVersion, ProtocolResponseIDMismatch, ProtocolMissingResult,
+		ProtocolMalformedEnvelope, ProtocolEnvelopeMethodMismatch, ProtocolMalformedSessionUpdate,
+		ProtocolSessionMismatch, ProtocolInvalidToolLifecycle, ProtocolInvalidResult,
+		ProtocolStreamClosed, ProtocolStreamRead, ProtocolOther:
+		return true
+	default:
+		return false
+	}
+}
+
 // ErrorClass is an exact, provider-neutral classification of a response. It
 // intentionally never infers state from provider prose. The Z.ai business
 // codes are kept here so conformance and admission use one taxonomy without a

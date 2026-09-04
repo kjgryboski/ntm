@@ -95,6 +95,17 @@ func (e *Error) Error() string {
 
 func (e *Error) Unwrap() error { return e.Err }
 
+// protocolFailure carries only a bounded reason, never the rejected message.
+type protocolFailure struct {
+	reason provider.ProtocolFailureReason
+}
+
+func (e *protocolFailure) Error() string { return "Grok ACP protocol failure: " + string(e.reason) }
+
+func protocolError(reason provider.ProtocolFailureReason) error {
+	return &protocolFailure{reason: reason}
+}
+
 // StartSpec is the narrow process boundary. Credentials are intentionally not
 // represented here: automated ACP uses only the CLI's existing cached login,
 // and ACP authenticate carries only the cached_token method identifier.
@@ -421,7 +432,8 @@ type Result struct {
 	// FailureStage is a bounded controller label, never provider text. It lets
 	// operators distinguish setup/handshake/tooling failures without retaining
 	// stderr, RPC payloads, prompts, paths, or credentials.
-	FailureStage string `json:"failure_stage,omitempty"`
+	FailureStage          string                         `json:"failure_stage,omitempty"`
+	ProtocolFailureReason provider.ProtocolFailureReason `json:"protocol_failure_reason,omitempty"`
 	// ProviderRPCErrorCode retains only a JSON-RPC integer code. Provider
 	// messages and non-integer vendor payloads remain excluded from receipts.
 	ProviderRPCErrorCode    *int64 `json:"provider_rpc_error_code,omitempty"`
@@ -705,7 +717,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	}
 	var init initializeResult
 	if err := json.Unmarshal(initRaw, &init); err != nil {
-		return finishFailure(result, ErrProtocol, fmt.Errorf("decode initialize result: %w", err))
+		return finishFailure(result, ErrProtocol, protocolError(provider.ProtocolInvalidResult))
 	}
 	methodID, err := selectAuthMethod(init.AuthMethods)
 	if err != nil {
@@ -735,10 +747,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	}
 	var session sessionNewResult
 	if err := json.Unmarshal(newRaw, &session); err != nil || strings.TrimSpace(session.SessionID) == "" {
-		if err == nil {
-			err = errors.New("session/new result omitted sessionId")
-		}
-		return finishFailure(result, ErrProtocol, fmt.Errorf("decode session/new result: %w", err))
+		return finishFailure(result, ErrProtocol, protocolError(provider.ProtocolInvalidResult))
 	}
 	result.ProviderSessionID = session.SessionID
 	updates.providerSessionID = session.SessionID
@@ -776,7 +785,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	}
 	var prompt sessionPromptResult
 	if err := json.Unmarshal(promptRaw, &prompt); err != nil {
-		return finishFailure(result, ErrProtocol, fmt.Errorf("decode session/prompt result: %w", err))
+		return finishFailure(result, ErrProtocol, protocolError(provider.ProtocolInvalidResult))
 	}
 	failureStage = "completion_metadata"
 	promptModel, resolvedModel, usage, err := prompt.completionMetadata()
@@ -1007,6 +1016,9 @@ func drainPostResponseUpdates(ctx context.Context, events <-chan rpcEvent, updat
 			if event.err != nil {
 				return event.err
 			}
+			if event.message.Method != "" && len(event.message.ID) != 0 {
+				return protocolError(provider.ProtocolUnexpectedRequest)
+			}
 			if isBenignACPNotification(event.message) {
 				if err := updates.observeVendorNotification(event.message.Method, event.message.Params); err != nil {
 					return err
@@ -1014,7 +1026,10 @@ func drainPostResponseUpdates(ctx context.Context, events <-chan rpcEvent, updat
 				continue
 			}
 			if event.message.Method != "session/update" {
-				return errors.New("unexpected ACP message after session/prompt response")
+				if event.message.Method == "" {
+					return protocolError(provider.ProtocolResponseIDMismatch)
+				}
+				return protocolError(provider.ProtocolUnknownMethod)
 			}
 			if err := updates.observe(event.message.Params); err != nil {
 				return err
@@ -1053,6 +1068,7 @@ func exitCodeFromError(err error) (int, bool) {
 func finishFailure(result Result, code ErrorCode, err error) (Result, error) {
 	result.Success = false
 	result.FailureCode = code
+	result.ProtocolFailureReason = protocolReason(err, code)
 	result.ProviderRPCErrorCode = providerRPCErrorCode(err)
 	result.State = StateFailed
 	if code == ErrTimeout {
@@ -1070,6 +1086,7 @@ func finishFailure(result Result, code ErrorCode, err error) (Result, error) {
 func finishCancellationFailure(result Result, code ErrorCode, err error) (Result, error) {
 	result.Success = false
 	result.FailureCode = code
+	result.ProtocolFailureReason = protocolReason(err, code)
 	result.ProviderRPCErrorCode = providerRPCErrorCode(err)
 	if code == ErrCancelled {
 		result.State = StateCancelled
@@ -1082,6 +1099,20 @@ func finishCancellationFailure(result Result, code ErrorCode, err error) (Result
 		result.CompletedAt = time.Now().UTC()
 	}
 	return result, &Error{Code: code, Err: err}
+}
+
+func protocolReason(err error, code ErrorCode) provider.ProtocolFailureReason {
+	var failure *protocolFailure
+	if errors.As(err, &failure) && failure.reason != "" && failure.reason.Valid() {
+		return failure.reason
+	}
+	if code != ErrProtocol {
+		return ""
+	}
+	if errors.Is(err, io.EOF) {
+		return provider.ProtocolStreamClosed
+	}
+	return provider.ProtocolOther
 }
 
 func contextAwareFailure(result Result, promptAccepted bool, err error) (Result, error) {
@@ -1576,17 +1607,17 @@ func readRPCEvents(reader io.Reader) <-chan rpcEvent {
 		for scanner.Scan() {
 			var message rpcMessage
 			if err := json.Unmarshal(scanner.Bytes(), &message); err != nil {
-				events <- rpcEvent{err: fmt.Errorf("decode ACP message: %w", err)}
+				events <- rpcEvent{err: protocolError(provider.ProtocolMalformedMessage)}
 				return
 			}
 			if message.JSONRPC != "2.0" {
-				events <- rpcEvent{err: fmt.Errorf("invalid ACP jsonrpc version %q", message.JSONRPC)}
+				events <- rpcEvent{err: protocolError(provider.ProtocolInvalidVersion)}
 				return
 			}
 			events <- rpcEvent{message: message}
 		}
 		if err := scanner.Err(); err != nil {
-			events <- rpcEvent{err: fmt.Errorf("read ACP message: %w", err)}
+			events <- rpcEvent{err: protocolError(provider.ProtocolStreamRead)}
 		}
 	}()
 	return events
@@ -1618,6 +1649,9 @@ func consumeResponseEvent(event rpcEvent, requestID int, updates *updateAccumula
 	if event.err != nil {
 		return nil, false, event.err
 	}
+	if event.message.Method != "" && len(event.message.ID) != 0 {
+		return nil, false, protocolError(provider.ProtocolUnexpectedRequest)
+	}
 	if event.message.Method == "session/update" {
 		if err := updates.observe(event.message.Params); err != nil {
 			return nil, false, err
@@ -1631,17 +1665,17 @@ func consumeResponseEvent(event rpcEvent, requestID int, updates *updateAccumula
 		return nil, false, nil
 	}
 	if event.message.Method != "" {
-		return nil, false, fmt.Errorf("unexpected ACP notification %q", event.message.Method)
+		return nil, false, protocolError(provider.ProtocolUnknownMethod)
 	}
 	wantID := fmt.Sprintf("%d", requestID)
 	if string(event.message.ID) != wantID {
-		return nil, false, fmt.Errorf("unexpected ACP response id %s, want %s", string(event.message.ID), wantID)
+		return nil, false, protocolError(provider.ProtocolResponseIDMismatch)
 	}
 	if event.message.Error != nil {
 		return nil, false, &providerError{message: event.message.Error.Message, code: parseRPCErrorCode(event.message.Error.Code)}
 	}
 	if len(event.message.Result) == 0 {
-		return nil, false, errors.New("ACP response omitted both result and error")
+		return nil, false, protocolError(provider.ProtocolMissingResult)
 	}
 	return event.message.Result, true, nil
 }
@@ -1776,7 +1810,7 @@ func (a *updateAccumulator) observeVendorNotification(method string, params json
 			} `json:"update"`
 		}
 		if err := json.Unmarshal(payload, &notification); err != nil || notification.SessionID == "" || notification.Update.SessionUpdate == "" {
-			return errors.New("Grok ACP session notification is malformed")
+			return protocolError(provider.ProtocolMalformedSessionUpdate)
 		}
 		if a.providerSessionID == "" || notification.SessionID != a.providerSessionID {
 			return nil
@@ -1795,7 +1829,7 @@ func (a *updateAccumulator) observeVendorNotification(method string, params json
 			SessionID string `json:"sessionId"`
 		}
 		if err := json.Unmarshal(payload, &notification); err != nil || notification.SessionID == "" {
-			return errors.New("Grok ACP prompt-complete notification is malformed")
+			return protocolError(provider.ProtocolMalformedSessionUpdate)
 		}
 		if a.providerSessionID != "" && notification.SessionID == a.providerSessionID {
 			a.recordNonMessageUpdate("xai_session_prompt_complete")
@@ -1829,28 +1863,32 @@ func directOrWrappedVendorParams(method, canonical string, params json.RawMessag
 		return params, nil
 	}
 	if method != "_"+canonical {
-		return nil, errors.New("Grok ACP vendor notification method is not canonical")
+		return nil, protocolError(provider.ProtocolUnknownMethod)
 	}
 	var envelope struct {
 		Method json.RawMessage `json:"method"`
 		Params json.RawMessage `json:"params"`
 	}
 	if err := json.Unmarshal(params, &envelope); err != nil {
-		return nil, errors.New("Grok ACP vendor notification envelope is malformed")
+		return nil, protocolError(provider.ProtocolMalformedEnvelope)
 	}
 	if len(envelope.Method) == 0 && len(envelope.Params) == 0 {
 		return params, nil
 	}
 	var innerMethod string
-	if err := json.Unmarshal(envelope.Method, &innerMethod); err != nil || innerMethod != canonical || len(envelope.Params) == 0 {
-		return nil, errors.New("Grok ACP vendor notification envelope is malformed")
+	if err := json.Unmarshal(envelope.Method, &innerMethod); err != nil || innerMethod == "" || len(envelope.Params) == 0 {
+		return nil, protocolError(provider.ProtocolMalformedEnvelope)
+	}
+	if innerMethod != canonical {
+		return nil, protocolError(provider.ProtocolEnvelopeMethodMismatch)
 	}
 	return envelope.Params, nil
 }
 
 func (a *updateAccumulator) observe(params json.RawMessage) error {
 	var envelope struct {
-		Update struct {
+		SessionID string `json:"sessionId"`
+		Update    struct {
 			SessionUpdate string          `json:"sessionUpdate"`
 			ToolCallID    string          `json:"toolCallId"`
 			Status        json.RawMessage `json:"status"`
@@ -1862,6 +1900,9 @@ func (a *updateAccumulator) observe(params json.RawMessage) error {
 	if json.Unmarshal(params, &envelope) != nil {
 		a.recordNonMessageUpdate("unknown")
 		return nil
+	}
+	if a.providerSessionID != "" && envelope.SessionID != "" && envelope.SessionID != a.providerSessionID {
+		return protocolError(provider.ProtocolSessionMismatch)
 	}
 	if envelope.Update.SessionUpdate != "agent_message_chunk" {
 		name := envelope.Update.SessionUpdate
@@ -1902,7 +1943,7 @@ func (a *updateAccumulator) recordToolEvent(name, toolCallID string, rawStatus j
 	switch name {
 	case "tool_call":
 		if _, exists := a.toolCalls[key]; exists {
-			return errors.New("ACP emitted a duplicate tool_call id")
+			return protocolError(provider.ProtocolInvalidToolLifecycle)
 		}
 		a.toolRequestCount++
 		ref := fmt.Sprintf("tool-%06d", a.toolRequestCount)
@@ -1920,10 +1961,10 @@ func (a *updateAccumulator) recordToolEvent(name, toolCallID string, rawStatus j
 		}
 		call, exists := a.toolCalls[key]
 		if !exists {
-			return errors.New("ACP terminal tool_call_update has no matching tool_call")
+			return protocolError(provider.ProtocolInvalidToolLifecycle)
 		}
 		if call.terminal {
-			return errors.New("ACP emitted a duplicate terminal tool_call_update")
+			return protocolError(provider.ProtocolInvalidToolLifecycle)
 		}
 		call.terminal = true
 		a.toolCalls[key] = call
@@ -1936,7 +1977,7 @@ func (a *updateAccumulator) recordToolEvent(name, toolCallID string, rawStatus j
 			Type: provider.EventToolCompleted, Tool: call.ref,
 		})
 	default:
-		return errors.New("ACP tool lifecycle has an invalid update type")
+		return protocolError(provider.ProtocolInvalidToolLifecycle)
 	}
 	a.recordUpdateName(a.toolEventHasher, &a.toolEventCount, name)
 	return nil
@@ -1944,7 +1985,7 @@ func (a *updateAccumulator) recordToolEvent(name, toolCallID string, rawStatus j
 
 func acpToolCallKey(toolCallID string) (string, error) {
 	if toolCallID == "" || len(toolCallID) > 512 || strings.IndexFunc(toolCallID, unicode.IsControl) >= 0 {
-		return "", errors.New("ACP tool lifecycle update has no valid tool_call id")
+		return "", protocolError(provider.ProtocolInvalidToolLifecycle)
 	}
 	// The raw provider ID is used only while parsing this notification. The
 	// accumulator keeps a digest key and receipts expose only synthetic refs.
@@ -1958,13 +1999,13 @@ func acpToolStatus(raw json.RawMessage) (string, bool, error) {
 	}
 	var status string
 	if err := json.Unmarshal(raw, &status); err != nil || status == "" {
-		return "", false, errors.New("ACP tool_call_update has an invalid status")
+		return "", false, protocolError(provider.ProtocolInvalidToolLifecycle)
 	}
 	switch status {
 	case "pending", "in_progress", "completed", "failed":
 		return status, true, nil
 	default:
-		return "", false, errors.New("ACP tool_call_update has an invalid status")
+		return "", false, protocolError(provider.ProtocolInvalidToolLifecycle)
 	}
 }
 

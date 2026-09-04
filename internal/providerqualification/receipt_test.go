@@ -7,9 +7,11 @@ import (
 	"errors"
 	"io/fs"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
 	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 )
@@ -34,6 +36,32 @@ func passingReceipt(t *testing.T, completed time.Time) Receipt {
 		t.Fatalf("Finalize() error: %v", err)
 	}
 	return r
+}
+
+func TestReceiptSealsOnlyBoundedFailureReasons(t *testing.T) {
+	r := passingReceipt(t, time.Unix(1_800_000_000, 0).UTC())
+	r.Checks[0].Passed = false
+	r.Checks[0].FailureReason = provider.ProtocolMalformedEnvelope
+	if err := r.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := r.CanonicalPayload()
+	if err != nil || !strings.Contains(string(payload), `"failure_reason":"malformed_envelope"`) || r.Validate() != nil {
+		t.Fatal("failure reason was not sealed in the canonical signed payload")
+	}
+	r.Checks[0].FailureReason = provider.ProtocolUnknownMethod
+	if r.Validate() == nil {
+		t.Fatal("tampering with failure reason did not invalidate receipt")
+	}
+	r.Checks[0].FailureReason = provider.ProtocolFailureReason("SENSITIVE_CANARY")
+	if err := r.Finalize(); err == nil || strings.Contains(err.Error(), "SENSITIVE_CANARY") {
+		t.Fatal("arbitrary diagnostic text accepted or exposed")
+	}
+	r.Checks[0].FailureReason = provider.ProtocolUnknownMethod
+	r.Checks[0].Passed = true
+	if r.Finalize() == nil {
+		t.Fatal("passing check accepted a failure reason")
+	}
 }
 
 func TestReceiptFinalizeRequiresEveryLiveCheck(t *testing.T) {

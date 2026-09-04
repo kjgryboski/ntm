@@ -553,6 +553,40 @@ func TestProviderGrokLineageWorkspaceIsDisposableAndCredentialIsolated(t *testin
 	}
 }
 
+func TestProviderGrokQualificationSignsBoundedProtocolReason(t *testing.T) {
+	for _, reason := range []provider.ProtocolFailureReason{provider.ProtocolUnknownMethod, provider.ProtocolMalformedEnvelope, provider.ProtocolFailureReason("SENSITIVE_CANARY")} {
+		profile := providerTestGrokProfile(agent.DefaultGrokAutomationPolicyName)
+		identity, err := profile.Identity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := grok.Result{FailureCode: grok.ErrProtocol, FailureStage: "session_new", ProtocolFailureReason: reason}
+		deps, _, stored, _, _ := grokQualificationDepsForTest(t, profile, result)
+		deps.run = func(context.Context, grok.Runner, grok.Request) (grok.Result, error) {
+			return result, errors.New("SENSITIVE_CANARY")
+		}
+		want := reason
+		if !want.Valid() {
+			want = provider.ProtocolOther
+		}
+		signed := false
+		deps.sign = func(_ context.Context, receipt *providerqualification.Receipt) error {
+			payload, err := receipt.CanonicalPayload()
+			if err != nil || !strings.Contains(string(payload), `"failure_reason":"`+string(want)+`"`) || strings.Contains(string(payload), "SENSITIVE_CANARY") {
+				t.Fatal("signer did not receive a bounded diagnostic in its canonical payload")
+			}
+			signed = true
+			return nil
+		}
+		cmd := &cobra.Command{}
+		cmd.SetOut(&bytes.Buffer{})
+		_ = runProviderGrokQualification(cmd, providerQualificationOptions{profile: "grok", live: true, timeout: time.Second, suiteTimeout: time.Second}, profile, identity, deps)
+		if !signed || stored.Validate() != nil {
+			t.Fatal("failed provider run did not produce a valid signed-payload receipt")
+		}
+	}
+}
+
 func TestProviderGrokQualificationFailsClosedForUnknownPolicy(t *testing.T) {
 	profile := providerTestGrokProfile("custom-unmanaged-policy")
 	identity, err := profile.Identity()

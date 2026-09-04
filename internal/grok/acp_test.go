@@ -929,6 +929,59 @@ func TestRunFailsClosedWhenAuthMethodUnavailable(t *testing.T) {
 	}
 }
 
+func TestRunReportsSafeStructuredProtocolReasons(t *testing.T) {
+	const secret = "SENSITIVE_DIAGNOSTIC_CANARY"
+	for _, tc := range []struct {
+		name, event string
+		want        provider.ProtocolFailureReason
+	}{
+		{"unknown method", `{"jsonrpc":"2.0","method":"` + secret + `","params":{"secret":"` + secret + `"}}`, provider.ProtocolUnknownMethod},
+		{"reverse request", `{"jsonrpc":"2.0","id":null,"method":"session/update","params":{"secret":"` + secret + `"}}`, provider.ProtocolUnexpectedRequest},
+		{"malformed message", `{"jsonrpc":"2.0","method":` + secret + `}`, provider.ProtocolMalformedMessage},
+		{"invalid version", `{"jsonrpc":"` + secret + `","id":3,"result":{}}`, provider.ProtocolInvalidVersion},
+		{"response id", `{"jsonrpc":"2.0","id":"` + secret + `","result":{}}`, provider.ProtocolResponseIDMismatch},
+		{"missing result", `{"jsonrpc":"2.0","id":3}`, provider.ProtocolMissingResult},
+		{"invalid result", `{"jsonrpc":"2.0","id":3,"result":{"sessionId":123}}`, provider.ProtocolInvalidResult},
+		{"malformed envelope", `{"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"method":null,"params":{"secret":"` + secret + `"}}}`, provider.ProtocolMalformedEnvelope},
+		{"envelope method", `{"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"method":"` + secret + `","params":{}}}`, provider.ProtocolEnvelopeMethodMismatch},
+		{"session shape", `{"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"sessionId":"` + secret + `"}}`, provider.ProtocolMalformedSessionUpdate},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			transcript := `{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}` + "\n" +
+				`{"jsonrpc":"2.0","id":2,"result":{}}` + "\n" + tc.event + "\n"
+			result, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{Prompt: "hello", CWD: "/repo"})
+			assertCode(t, err, ErrProtocol)
+			if result.ProtocolFailureReason != tc.want || result.FailureStage != "session_new" {
+				t.Fatalf("reason=%q stage=%q, want %q at session_new", result.ProtocolFailureReason, result.FailureStage, tc.want)
+			}
+			encoded, marshalErr := json.Marshal(result)
+			if marshalErr != nil || strings.Contains(string(encoded), secret) || strings.Contains(err.Error(), secret) {
+				t.Fatal("diagnostic retained rejected provider data")
+			}
+		})
+	}
+}
+
+func TestACPForeignStandardSessionUpdateCannotContributeEvidence(t *testing.T) {
+	for _, postResponse := range []bool{false, true} {
+		updates := newUpdateAccumulator(io.Discard, "", "")
+		updates.providerSessionID = "active"
+		event := rpcEvent{message: rpcMessage{Method: "session/update", Params: json.RawMessage(`{"sessionId":"foreign","update":{"sessionUpdate":"agent_message_chunk","content":{"text":"secret"}}}`)}}
+		var err error
+		if postResponse {
+			events := make(chan rpcEvent, 1)
+			events <- event
+			close(events)
+			err = drainPostResponseUpdates(t.Context(), events, &updates, time.Millisecond)
+		} else {
+			_, _, err = consumeResponseEvent(event, 4, &updates)
+		}
+		if protocolReason(err, ErrProtocol) != provider.ProtocolSessionMismatch || updates.chunks != 0 {
+			t.Fatalf("postResponse=%v: foreign session accepted or misclassified: %v", postResponse, err)
+		}
+	}
+}
+
 func TestRunReportsBoundedSessionNewFailureStage(t *testing.T) {
 	transcript := strings.Join([]string{
 		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,

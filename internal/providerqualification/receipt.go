@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
 )
 
@@ -124,6 +125,9 @@ type Check struct {
 	Provenance     string `json:"provenance"`
 	EvidenceSHA256 string `json:"evidence_sha256,omitempty"`
 	Detail         string `json:"detail,omitempty"`
+	// FailureReason is a closed controller vocabulary covered by the digest
+	// and attestation. Omission keeps older receipts byte-for-byte valid.
+	FailureReason provider.ProtocolFailureReason `json:"failure_reason,omitempty"`
 }
 
 // Receipt is a self-digested local qualification record. ReceiptSHA256 is
@@ -182,6 +186,9 @@ func (r *Receipt) Finalize() error {
 		if check.EvidenceSHA256 != "" && !isSHA256(check.EvidenceSHA256) {
 			return fmt.Errorf("qualification check %q has invalid evidence digest", check.Name)
 		}
+		if !check.FailureReason.Valid() || (check.Passed && check.FailureReason != "") {
+			return errors.New("qualification check has an invalid failure reason")
+		}
 		seen[check.Name] = check
 	}
 	required, err := requiredChecksForTransport(r.Transport)
@@ -232,6 +239,9 @@ func (r Receipt) Validate() error {
 	for _, check := range r.Checks {
 		if check.Name == "" || seen[check.Name].Name != "" {
 			return errors.New("qualification check names must be non-empty and unique")
+		}
+		if !check.FailureReason.Valid() || (check.Passed && check.FailureReason != "") {
+			return errors.New("qualification check has an invalid failure reason")
 		}
 		seen[check.Name] = check
 	}
