@@ -94,6 +94,164 @@ func TestRunCompletesFromACPTranscript(t *testing.T) {
 	}
 }
 
+func TestRunAcceptsPinnedGrokHousekeepingNotifications(t *testing.T) {
+	transcript := strings.Join([]string{
+		`{"jsonrpc":"2.0","method":"x.ai/announcements/update","params":{}}`,
+		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
+		`{"jsonrpc":"2.0","id":2,"result":{}}`,
+		`{"jsonrpc":"2.0","method":"x.ai/mcp/init_progress","params":{}}`,
+		`{"jsonrpc":"2.0","method":"x.ai/mcp/server_status","params":{}}`,
+		`{"jsonrpc":"2.0","method":"x.ai/mcp_initialized","params":{}}`,
+		`{"jsonrpc":"2.0","id":3,"result":{"sessionId":"grok-session-7"}}`,
+		`{"jsonrpc":"2.0","method":"x.ai/session_notification","params":{"sessionId":"grok-session-7","update":{"sessionUpdate":"retry_state"}}}`,
+		`{"jsonrpc":"2.0","method":"x.ai/session/prompt_complete","params":{"sessionId":"grok-session-7"}}`,
+		`{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}`,
+	}, "\n") + "\n"
+	result, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{
+		Prompt: "hello", CWD: "/repo",
+	})
+	if err != nil || !result.Success || !result.CompletionConfirmed {
+		t.Fatalf("housekeeping transcript result=%+v err=%v", result, err)
+	}
+}
+
+func TestPinnedGrokHousekeepingNotificationsRemainFailClosed(t *testing.T) {
+	methods := []string{
+		"x.ai/announcements/update",
+		"x.ai/git/worktree/status",
+		"x.ai/git_head_changed",
+		"x.ai/mcp/init_progress",
+		"x.ai/mcp/server_status",
+		"x.ai/mcp/servers_updated",
+		"x.ai/mcp/tools_changed",
+		"x.ai/mcp_initialized",
+		"x.ai/models/update",
+		"x.ai/queue/changed",
+		"x.ai/session/models/update",
+		"x.ai/session/prompt_complete",
+		"x.ai/session_notification",
+		"x.ai/sessions/changed",
+		"x.ai/settings/update",
+	}
+	if len(methods) != len(grokV1013BenignNotifications) {
+		t.Fatalf("test list has %d methods, runtime allowlist has %d", len(methods), len(grokV1013BenignNotifications))
+	}
+	for _, method := range methods {
+		if !isBenignACPNotification(rpcMessage{Method: method}) {
+			t.Errorf("notification %q was rejected", method)
+		}
+		if isBenignACPNotification(rpcMessage{ID: json.RawMessage(`1`), Method: method}) {
+			t.Errorf("provider request %q was accepted as a notification", method)
+		}
+	}
+	for _, method := range methods {
+		if !isBenignACPNotification(rpcMessage{Method: "_" + method}) {
+			t.Errorf("reviewed underscore-prefixed notification %q was rejected", method)
+		}
+	}
+	for _, message := range []rpcMessage{
+		{Method: "x.ai/unknown"},
+		{Method: "_x.ai/unknown"},
+		{Method: "x.ai/models/update/evil"},
+		{Method: "x.ai//models/update"},
+		{Method: "x.ai/ask_user_question"},
+		{Method: "x.ai/exit_plan_mode"},
+		{Method: "x.ai/mcp/elicit"},
+		{Method: "x.ai/task_backgrounded"},
+		{Method: "session/update"},
+		{Method: ""},
+		{ID: json.RawMessage(`null`), Method: "x.ai/mcp/init_progress"},
+	} {
+		if isBenignACPNotification(message) {
+			t.Errorf("unexpected message was accepted as benign: %+v", message)
+		}
+	}
+}
+
+func TestGrokVendorSessionCarriersCannotSupplyAuthoritativeEvidence(t *testing.T) {
+	const nonce = "NTM_ACK_0123456789abcdef0123456789abcdef"
+	for _, wrapped := range []bool{false, true} {
+		updates := newUpdateAccumulator(io.Discard, nonce, "grok-4.6")
+		updates.providerSessionID = "s"
+		for _, update := range []string{
+			`{"sessionUpdate":"agent_message_chunk","content":{"text":"` + nonce + `"}}`,
+			`{"sessionUpdate":"tool_call","toolCallId":"opaque-id"}`,
+			`{"sessionUpdate":"tool_call_update","toolCallId":"opaque-id","status":"completed"}`,
+			`{"sessionUpdate":"model_changed","modelId":"grok-4.6"}`,
+		} {
+			method := "x.ai/session_notification"
+			payload := `{"sessionId":"s","update":` + update + `}`
+			if wrapped {
+				payload = `{"method":"` + method + `","params":` + payload + `}`
+				method = "_" + method
+			}
+			if err := updates.observeVendorNotification(method, json.RawMessage(payload)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		updates.nonce.Finalize()
+		if updates.nonce.verified || updates.chunks != 0 || updates.bytes != 0 || updates.toolRequestCount != 0 || updates.toolCompleteCount != 0 || updates.sessionModelObserved {
+			t.Fatalf("wrapped=%v: vendor carrier supplied authoritative evidence: %+v", wrapped, updates)
+		}
+		if updates.nonMessageUpdateCount != 4 {
+			t.Fatalf("wrapped=%v: retained %d update names, want 4", wrapped, updates.nonMessageUpdateCount)
+		}
+		method := "x.ai/session/prompt_complete"
+		payload := `{"sessionId":"s","stopReason":"end_turn"}`
+		if wrapped {
+			payload = `{"method":"` + method + `","params":` + payload + `}`
+			method = "_" + method
+		}
+		_, done, err := consumeResponseEvent(rpcEvent{message: rpcMessage{JSONRPC: "2.0", Method: method, Params: json.RawMessage(payload)}}, 4, &updates)
+		if err != nil || done {
+			t.Fatalf("wrapped=%v: prompt-complete notification ended request: done=%v err=%v", wrapped, done, err)
+		}
+	}
+}
+
+func TestRunRejectsMalformedOrMismatchedGrokSessionCarrier(t *testing.T) {
+	for name, notification := range map[string]string{
+		"empty direct payload":      `{"jsonrpc":"2.0","method":"x.ai/session_notification","params":{}}`,
+		"null update":               `{"jsonrpc":"2.0","method":"x.ai/session_notification","params":{"sessionId":"s","update":null}}`,
+		"missing update name":       `{"jsonrpc":"2.0","method":"x.ai/session_notification","params":{"sessionId":"s","update":{}}}`,
+		"malformed wrapped payload": `{"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"method":"x.ai/settings/update","params":{"sessionId":"s","update":{"sessionUpdate":"retry_state"}}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			transcript := strings.Join([]string{
+				`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
+				`{"jsonrpc":"2.0","id":2,"result":{}}`,
+				`{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s"}}`,
+				notification,
+				`{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}`,
+			}, "\n") + "\n"
+			_, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{Prompt: "hello", CWD: "/repo"})
+			assertCode(t, err, ErrProtocol)
+		})
+	}
+
+	transcript := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
+		`{"jsonrpc":"2.0","id":2,"result":{}}`,
+		`{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s"}}`,
+		`{"jsonrpc":"2.0","method":"x.ai/session_notification","params":{"sessionId":"other","update":{"sessionUpdate":"model_auto_switched","newModelId":"other-model"}}}`,
+		`{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}`,
+	}, "\n") + "\n"
+	result, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{Prompt: "hello", CWD: "/repo", Model: "grok-4.6"})
+	if err != nil || result.Model != "" || result.ModelEvidence != "" || result.SessionSelectedModel != "" {
+		t.Fatalf("foreign session carrier affected identity: result=%+v err=%v", result, err)
+	}
+}
+
+func TestDrainPostResponseUpdatesRejectsUnknownVendorNotification(t *testing.T) {
+	events := make(chan rpcEvent, 1)
+	events <- rpcEvent{message: rpcMessage{JSONRPC: "2.0", Method: "x.ai/future/unreviewed"}}
+	close(events)
+	updates := newUpdateAccumulator(io.Discard, "", "")
+	if err := drainPostResponseUpdates(t.Context(), events, &updates, time.Second); err == nil {
+		t.Fatal("post-response drain accepted an unreviewed vendor notification")
+	}
+}
+
 func TestRuntimeEventsPreserveACPCompletionBeforeRequest(t *testing.T) {
 	updates := newUpdateAccumulator(io.Discard, "nonce", "grok-4.6")
 	if err := updates.observe(json.RawMessage(`{"update":{"sessionUpdate":"tool_call_update","toolCallId":"opaque-tool-id","status":"completed"}}`)); err == nil {

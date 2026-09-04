@@ -45,6 +45,11 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
   hints on both initialize and session creation. Grok 1.0.13 therefore blocks
   on MCP initialization before accepting the first workspace prompt instead
   of silently using its progressive interactive startup path.
+- Grok ACP now accepts only the reviewed direct and wrapped housekeeping
+  notifications emitted by the pinned 1.0.13 runtime while retaining
+  request-ID and unknown-method fail-closed checks. MCP progress can no longer
+  be mistaken for malformed prompt traffic, while session carriers are bound
+  to the active session and contribute no terminal completion evidence.
 
 ---
 

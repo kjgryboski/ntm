@@ -1008,7 +1008,9 @@ func drainPostResponseUpdates(ctx context.Context, events <-chan rpcEvent, updat
 				return event.err
 			}
 			if isBenignACPNotification(event.message) {
-				updates.observeVendorNotification(event.message.Method, event.message.Params)
+				if err := updates.observeVendorNotification(event.message.Method, event.message.Params); err != nil {
+					return err
+				}
 				continue
 			}
 			if event.message.Method != "session/update" {
@@ -1623,7 +1625,9 @@ func consumeResponseEvent(event rpcEvent, requestID int, updates *updateAccumula
 		return nil, false, nil
 	}
 	if isBenignACPNotification(event.message) {
-		updates.observeVendorNotification(event.message.Method, event.message.Params)
+		if err := updates.observeVendorNotification(event.message.Method, event.message.Params); err != nil {
+			return nil, false, err
+		}
 		return nil, false, nil
 	}
 	if event.message.Method != "" {
@@ -1642,14 +1646,42 @@ func consumeResponseEvent(event rpcEvent, requestID int, updates *updateAccumula
 	return event.message.Result, true, nil
 }
 
-// isBenignACPNotification recognizes xAI's vendor-extension notification
-// namespace. The CLI emits several evolving housekeeping methods during
-// initialization (models, settings, announcements, MCP, and session indexes).
-// They are accepted only without a request ID, contribute no completion or
-// identity evidence, and cannot widen permissions. Provider-to-client requests
-// and non-vendor unknown methods continue to fail closed.
+// grokV1013BenignNotifications is pinned to xai-org/grok-build commit
+// bb7f39d5858cbf5e00de639367f59debbdcb0138. Runtime upgrades must update this
+// list and its protocol fixtures deliberately.
+var grokV1013BenignNotifications = map[string]struct{}{
+	"x.ai/announcements/update":    {},
+	"x.ai/git/worktree/status":     {},
+	"x.ai/git_head_changed":        {},
+	"x.ai/mcp/init_progress":       {},
+	"x.ai/mcp/server_status":       {},
+	"x.ai/mcp/servers_updated":     {},
+	"x.ai/mcp/tools_changed":       {},
+	"x.ai/mcp_initialized":         {},
+	"x.ai/models/update":           {},
+	"x.ai/queue/changed":           {},
+	"x.ai/session/models/update":   {},
+	"x.ai/session/prompt_complete": {},
+	"x.ai/session_notification":    {},
+	"x.ai/sessions/changed":        {},
+	"x.ai/settings/update":         {},
+}
+
+// isBenignACPNotification recognizes only the reviewed notification methods
+// emitted by the pinned Grok 1.0.13 runtime. ACP's underscore-prefixed vendor
+// envelope is accepted for the same exact methods, never as a namespace
+// wildcard. Messages with request IDs, permission prompts, task/scheduler
+// events, and unknown methods continue to fail closed.
 func isBenignACPNotification(message rpcMessage) bool {
-	return len(message.ID) == 0 && strings.HasPrefix(message.Method, "_x.ai/")
+	if len(message.ID) != 0 {
+		return false
+	}
+	method := message.Method
+	if strings.HasPrefix(method, "_x.ai/") {
+		method = strings.TrimPrefix(method, "_")
+	}
+	_, ok := grokV1013BenignNotifications[method]
+	return ok
 }
 
 type providerError struct {
@@ -1721,21 +1753,90 @@ type grokSessionModelNotificationParams struct {
 	Model     string `json:"model"`
 }
 
-// observeVendorNotification accepts model evidence only from the reviewed
-// notification and only when its top-level sessionId and model fields bind the
-// same record to this ACP session and exact launch. Raw catalogs, nested
-// indexes, and unrelated vendor metadata are intentionally not evidence.
-func (a *updateAccumulator) observeVendorNotification(method string, params json.RawMessage) {
-	if a == nil || method != grokSessionModelNotification || a.expectedModel == "" || a.providerSessionID == "" {
-		return
+// observeVendorNotification records reviewed vendor lifecycle traffic without
+// treating it as completion evidence. Session-scoped carriers must bind to the
+// active provider session before their update names enter the receipt. The one
+// legacy model-selection notification remains secondary evidence only and can
+// never replace terminal served-model metadata.
+func (a *updateAccumulator) observeVendorNotification(method string, params json.RawMessage) error {
+	if a == nil {
+		return errors.New("ACP vendor notification accumulator is unavailable")
 	}
-	var notification grokSessionModelNotificationParams
-	if err := json.Unmarshal(params, &notification); err != nil {
-		return
+	canonical := strings.TrimPrefix(method, "_")
+	switch canonical {
+	case "x.ai/session_notification":
+		payload, err := directOrWrappedVendorParams(method, canonical, params)
+		if err != nil {
+			return err
+		}
+		var notification struct {
+			SessionID string `json:"sessionId"`
+			Update    struct {
+				SessionUpdate string `json:"sessionUpdate"`
+			} `json:"update"`
+		}
+		if err := json.Unmarshal(payload, &notification); err != nil || notification.SessionID == "" || notification.Update.SessionUpdate == "" {
+			return errors.New("Grok ACP session notification is malformed")
+		}
+		if a.providerSessionID == "" || notification.SessionID != a.providerSessionID {
+			return nil
+		}
+		// xAI's SessionUpdate is distinct from the standard ACP update enum.
+		// Retain only its redacted name; this carrier must never manufacture
+		// assistant acknowledgements or authoritative tool lifecycle events.
+		a.recordNonMessageUpdate("xai_session_" + notification.Update.SessionUpdate)
+		return nil
+	case "x.ai/session/prompt_complete":
+		payload, err := directOrWrappedVendorParams(method, canonical, params)
+		if err != nil {
+			return err
+		}
+		var notification struct {
+			SessionID string `json:"sessionId"`
+		}
+		if err := json.Unmarshal(payload, &notification); err != nil || notification.SessionID == "" {
+			return errors.New("Grok ACP prompt-complete notification is malformed")
+		}
+		if a.providerSessionID != "" && notification.SessionID == a.providerSessionID {
+			a.recordNonMessageUpdate("xai_session_prompt_complete")
+		}
+		return nil
+	case "x.ai/session/models/update":
+		if method != grokSessionModelNotification || a.expectedModel == "" || a.providerSessionID == "" {
+			return nil
+		}
+		var notification grokSessionModelNotificationParams
+		if err := json.Unmarshal(params, &notification); err != nil {
+			return nil
+		}
+		if notification.SessionID == a.providerSessionID && notification.Model == a.expectedModel {
+			a.sessionModelObserved = true
+		}
+		return nil
+	default:
+		a.recordNonMessageUpdate("xai_housekeeping_" + strings.ReplaceAll(canonical, "/", "_"))
+		return nil
 	}
-	if notification.SessionID == a.providerSessionID && notification.Model == a.expectedModel {
-		a.sessionModelObserved = true
+}
+
+// directOrWrappedVendorParams unwraps ACP's `_x.ai/...` extension envelope.
+// Direct `x.ai/...` notifications carry their typed payload in params. Exact
+// method equality prevents a wrapper from smuggling a different event type.
+func directOrWrappedVendorParams(method, canonical string, params json.RawMessage) (json.RawMessage, error) {
+	if method == canonical {
+		return params, nil
 	}
+	if method != "_"+canonical {
+		return nil, errors.New("Grok ACP vendor notification method is not canonical")
+	}
+	var envelope struct {
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(params, &envelope); err != nil || envelope.Method != canonical || len(envelope.Params) == 0 {
+		return nil, errors.New("Grok ACP vendor notification envelope is malformed")
+	}
+	return envelope.Params, nil
 }
 
 func (a *updateAccumulator) observe(params json.RawMessage) error {
