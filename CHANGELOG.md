@@ -36,6 +36,10 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
   request instead of holding one lease across a multi-turn lineage suite, and
   preserves only an integer JSON-RPC failure code alongside bounded redacted
   failure metadata.
+- Grok's typed workspace broker now emits the ACP v1-required empty `env`
+  array. Strict ACP agents no longer reject the otherwise valid stdio MCP
+  descriptor during `session/new`, and NTM still passes no credential-bearing
+  environment entries to the broker.
 
 ---
 

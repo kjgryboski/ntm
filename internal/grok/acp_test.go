@@ -184,6 +184,7 @@ func TestRunPassesOnlyTypedNTMWorkspaceBrokerToSessionNew(t *testing.T) {
 			Name    string   `json:"name"`
 			Command string   `json:"command"`
 			Args    []string `json:"args"`
+			Env     []any    `json:"env"`
 		} `json:"mcpServers"`
 	}
 	if err := json.Unmarshal(requests[2].Params, &params); err != nil {
@@ -191,6 +192,9 @@ func TestRunPassesOnlyTypedNTMWorkspaceBrokerToSessionNew(t *testing.T) {
 	}
 	if len(params.MCPServers) != 1 || params.MCPServers[0].Name != WorkspaceBrokerMCPName || !filepath.IsAbs(params.MCPServers[0].Command) || !slices.Equal(params.MCPServers[0].Args[:3], []string{"provider", "broker", "stdio"}) {
 		t.Fatalf("session/new MCP descriptor = %+v", params.MCPServers)
+	}
+	if params.MCPServers[0].Env == nil || len(params.MCPServers[0].Env) != 0 {
+		t.Fatalf("session/new MCP descriptor env = %#v, want an explicit empty ACP env array", params.MCPServers[0].Env)
 	}
 	if strings.Contains(string(requests[2].Params), "toolset") || strings.Contains(string(requests[2].Params), "protocol") {
 		t.Fatalf("session/new included non-standard MCP fields: %s", requests[2].Params)

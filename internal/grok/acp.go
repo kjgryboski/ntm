@@ -365,7 +365,12 @@ func (d WorkspaceBrokerDescriptor) MarshalJSON() ([]byte, error) {
 		Name    string   `json:"name"`
 		Command string   `json:"command"`
 		Args    []string `json:"args"`
-	}{Name: WorkspaceBrokerMCPName, Command: d.command, Args: append([]string(nil), d.args...)})
+		// ACP v1 requires env even when the controller intentionally passes no
+		// environment variables to the broker. Keep the value structurally
+		// present and empty so credentials cannot be inherited through this
+		// descriptor and strict agents do not reject session/new.
+		Env []any `json:"env"`
+	}{Name: WorkspaceBrokerMCPName, Command: d.command, Args: append([]string(nil), d.args...), Env: []any{}})
 }
 
 // BindingSHA256 is safe receipt evidence for the exact current executable,
