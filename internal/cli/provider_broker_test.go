@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -148,5 +149,168 @@ func TestProviderBrokerServeBindsLinkedWorktreeAndVerifier(t *testing.T) {
 	}
 	if len(verifier.manifests) != 1 || verifier.manifests[0].Worktree != linked || verifier.manifests[0].Revision != revision || len(verifier.manifests[0].CommandIDs) != 1 || verifier.manifests[0].CommandIDs[0] != "go-test" {
 		t.Fatalf("verifier manifests = %+v", verifier.manifests)
+	}
+}
+
+func TestProviderBrokerAuditIsPrivateRedactedAndEnforcesWriteThenVerify(t *testing.T) {
+	repository := t.TempDir()
+	runProviderToolsGit(t, repository, "init")
+	runProviderToolsGit(t, repository, "config", "user.name", "NTM Provider Test")
+	runProviderToolsGit(t, repository, "config", "user.email", "ntm-provider@example.invalid")
+	initial := []byte("package main\n")
+	if err := os.WriteFile(filepath.Join(repository, "main.go"), initial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runProviderToolsGit(t, repository, "add", "main.go")
+	runProviderToolsGit(t, repository, "commit", "-m", "fixture")
+	revision := runProviderToolsGit(t, repository, "rev-parse", "HEAD")
+	parent := t.TempDir()
+	linked := filepath.Join(parent, "worktree")
+	runProviderToolsGit(t, repository, "worktree", "add", "-b", "broker-audit-test", linked, revision)
+	workspace, err := provider.NewWorkspaceBroker(t.Context(), linked, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditPath := filepath.Join(parent, "broker-audit.jsonl")
+	holder, err := os.OpenFile(auditPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	audit, err := openProviderBrokerAudit(linked, revision, auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer audit.file.Close()
+	if _, err := openProviderBrokerAudit(linked, revision, auditPath); err == nil {
+		t.Fatal("nonempty audit file was admitted more than once")
+	}
+	verifier := &providerBrokerVerifierFake{}
+	broker := &providerBroker{workspace: workspace, verifier: verifier, audit: audit, manifest: provider.VerificationManifest{
+		Worktree: linked, Revision: revision, CommandIDs: []string{"go-test"},
+	}}
+	initialSHA256 := sha256.Sum256(initial)
+	secretContent := "do-not-persist-this-content"
+	requests := []string{
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"verify_worktree","arguments":{}}}`,
+		fmt.Sprintf(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"main.go","expected_sha256":"%x","content":%q}}}`, initialSHA256, secretContent),
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"verify_worktree","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"verify_worktree","arguments":{}}}`,
+		`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"shell","arguments":{}}}`,
+	}
+	var output strings.Builder
+	if err := broker.serve(t.Context(), strings.NewReader(strings.Join(requests, "\n")+"\n"), &output); err != nil {
+		t.Fatal(err)
+	}
+	responses := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(responses) != len(requests) {
+		t.Fatalf("response count = %d, want %d", len(responses), len(requests))
+	}
+	for _, index := range []int{0, 3, 4} {
+		var response providerBrokerResponse
+		if err := json.Unmarshal([]byte(responses[index]), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Error == nil {
+			t.Fatalf("response %d unexpectedly succeeded: %+v", index, response)
+		}
+	}
+	if len(verifier.manifests) != 1 {
+		t.Fatalf("verification calls = %d, want 1", len(verifier.manifests))
+	}
+	info, err := os.Stat(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("audit mode = %o, want 600", info.Mode().Perm())
+	}
+	encoded, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), secretContent) || strings.Contains(string(encoded), "main.go") || strings.Contains(string(encoded), linked) {
+		t.Fatalf("audit retained raw sensitive input: %s", encoded)
+	}
+	lines := strings.Split(strings.TrimSpace(string(encoded)), "\n")
+	if len(lines) != len(requests)+1 {
+		t.Fatalf("audit line count = %d, want %d: %s", len(lines), len(requests)+1, encoded)
+	}
+	var header providerBrokerAuditHeader
+	if err := json.Unmarshal([]byte(lines[0]), &header); err != nil {
+		t.Fatal(err)
+	}
+	if header.SchemaVersion != providerBrokerAuditSchemaVersion || header.Kind != "header" || header.WorktreeSHA256 == "" || header.RevisionSHA256 == "" {
+		t.Fatalf("audit header = %+v", header)
+	}
+	for index, raw := range lines[1:] {
+		var event providerBrokerAuditEvent
+		if err := json.Unmarshal([]byte(raw), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Sequence != uint64(index+1) || event.SchemaVersion != providerBrokerAuditSchemaVersion || event.Kind != "tool_call" {
+			t.Fatalf("audit event %d = %+v", index, event)
+		}
+	}
+	var writeEvent, verifiedEvent, staleEvent providerBrokerAuditEvent
+	_ = json.Unmarshal([]byte(lines[2]), &writeEvent)
+	_ = json.Unmarshal([]byte(lines[3]), &verifiedEvent)
+	_ = json.Unmarshal([]byte(lines[4]), &staleEvent)
+	if !writeEvent.Success || writeEvent.WorkspaceReceipt == nil || writeEvent.PathSHA256 == "" {
+		t.Fatalf("write audit event = %+v", writeEvent)
+	}
+	if !verifiedEvent.Success || verifiedEvent.VerificationReceipt == nil {
+		t.Fatalf("verification audit event = %+v", verifiedEvent)
+	}
+	if staleEvent.Success || !staleEvent.Rejected || staleEvent.ErrorSHA256 == "" {
+		t.Fatalf("stale verification audit event = %+v", staleEvent)
+	}
+}
+
+func TestProviderBrokerAuditRequiresPrecreatedPrivateFileAndExecutableDigest(t *testing.T) {
+	parent := t.TempDir()
+	linked := filepath.Join(parent, "linked")
+	if err := os.Mkdir(linked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]struct {
+		contents string
+		mode     os.FileMode
+	}{
+		"missing.jsonl":  {"", 0o600},
+		"nonempty.jsonl": {"unexpected", 0o600},
+		"wide.jsonl":     {"", 0o644},
+	} {
+		path := filepath.Join(parent, name)
+		if name != "missing.jsonl" {
+			if err := os.WriteFile(path, []byte(contents.contents), contents.mode); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := openProviderBrokerAudit(linked, strings.Repeat("a", 40), path); err == nil {
+			t.Fatalf("invalid audit file %q was admitted", name)
+		}
+	}
+	if verifyProviderBrokerExecutableDigest(strings.Repeat("0", sha256.Size*2)) {
+		t.Fatal("mismatched broker executable digest was accepted")
+	}
+	path, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !verifyProviderBrokerExecutableDigest(fmt.Sprintf("%x", hasher.Sum(nil))) {
+		t.Fatal("current broker executable digest was rejected")
 	}
 }

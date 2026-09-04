@@ -528,6 +528,24 @@ fork/resume lineage, and local cleanup may pass; review, write, denial,
 cancellation, and crash gates remain false, so this command alone cannot
 authorize `provider session`.
 
+The separately named workspace policy has its own one-call qualification:
+
+```bash
+ntm provider qualify --profile=grok-workspace-write --live
+```
+
+NTM creates and removes an isolated linked worktree and cached-login copy. The
+provider receives exactly four typed broker operations: read the target, perform
+one hash-checked edit, attempt one protected synthetic-secret read, and invoke
+the fixed Bubblewrap test manifest. The broker runs from the parent NTM inode,
+verifies its executable digest, and appends only redacted evidence to a
+parent-held private audit inode. A current signed receipt may promote review and
+`workspace-write` for that exact identity, runtime, policy, and binary. Crash,
+cancellation, and resume remain false, so it never promotes `lifecycle` by
+itself. As elsewhere in the local control plane, arbitrary code already running
+under the controller's same OS account is inside the trusted boundary; the
+private inode is not claimed to resist a fully compromised same-user process.
+
 Grok sessions retain the sandbox recorded when the parent was created, so a
 resume or fork omits only the per-invocation sandbox selector while preserving
 every compiled allow/deny rule from the root-owned policy. Model identity stays

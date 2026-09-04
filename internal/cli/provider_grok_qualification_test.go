@@ -3,9 +3,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -103,6 +107,265 @@ func TestProviderGrokQualificationProducesHonestObserveOnlyNoGoReceipt(t *testin
 		if name != providerqualification.CheckIdentity && name != providerqualification.CheckProcessCleanup && passed[name] {
 			t.Fatalf("unexercised lifecycle check %q was fabricated as passed", name)
 		}
+	}
+}
+
+func TestProviderGrokWorkspaceQualificationProducesOperationScopedReceipt(t *testing.T) {
+	profile := providerTestGrokProfile(agent.GrokWorkspaceWritePolicyName)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := grok.Result{
+		Success: true, AcknowledgementVerified: true, Authenticated: true,
+		Model: identity.Model(), ModelEvidence: "completion_metadata",
+		ResolvedModel: grok.ExpectedResolvedModel(profile.RuntimeVersion, identity.Model()), ResolvedModelEvidence: "completion_metadata.usage.model_usage_singleton",
+		ToolRequestCount: 4, ToolCompleteCount: 4,
+		RuntimeEventContract: provider.EventContractReport{Passed: true},
+		Cleanup:              grok.ProcessCleanupReceipt{ObservedAt: time.Now().UTC(), Reaped: true, ResidualPIDs: []int32{}, LocalTermination: "observed_tree_terminated_verified"},
+	}
+	deps, admission, stored, request, calls := grokQualificationDepsForTest(t, profile, result)
+	root := filepath.Join(t.TempDir(), "not-created-qualification-root")
+	workspace := providerGrokLineageWorkspace{Root: root, Primary: filepath.Join(root, "primary"), Worktree: filepath.Join(root, "linked"), RuntimeHome: filepath.Join(root, "grok-home")}
+	revision := strings.Repeat("a", 40)
+	deps.prepareWorkspace = func(context.Context, string) (providerGrokLineageWorkspace, error) { return workspace, nil }
+	deps.cleanupLineage = func(context.Context, providerGrokLineageWorkspace) error { return nil }
+	deps.workspaceRevision = func(context.Context, string) (string, error) { return revision, nil }
+	deps.workspaceBroker = func(_ context.Context, worktree, auditFile string) (*grok.WorkspaceBrokerDescriptor, error) {
+		return grok.NewWorkspaceBrokerDescriptorWithAudit(worktree, revision, []string{"go-test", "go-vet"}, auditFile)
+	}
+	deps.createWorkspaceAudit = func(string, string) (*os.File, error) {
+		return os.CreateTemp(t.TempDir(), "grok-audit-guard-")
+	}
+	deps.readWorkspaceFile = func(string) ([]byte, error) { return append([]byte(nil), providerGrokWorkspaceAfter...), nil }
+	deps.readWorkspaceAudit = func(*os.File, string, string, string) (providerGrokWorkspaceAudit, error) {
+		return providerGrokWorkspaceAuditForTest(workspace.Worktree, revision), nil
+	}
+	cmd := &cobra.Command{}
+	cmd.SetContext(context.Background())
+	var output bytes.Buffer
+	cmd.SetOut(&output)
+	err = runProviderGrokQualification(cmd, providerQualificationOptions{profile: "grok-workspace", live: true, timeout: time.Second, suiteTimeout: time.Second}, profile, identity, deps)
+	var exit *providerQualificationExitError
+	if !errors.As(err, &exit) {
+		t.Fatalf("err=%v, want partial qualification exit", err)
+	}
+	if *calls != 1 || admission.acquires != 1 || admission.releases != 1 || admission.successes != 1 {
+		t.Fatalf("calls=%d admission=%+v", *calls, admission)
+	}
+	if request.Broker == nil || request.Broker.BindingSHA256() == "" || request.CWD != workspace.Worktree || request.ExpectedNonce == "" || !strings.Contains(request.Prompt, providerGrokWorkspaceSecret) || !strings.Contains(request.Prompt, providerGrokWorkspaceTarget) {
+		t.Fatalf("workspace request was incomplete: %+v", *request)
+	}
+	if stored.Passed || stored.Transport != "xai_acp" || stored.PolicySHA256 != agent.GrokAutomationPolicySHA256(agent.GrokWorkspaceWritePolicyName) || stored.Validate() != nil {
+		t.Fatalf("receipt=%+v validate=%v", *stored, stored.Validate())
+	}
+	passed := make(map[string]bool, len(stored.Checks))
+	for _, check := range stored.Checks {
+		passed[check.Name] = check.Passed
+	}
+	for _, name := range []string{providerqualification.CheckIdentity, providerqualification.CheckWorkspaceEdit, providerqualification.CheckTestCommand, providerqualification.CheckSecretDenied, providerqualification.CheckPushDenied, providerqualification.CheckProcessCleanup} {
+		if !passed[name] {
+			t.Fatalf("workspace receipt omitted proven check %q: %+v", name, stored.Checks)
+		}
+	}
+	for _, name := range []string{providerqualification.CheckCrashRecovery, providerqualification.CheckCancellation, providerqualification.CheckResume} {
+		if passed[name] {
+			t.Fatalf("workspace receipt fabricated unexercised check %q", name)
+		}
+	}
+	if strings.Contains(output.String(), providerGrokWorkspaceSecret) || strings.Contains(output.String(), providerGrokWorkspaceTarget) {
+		t.Fatal("workspace qualification output leaked fixture paths")
+	}
+}
+
+func providerGrokWorkspaceAuditForTest(worktree, revision string) providerGrokWorkspaceAudit {
+	now := time.Date(2026, time.September, 3, 12, 0, 0, 0, time.UTC)
+	worktreeSHA256 := sha256StringCLI(filepath.Clean(worktree))
+	revisionSHA256 := sha256StringCLI(revision)
+	targetSHA256 := sha256StringCLI(providerGrokWorkspaceTarget)
+	secretSHA256 := sha256StringCLI(providerGrokWorkspaceSecret)
+	baseWorkspaceReceipt := func(action, pathSHA256 string) provider.WorkspaceOperationReceipt {
+		return provider.WorkspaceOperationReceipt{SchemaVersion: providerGrokWorkspaceSchema, Action: action, WorktreeSHA256: worktreeSHA256, RevisionSHA256: revisionSHA256, PathSHA256: pathSHA256, StartedAt: now, CompletedAt: now}
+	}
+	readReceipt := baseWorkspaceReceipt("read", targetSHA256)
+	readReceipt.ResultSHA256 = sha256TextCLI(providerGrokWorkspaceBefore)
+	readReceipt.Bytes = int64(len(providerGrokWorkspaceBefore))
+	writeReceipt := baseWorkspaceReceipt("write", targetSHA256)
+	writeReceipt.BeforeSHA256 = sha256TextCLI(providerGrokWorkspaceBefore)
+	writeReceipt.AfterSHA256 = sha256TextCLI(providerGrokWorkspaceAfter)
+	writeReceipt.ResultSHA256 = writeReceipt.AfterSHA256
+	writeReceipt.Bytes = int64(len(providerGrokWorkspaceAfter))
+	writeReceipt.Mutated = true
+	secretReceipt := baseWorkspaceReceipt("read", secretSHA256)
+	secretReceipt.ErrorSHA256 = sha256StringCLI("protected")
+	verifyReceipt := provider.VerificationReceipt{
+		SchemaVersion: providerGrokVerifierSchema, ManifestSHA256: sha256StringCLI(filepath.Clean(worktree) + "\x00" + revision + "\x00go-test\x00go-vet"), WorktreeSHA256: worktreeSHA256, RevisionSHA256: revisionSHA256,
+		NetworkIsolated: true, CredentialsCleared: true, PIDNamespaceIsolated: true, CleanupVerified: true, DisposableWorktree: true,
+		Commands: []provider.CommandVerification{
+			{ID: "go-test", CommandSHA256: sha256StringCLI("go-test\x00go\x00test\x00./..."), OutputSHA256: sha256StringCLI("test-output"), ProcessWaited: true, CleanupVerified: true, StartedAt: now, CompletedAt: now},
+			{ID: "go-vet", CommandSHA256: sha256StringCLI("go-vet\x00go\x00vet\x00./..."), OutputSHA256: sha256StringCLI("vet-output"), ProcessWaited: true, CleanupVerified: true, StartedAt: now, CompletedAt: now},
+		},
+		StartedAt: now, CompletedAt: now,
+	}
+	return providerGrokWorkspaceAudit{
+		Header: providerBrokerAuditHeader{SchemaVersion: providerBrokerAuditSchemaVersion, Kind: "header", WorktreeSHA256: worktreeSHA256, RevisionSHA256: revisionSHA256, CreatedAt: now},
+		Events: []providerBrokerAuditEvent{
+			{SchemaVersion: providerBrokerAuditSchemaVersion, Kind: "tool_call", Sequence: 1, Tool: "read_file", PathSHA256: targetSHA256, Success: true, WorkspaceReceipt: &readReceipt, OccurredAt: now},
+			{SchemaVersion: providerBrokerAuditSchemaVersion, Kind: "tool_call", Sequence: 2, Tool: "write_file", PathSHA256: targetSHA256, Success: true, WorkspaceReceipt: &writeReceipt, OccurredAt: now},
+			{SchemaVersion: providerBrokerAuditSchemaVersion, Kind: "tool_call", Sequence: 3, Tool: "read_file", PathSHA256: secretSHA256, Rejected: true, WorkspaceReceipt: &secretReceipt, ErrorSHA256: sha256StringCLI("protected"), OccurredAt: now},
+			{SchemaVersion: providerBrokerAuditSchemaVersion, Kind: "tool_call", Sequence: 4, Tool: "verify_worktree", Success: true, VerificationReceipt: &verifyReceipt, OccurredAt: now},
+		},
+	}
+}
+
+func TestProviderGrokWorkspaceAuditRejectsReorderedEvidence(t *testing.T) {
+	audit := providerGrokWorkspaceAuditForTest("/tmp/linked", strings.Repeat("a", 40))
+	audit.Events[0], audit.Events[1] = audit.Events[1], audit.Events[0]
+	assertions := evaluateProviderGrokWorkspaceAudit(audit, "/tmp/linked", strings.Repeat("a", 40))
+	if assertions.ReadObserved || assertions.EditObserved || assertions.SecretDenied || assertions.TestObserved {
+		t.Fatalf("reordered audit was accepted: %+v", assertions)
+	}
+}
+
+func TestProviderGrokWorkspaceAuditRejectsEvidenceOutsideQualificationWindow(t *testing.T) {
+	revision := strings.Repeat("a", 40)
+	audit := providerGrokWorkspaceAuditForTest("/tmp/linked", revision)
+	started := audit.Header.CreatedAt.Add(time.Minute)
+	assertions := evaluateProviderGrokWorkspaceAudit(audit, "/tmp/linked", revision, started, started.Add(time.Minute))
+	if assertions.ReadObserved || assertions.EditObserved || assertions.SecretDenied || assertions.TestObserved {
+		t.Fatalf("out-of-window audit was accepted: %+v", assertions)
+	}
+}
+
+func TestProviderGrokWorkspaceBrokerProducesRealQualificationEvidence(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the production workspace verifier is Linux-only")
+	}
+	if _, err := exec.LookPath("bwrap"); err != nil {
+		t.Skip("Bubblewrap is unavailable")
+	}
+
+	runtimeHome := t.TempDir()
+	if err := os.WriteFile(filepath.Join(runtimeHome, "auth.json"), []byte(`{"token":"synthetic-test-token"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := prepareProviderGrokWorkspaceQualification(t.Context(), runtimeHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleaned := false
+	defer func() {
+		if !cleaned {
+			_ = cleanupProviderGrokLineageWorkspace(context.Background(), workspace)
+		}
+	}()
+	revision, err := providerGrokQualificationGit(t.Context(), workspace.Worktree, "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditPath := filepath.Join(workspace.Root, providerGrokWorkspaceAuditFile)
+	auditGuard, err := createProviderGrokWorkspaceAudit(auditPath, workspace.Worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer auditGuard.Close()
+	descriptor, err := grok.NewWorkspaceBrokerDescriptorWithAudit(workspace.Worktree, revision, []string{"go-test", "go-vet"}, auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	requests := []string{
+		fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":%q}}}`, providerGrokWorkspaceTarget),
+		fmt.Sprintf(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_file","arguments":{"path":%q,"expected_sha256":%q,"content":%q}}}`, providerGrokWorkspaceTarget, sha256TextCLI(providerGrokWorkspaceBefore), string(providerGrokWorkspaceAfter)),
+		fmt.Sprintf(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":%q}}}`, providerGrokWorkspaceSecret),
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"verify_worktree","arguments":{}}}`,
+	}
+	descriptorJSON, err := json.Marshal(descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var commandSpec struct {
+		Command string   `json:"command"`
+		Args    []string `json:"args"`
+	}
+	if err := json.Unmarshal(descriptorJSON, &commandSpec); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.CommandContext(t.Context(), commandSpec.Command, commandSpec.Args...)
+	command.Env = append(os.Environ(), "NTM_PROVIDER_BROKER_TEST_HELPER=1")
+	command.Stdin = strings.NewReader(strings.Join(requests, "\n") + "\n")
+	var output bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("spawn bound provider broker: %v (%s)", err, strings.TrimSpace(stderr.String()))
+	}
+	responses := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(responses) != len(requests) {
+		t.Fatalf("response count = %d, want %d", len(responses), len(requests))
+	}
+	for index, raw := range responses {
+		var response providerBrokerResponse
+		if err := json.Unmarshal([]byte(raw), &response); err != nil {
+			t.Fatalf("response %d is invalid JSON: %v", index, err)
+		}
+		if index == 2 {
+			if response.Error == nil {
+				t.Fatal("protected-path request unexpectedly succeeded")
+			}
+		} else if response.Error != nil {
+			t.Fatalf("response %d failed: %+v", index, response.Error)
+		}
+	}
+
+	audit, err := readProviderGrokWorkspaceAudit(auditGuard, auditPath, workspace.Worktree, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertions := evaluateProviderGrokWorkspaceAudit(audit, workspace.Worktree, revision)
+	if !assertions.ReadObserved || !assertions.EditObserved || !assertions.SecretDenied || !assertions.TestObserved {
+		t.Fatalf("real broker evidence was incomplete: %+v", assertions)
+	}
+	content, err := os.ReadFile(filepath.Join(workspace.Worktree, filepath.FromSlash(providerGrokWorkspaceTarget)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(content, providerGrokWorkspaceAfter) {
+		t.Fatalf("qualified target content = %q", content)
+	}
+	if err := cleanupProviderGrokLineageWorkspace(t.Context(), workspace); err != nil {
+		t.Fatal(err)
+	}
+	cleaned = true
+	if !providerGrokLineageWorkspaceRemoved(workspace) {
+		t.Fatal("qualification workspace remained after cleanup")
+	}
+}
+
+func TestProviderGrokWorkspaceAuditRejectsPathReplacement(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	worktree := filepath.Join(root, "linked")
+	if err := os.Mkdir(worktree, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	auditPath := filepath.Join(root, providerGrokWorkspaceAuditFile)
+	guard, err := createProviderGrokWorkspaceAudit(auditPath, worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guard.Close()
+	if err := os.Rename(auditPath, auditPath+".replaced"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(auditPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readProviderGrokWorkspaceAudit(guard, auditPath, worktree, strings.Repeat("a", 40)); err == nil {
+		t.Fatal("replacement audit inode was accepted")
 	}
 }
 
@@ -208,8 +471,8 @@ func TestProviderGrokLineageWorkspaceIsDisposableAndCredentialIsolated(t *testin
 	}
 }
 
-func TestProviderGrokQualificationFailsClosedForNonObservePolicy(t *testing.T) {
-	profile := providerTestGrokProfile(agent.GrokWorkspaceWritePolicyName)
+func TestProviderGrokQualificationFailsClosedForUnknownPolicy(t *testing.T) {
+	profile := providerTestGrokProfile("custom-unmanaged-policy")
 	identity, err := profile.Identity()
 	if err != nil {
 		t.Fatal(err)
@@ -217,7 +480,7 @@ func TestProviderGrokQualificationFailsClosedForNonObservePolicy(t *testing.T) {
 	deps, _, _, _, calls := grokQualificationDepsForTest(t, profile, grok.Result{})
 	err = runProviderGrokQualification(&cobra.Command{}, providerQualificationOptions{profile: "grok", live: true, timeout: time.Second, suiteTimeout: time.Second}, profile, identity, deps)
 	if err == nil || *calls != 0 {
-		t.Fatalf("err=%v calls=%d; non-observe policy must not dispatch", err, *calls)
+		t.Fatalf("err=%v calls=%d; unmanaged policy must not dispatch", err, *calls)
 	}
 }
 

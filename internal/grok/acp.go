@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -220,6 +221,11 @@ type Request struct {
 	// deliberately a controller-owned workspace broker, not an arbitrary MCP
 	// configuration passed through from a prompt or provider response.
 	Broker *WorkspaceBrokerDescriptor
+	// AfterPromptWritten is invoked once after the complete session/prompt RPC
+	// request has been written. It is intended for deterministic qualification
+	// cancellation tests. A callback panic is contained and cannot interrupt an
+	// accepted provider operation.
+	AfterPromptWritten func()
 }
 
 // WorkspaceBrokerDescriptor describes the sole local NTM MCP service an ACP
@@ -238,13 +244,26 @@ const WorkspaceBrokerMCPName = "ntm-controlled-workspace"
 // supplied program. Arguments are passed directly to the process, never
 // through a shell.
 func NewWorkspaceBrokerDescriptor(worktree, revision string, commands []string) (*WorkspaceBrokerDescriptor, error) {
-	command, err := os.Executable()
-	if err != nil {
-		return nil, errors.New("resolve current NTM executable for ACP workspace broker")
+	return newWorkspaceBrokerDescriptor(worktree, revision, commands, "")
+}
+
+// NewWorkspaceBrokerDescriptorWithAudit constructs the bounded broker with a
+// pre-created, private redacted JSONL audit file. The audit file must be a
+// direct child of the linked worktree's exact temporary parent, never inside
+// the worktree. Its path is part of BindingSHA256 and therefore cannot be
+// changed after admission without invalidating the descriptor binding.
+func NewWorkspaceBrokerDescriptorWithAudit(worktree, revision string, commands []string, auditFile string) (*WorkspaceBrokerDescriptor, error) {
+	return newWorkspaceBrokerDescriptor(worktree, revision, commands, auditFile)
+}
+
+func newWorkspaceBrokerDescriptor(worktree, revision string, commands []string, auditFile string) (*WorkspaceBrokerDescriptor, error) {
+	if runtime.GOOS != "linux" || os.Getpid() <= 0 {
+		return nil, errors.New("ACP workspace broker requires Linux parent executable binding")
 	}
-	command, err = filepath.Abs(command)
-	if err != nil || !filepath.IsAbs(command) || len(command) > 4096 || strings.IndexFunc(command, unicode.IsControl) >= 0 {
-		return nil, errors.New("ACP workspace broker executable is not an absolute current-process path")
+	command := fmt.Sprintf("/proc/%d/exe", os.Getpid())
+	commandSHA256, err := workspaceBrokerExecutableSHA256(command)
+	if err != nil {
+		return nil, errors.New("hash current NTM executable for ACP workspace broker")
 	}
 	if !filepath.IsAbs(worktree) || len(worktree) > 4096 || strings.IndexFunc(worktree, unicode.IsControl) >= 0 || len(revision) < 40 || len(revision) > sha256.Size*2 || strings.IndexFunc(revision, func(r rune) bool { return !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) }) >= 0 {
 		return nil, errors.New("ACP workspace broker binding is invalid")
@@ -260,16 +279,26 @@ func NewWorkspaceBrokerDescriptor(worktree, revision string, commands []string) 
 		}
 		seen[id] = true
 	}
-	return &WorkspaceBrokerDescriptor{command: command, args: []string{
-		"provider", "broker", "stdio", "--worktree", worktree, "--revision", revision, "--commands", strings.Join(commands, ","),
-	}}, nil
+	args := []string{
+		"provider", "broker", "stdio", "--worktree", worktree, "--revision", revision, "--commands", strings.Join(commands, ","), "--ntm-sha256", commandSHA256,
+	}
+	if auditFile != "" {
+		if err := validateWorkspaceBrokerAuditFile(worktree, auditFile); err != nil {
+			return nil, err
+		}
+		args = append(args, "--audit-file", auditFile)
+	}
+	return &WorkspaceBrokerDescriptor{command: command, args: args}, nil
 }
 
 func (d WorkspaceBrokerDescriptor) validate() error {
 	if !filepath.IsAbs(d.command) || len(d.command) > 4096 || strings.IndexFunc(d.command, unicode.IsControl) >= 0 {
 		return errors.New("ACP workspace broker descriptor is invalid")
 	}
-	if len(d.args) != 9 || !slices.Equal(d.args[:3], []string{"provider", "broker", "stdio"}) || d.args[3] != "--worktree" || d.args[5] != "--revision" || d.args[7] != "--commands" {
+	if runtime.GOOS != "linux" || !workspaceBrokerProcExePath(d.command) {
+		return errors.New("ACP workspace broker descriptor requires Linux parent executable binding")
+	}
+	if (len(d.args) != 11 && len(d.args) != 13) || !slices.Equal(d.args[:3], []string{"provider", "broker", "stdio"}) || d.args[3] != "--worktree" || d.args[5] != "--revision" || d.args[7] != "--commands" || d.args[9] != "--ntm-sha256" || !workspaceBrokerDigest(d.args[10]) {
 		return errors.New("ACP workspace broker descriptor is incomplete")
 	}
 	for _, value := range d.args {
@@ -277,7 +306,55 @@ func (d WorkspaceBrokerDescriptor) validate() error {
 			return errors.New("ACP workspace broker descriptor has invalid arguments")
 		}
 	}
+	if len(d.args) == 13 {
+		if d.args[11] != "--audit-file" {
+			return errors.New("ACP workspace broker descriptor has invalid audit arguments")
+		}
+		if err := validateWorkspaceBrokerAuditFile(d.args[4], d.args[12]); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func validateWorkspaceBrokerAuditFile(worktree, auditFile string) error {
+	if !filepath.IsAbs(auditFile) || len(auditFile) > 4096 || strings.IndexFunc(auditFile, unicode.IsControl) >= 0 {
+		return errors.New("ACP workspace broker audit path is invalid")
+	}
+	worktree = filepath.Clean(worktree)
+	auditFile = filepath.Clean(auditFile)
+	if filepath.Dir(auditFile) != filepath.Dir(worktree) {
+		return errors.New("ACP workspace broker audit path must be under the linked worktree temporary parent")
+	}
+	return nil
+}
+
+func workspaceBrokerExecutableSHA256(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func workspaceBrokerProcExePath(path string) bool {
+	if !strings.HasPrefix(path, "/proc/") || !strings.HasSuffix(path, "/exe") {
+		return false
+	}
+	middle := strings.TrimSuffix(strings.TrimPrefix(path, "/proc/"), "/exe")
+	if middle == "" || strings.IndexFunc(middle, func(r rune) bool { return r < '0' || r > '9' }) >= 0 {
+		return false
+	}
+	return filepath.Clean(path) == path
+}
+
+func workspaceBrokerDigest(value string) bool {
+	return len(value) == sha256.Size*2 && strings.IndexFunc(value, func(r rune) bool { return !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) }) < 0
 }
 
 func (d WorkspaceBrokerDescriptor) MarshalJSON() ([]byte, error) {
@@ -643,6 +720,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	if err != nil {
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
 	}
+	invokeAfterPromptWritten(req.AfterPromptWritten)
 	promptRaw, cancellation, err := waitPromptResponseOrCancellation(
 		ctx,
 		proc.Stdin(),
@@ -733,6 +811,19 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 		result.AuthenticationEvidence = "cached_token_authenticate_plus_completed_session"
 	}
 	return result, nil
+}
+
+func invokeAfterPromptWritten(callback func()) {
+	if callback == nil {
+		return
+	}
+	defer func() {
+		// This hook is deliberately observational/control-plane only. A panic
+		// must not turn a successfully written provider request into a broken
+		// runner or conceal its outcome from the normal ACP receipt path.
+		_ = recover()
+	}()
+	callback()
 }
 
 func applyUpdateReceipt(result *Result, updates *updateAccumulator, outputHasher hash.Hash) {

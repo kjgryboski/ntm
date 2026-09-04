@@ -78,6 +78,9 @@ func authorizeProviderOperationWithDependencies(input providerOperationAuthoriza
 			return "", fmt.Errorf("provider operation %s is not promoted: signed check %s is absent, failed, or lacks authoritative evidence", operation, name)
 		}
 	}
+	if identityCheck := checks[providerqualification.CheckIdentity]; identityCheck.Provenance != "live" {
+		return "", errors.New("provider operation is not promoted without provider-live identity evidence")
+	}
 	if input.Transport == "zai_codex_runtime" && !qualificationModelIdentityVerified(receipt) {
 		return "", errors.New("Z.ai Codex operation is not promoted without exact provider-served model evidence")
 	}

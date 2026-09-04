@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,7 +17,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -32,9 +35,11 @@ const (
 )
 
 type providerBrokerOptions struct {
-	worktree string
-	revision string
-	commands []string
+	worktree  string
+	revision  string
+	commands  []string
+	auditFile string
+	ntmSHA256 string
 }
 
 type providerBrokerVerifier interface {
@@ -61,6 +66,14 @@ var providerBrokerDeps = providerBrokerDependencies{
 // current NTM binary, exact linked worktree revision, and a fixed verifier
 // manifest inferred from the repository type. It performs no provider call.
 func providerWorkspaceBrokerDescriptor(ctx context.Context, worktree string) (*grok.WorkspaceBrokerDescriptor, error) {
+	return providerWorkspaceBrokerDescriptorWithAudit(ctx, worktree, "")
+}
+
+// providerWorkspaceBrokerDescriptorWithAudit is the qualification-only
+// extension of the ordinary descriptor constructor. It shares the exact same
+// linked-worktree admission and verifier-manifest discovery, then binds the
+// supplied create-only audit path into the typed Grok descriptor.
+func providerWorkspaceBrokerDescriptorWithAudit(ctx context.Context, worktree, auditFile string) (*grok.WorkspaceBrokerDescriptor, error) {
 	worktree, err := filepath.Abs(worktree)
 	if err != nil {
 		return nil, fmt.Errorf("resolve provider broker worktree: %w", err)
@@ -87,7 +100,14 @@ func providerWorkspaceBrokerDescriptor(ctx context.Context, worktree string) (*g
 	if len(commands) == 0 {
 		return nil, errors.New("provider broker has no approved verifier manifest for this repository type")
 	}
-	return grok.NewWorkspaceBrokerDescriptor(worktree, revision, commands)
+	if strings.TrimSpace(auditFile) == "" {
+		return grok.NewWorkspaceBrokerDescriptor(worktree, revision, commands)
+	}
+	auditFile, err = filepath.Abs(auditFile)
+	if err != nil {
+		return nil, fmt.Errorf("resolve provider broker audit path: %w", err)
+	}
+	return grok.NewWorkspaceBrokerDescriptorWithAudit(worktree, revision, commands, auditFile)
 }
 
 func providerWorkspaceBrokerForPolicy(ctx context.Context, worktree, policy string) (*grok.WorkspaceBrokerDescriptor, error) {
@@ -98,9 +118,43 @@ func providerWorkspaceBrokerForPolicy(ctx context.Context, worktree, policy stri
 }
 
 type providerBroker struct {
-	workspace *provider.WorkspaceBroker
-	verifier  providerBrokerVerifier
-	manifest  provider.VerificationManifest
+	workspace           *provider.WorkspaceBroker
+	verifier            providerBrokerVerifier
+	manifest            provider.VerificationManifest
+	audit               *providerBrokerAudit
+	lastSuccessfulWrite uint64
+	lastVerifiedWrite   uint64
+}
+
+const providerBrokerAuditSchemaVersion = "ntm.provider-workspace-broker-audit.v1"
+
+// providerBrokerAudit stores receipt-safe evidence only. In particular it
+// never persists tool arguments, file content, verifier output, or raw paths.
+type providerBrokerAudit struct {
+	file     *os.File
+	sequence uint64
+}
+
+type providerBrokerAuditHeader struct {
+	SchemaVersion  string    `json:"schema_version"`
+	Kind           string    `json:"kind"`
+	WorktreeSHA256 string    `json:"worktree_sha256"`
+	RevisionSHA256 string    `json:"revision_sha256"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+type providerBrokerAuditEvent struct {
+	SchemaVersion       string                              `json:"schema_version"`
+	Kind                string                              `json:"kind"`
+	Sequence            uint64                              `json:"sequence"`
+	Tool                string                              `json:"tool"`
+	PathSHA256          string                              `json:"path_sha256,omitempty"`
+	Success             bool                                `json:"success"`
+	Rejected            bool                                `json:"rejected"`
+	WorkspaceReceipt    *provider.WorkspaceOperationReceipt `json:"workspace_receipt,omitempty"`
+	VerificationReceipt *provider.VerificationReceipt       `json:"verification_receipt,omitempty"`
+	ErrorSHA256         string                              `json:"error_sha256,omitempty"`
+	OccurredAt          time.Time                           `json:"occurred_at"`
 }
 
 type providerBrokerRequest struct {
@@ -139,13 +193,18 @@ func newProviderBrokerCmd() *cobra.Command {
 	stdio.Flags().StringVar(&opts.worktree, "worktree", "", "Exact linked disposable worktree path (required)")
 	stdio.Flags().StringVar(&opts.revision, "revision", "", "Exact current 40-64 character Git revision (required)")
 	stdio.Flags().StringSliceVar(&opts.commands, "commands", nil, "Approved verifier IDs: go-test, go-vet, cargo-test")
+	stdio.Flags().StringVar(&opts.auditFile, "audit-file", "", "Pre-created private redacted JSONL receipt audit file")
+	stdio.Flags().StringVar(&opts.ntmSHA256, "ntm-sha256", "", "Exact SHA-256 of the parent-bound NTM executable (required)")
 	cmd.AddCommand(stdio)
 	return cmd
 }
 
 func runProviderBrokerStdio(cmd *cobra.Command, opts providerBrokerOptions, deps providerBrokerDependencies) error {
-	if strings.TrimSpace(opts.worktree) == "" || strings.TrimSpace(opts.revision) == "" || len(opts.commands) == 0 {
-		return errors.New("provider broker stdio requires --worktree, --revision, and at least one --commands ID")
+	if strings.TrimSpace(opts.worktree) == "" || strings.TrimSpace(opts.revision) == "" || len(opts.commands) == 0 || !providerBrokerDigest(opts.ntmSHA256) {
+		return errors.New("provider broker stdio requires --worktree, --revision, --ntm-sha256, and at least one --commands ID")
+	}
+	if runtime.GOOS != "linux" || !verifyProviderBrokerExecutableDigest(opts.ntmSHA256) {
+		return errors.New("provider broker executable digest binding did not verify")
 	}
 	if deps.newWorkspace == nil || deps.newVerifier == nil {
 		return errors.New("provider broker dependencies are incomplete")
@@ -162,7 +221,130 @@ func runProviderBrokerStdio(cmd *cobra.Command, opts providerBrokerOptions, deps
 	broker := &providerBroker{workspace: workspace, verifier: verifier, manifest: provider.VerificationManifest{
 		Worktree: opts.worktree, Revision: opts.revision, CommandIDs: append([]string(nil), opts.commands...),
 	}}
+	if strings.TrimSpace(opts.auditFile) != "" {
+		audit, err := openProviderBrokerAudit(opts.worktree, opts.revision, opts.auditFile)
+		if err != nil {
+			return err
+		}
+		broker.audit = audit
+		defer audit.file.Close()
+	}
 	return broker.serve(ctx, cmd.InOrStdin(), cmd.OutOrStdout())
+}
+
+func verifyProviderBrokerExecutableDigest(expected string) bool {
+	if !providerBrokerDigest(expected) {
+		return false
+	}
+	path, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return false
+	}
+	return providerBrokerHashBytes(hasher.Sum(nil)) == expected
+}
+
+func providerBrokerHashBytes(value []byte) string {
+	return fmt.Sprintf("%x", value)
+}
+
+func providerBrokerDigest(value string) bool {
+	return len(value) == sha256.Size*2 && strings.IndexFunc(value, func(r rune) bool { return !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) }) < 0
+}
+
+func openProviderBrokerAudit(worktree, revision, auditFile string) (*providerBrokerAudit, error) {
+	worktree, err := filepath.Abs(worktree)
+	if err != nil {
+		return nil, errors.New("resolve provider broker worktree for audit")
+	}
+	auditFile, err = filepath.Abs(auditFile)
+	if err != nil {
+		return nil, errors.New("resolve provider broker audit path")
+	}
+	worktree = filepath.Clean(worktree)
+	auditFile = filepath.Clean(auditFile)
+	if filepath.Dir(auditFile) != filepath.Dir(worktree) {
+		return nil, errors.New("provider broker audit path must be a direct child of the linked worktree temporary parent")
+	}
+	before, err := os.Lstat(auditFile)
+	if err != nil || !before.Mode().IsRegular() || before.Mode().Perm() != 0o600 || before.Size() != 0 {
+		return nil, errors.New("provider broker audit file must be a pre-created empty private regular file")
+	}
+	file, err := os.OpenFile(auditFile, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return nil, errors.New("open pre-created private provider broker audit file")
+	}
+	after, err := file.Stat()
+	if err != nil || !after.Mode().IsRegular() || after.Mode().Perm() != 0o600 || after.Size() != 0 || !os.SameFile(before, after) {
+		_ = file.Close()
+		return nil, errors.New("provider broker audit file changed before broker admission")
+	}
+	audit := &providerBrokerAudit{file: file}
+	header := providerBrokerAuditHeader{
+		SchemaVersion:  providerBrokerAuditSchemaVersion,
+		Kind:           "header",
+		WorktreeSHA256: providerBrokerHash(worktree),
+		RevisionSHA256: providerBrokerHash(revision),
+		CreatedAt:      time.Now().UTC(),
+	}
+	if err := audit.write(header); err != nil {
+		_ = file.Close()
+		return nil, errors.New("persist provider broker audit header")
+	}
+	return audit, nil
+}
+
+func providerBrokerHash(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func (a *providerBrokerAudit) write(value any) error {
+	if a == nil || a.file == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	encoded = append(encoded, '\n')
+	if _, err := a.file.Write(encoded); err != nil {
+		return err
+	}
+	return a.file.Sync()
+}
+
+func (b *providerBroker) recordToolEvent(tool, path string, success, rejected bool, workspaceReceipt *provider.WorkspaceOperationReceipt, verificationReceipt *provider.VerificationReceipt, cause error) error {
+	if b == nil || b.audit == nil {
+		return nil
+	}
+	b.audit.sequence++
+	event := providerBrokerAuditEvent{
+		SchemaVersion:       providerBrokerAuditSchemaVersion,
+		Kind:                "tool_call",
+		Sequence:            b.audit.sequence,
+		Tool:                tool,
+		Success:             success,
+		Rejected:            rejected,
+		WorkspaceReceipt:    workspaceReceipt,
+		VerificationReceipt: verificationReceipt,
+		OccurredAt:          time.Now().UTC(),
+	}
+	if path != "" {
+		event.PathSHA256 = providerBrokerHash(path)
+	}
+	if cause != nil {
+		event.ErrorSHA256 = providerBrokerHash(cause.Error())
+	}
+	return b.audit.write(event)
 }
 
 func (b *providerBroker) serve(ctx context.Context, input io.Reader, output io.Writer) error {
@@ -267,7 +449,28 @@ func (b *providerBroker) call(ctx context.Context, raw json.RawMessage) (any, er
 		Arguments json.RawMessage `json:"arguments"`
 	}
 	if err := decodeProviderNativeToolArgs(raw, &request); err != nil {
+		if auditErr := b.recordToolEvent("invalid", "", false, true, nil, nil, err); auditErr != nil {
+			return nil, errors.New("persist provider broker audit event")
+		}
 		return nil, err
+	}
+	recordRejected := func(path string, cause error) error {
+		if err := b.recordToolEvent(request.Name, path, false, true, nil, nil, cause); err != nil {
+			return errors.New("persist provider broker audit event")
+		}
+		return cause
+	}
+	recordWorkspace := func(path string, receipt provider.WorkspaceOperationReceipt, success bool, cause error) error {
+		if err := b.recordToolEvent(request.Name, path, success, !success, &receipt, nil, cause); err != nil {
+			return errors.New("persist provider broker audit event")
+		}
+		return cause
+	}
+	recordVerification := func(receipt provider.VerificationReceipt, success bool, cause error) error {
+		if err := b.recordToolEvent(request.Name, "", success, !success, nil, &receipt, cause); err != nil {
+			return errors.New("persist provider broker audit event")
+		}
+		return cause
 	}
 	var payload any
 	switch request.Name {
@@ -276,9 +479,12 @@ func (b *providerBroker) call(ctx context.Context, raw json.RawMessage) (any, er
 			Path string `json:"path"`
 		}
 		if err := decodeProviderNativeToolArgs(request.Arguments, &args); err != nil {
-			return nil, err
+			return nil, recordRejected("", err)
 		}
 		files, receipt, err := b.workspace.ListFiles(ctx, args.Path)
+		if recordErr := recordWorkspace(args.Path, receipt, err == nil, err); recordErr != nil {
+			return nil, recordErr
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -291,9 +497,12 @@ func (b *providerBroker) call(ctx context.Context, raw json.RawMessage) (any, er
 			Path string `json:"path"`
 		}
 		if err := decodeProviderNativeToolArgs(request.Arguments, &args); err != nil {
-			return nil, err
+			return nil, recordRejected("", err)
 		}
 		content, receipt, err := b.workspace.ReadFile(ctx, args.Path)
+		if recordErr := recordWorkspace(args.Path, receipt, err == nil, err); recordErr != nil {
+			return nil, recordErr
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -309,12 +518,16 @@ func (b *providerBroker) call(ctx context.Context, raw json.RawMessage) (any, er
 			Content        string `json:"content"`
 		}
 		if err := decodeProviderNativeToolArgs(request.Arguments, &args); err != nil {
-			return nil, err
+			return nil, recordRejected("", err)
 		}
 		receipt, err := b.workspace.WriteFile(ctx, args.Path, args.ExpectedSHA256, []byte(args.Content))
+		if recordErr := recordWorkspace(args.Path, receipt, err == nil, err); recordErr != nil {
+			return nil, recordErr
+		}
 		if err != nil {
 			return nil, err
 		}
+		b.lastSuccessfulWrite++
 		payload = struct {
 			Written bool                               `json:"written"`
 			SHA256  string                             `json:"sha256"`
@@ -323,18 +536,25 @@ func (b *providerBroker) call(ctx context.Context, raw json.RawMessage) (any, er
 	case "verify_worktree":
 		var args struct{}
 		if err := decodeProviderNativeToolArgs(request.Arguments, &args); err != nil {
-			return nil, err
+			return nil, recordRejected("", err)
+		}
+		if b.lastSuccessfulWrite == 0 || b.lastVerifiedWrite == b.lastSuccessfulWrite {
+			return nil, recordRejected("", errors.New("verify_worktree requires a newer successful write_file"))
 		}
 		receipt, err := b.verifier.Verify(ctx, b.manifest)
+		if recordErr := recordVerification(receipt, err == nil, err); recordErr != nil {
+			return nil, recordErr
+		}
 		if err != nil {
 			return nil, err
 		}
+		b.lastVerifiedWrite = b.lastSuccessfulWrite
 		payload = struct {
 			Passed  bool                         `json:"passed"`
 			Receipt provider.VerificationReceipt `json:"receipt"`
 		}{true, receipt}
 	default:
-		return nil, errors.New("unknown constrained broker tool")
+		return nil, recordRejected("", errors.New("unknown constrained broker tool"))
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {

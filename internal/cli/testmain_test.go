@@ -5,6 +5,8 @@ import (
 	"os"
 	"testing"
 
+	"github.com/spf13/cobra"
+
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/tests/testutil"
 )
@@ -33,6 +35,22 @@ func newTmuxIntegrationTestConfig(projectsBase string) *config.Config {
 }
 
 func TestMain(m *testing.M) {
+	if os.Getenv("NTM_PROVIDER_BROKER_TEST_HELPER") == "1" {
+		root := &cobra.Command{Use: "ntm", SilenceErrors: true, SilenceUsage: true}
+		providerCmd := &cobra.Command{Use: "provider"}
+		providerCmd.AddCommand(newProviderBrokerCmd())
+		root.AddCommand(providerCmd)
+		root.SetArgs(os.Args[1:])
+		root.SetIn(os.Stdin)
+		root.SetOut(os.Stdout)
+		root.SetErr(os.Stderr)
+		if err := root.Execute(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	cleanupTmux, err := testutil.IsolateTmuxTestProcess()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "isolate CLI tmux tests: %v\n", err)

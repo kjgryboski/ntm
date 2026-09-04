@@ -181,3 +181,99 @@ func TestAuthorizeProviderOperationRejectsPartialGrokHeadlessLineageReceipt(t *t
 		}
 	}
 }
+
+func TestAuthorizeProviderOperationPromotesOnlyQualifiedGrokWorkspaceOperations(t *testing.T) {
+	profile := providerTestGrokProfile(agent.GrokWorkspaceWritePolicyName)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1_800_000_000, 0).UTC()
+	workspaceChecks := map[string]bool{
+		providerqualification.CheckIdentity:       true,
+		providerqualification.CheckWorkspaceEdit:  true,
+		providerqualification.CheckTestCommand:    true,
+		providerqualification.CheckSecretDenied:   true,
+		providerqualification.CheckPushDenied:     true,
+		providerqualification.CheckProcessCleanup: true,
+	}
+	checks := make([]providerqualification.Check, 0, len(providerqualification.GrokRequiredChecks()))
+	for _, name := range providerqualification.GrokRequiredChecks() {
+		checks = append(checks, providerqualification.Check{
+			Name: name, Passed: workspaceChecks[name], Provenance: "live", EvidenceSHA256: strings.Repeat("a", 64), Detail: "workspace qualification check",
+		})
+	}
+	policySHA256 := agent.GrokAutomationPolicySHA256(profile.AutomationPolicy)
+	runtimeSHA256 := strings.Repeat("c", 64)
+	receipt := providerqualification.Receipt{
+		Mode: providerqualification.ModeLive, Provider: "xai", Transport: "xai_acp",
+		IdentitySHA256: identity.Hash(), PolicySHA256: policySHA256, RuntimeVersion: profile.RuntimeVersion, RuntimeSHA256: runtimeSHA256,
+		StartedAt: now.Add(-time.Minute), CompletedAt: now, DisposableRepoHash: strings.Repeat("b", 64), Checks: checks,
+	}
+	if err := receipt.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := receipt.CanonicalPayload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature, err := newProviderNativeTestSigner()(context.Background(), payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := receipt.AttachAttestation(signature); err != nil {
+		t.Fatal(err)
+	}
+	input := providerOperationAuthorization{
+		Identity: identity, Transport: receipt.Transport, PolicySHA256: policySHA256, RuntimeVersion: profile.RuntimeVersion, RuntimeSHA256: runtimeSHA256,
+		MaxQualificationAge: time.Hour, TrustedSigner: signature.KeyMetadata,
+	}
+	deps := providerOperationAuthorizationDependencies{
+		load: func(_, _, transport string) (providerqualification.Receipt, string, error) {
+			if transport != receipt.Transport {
+				t.Fatalf("unexpected qualification transport %q", transport)
+			}
+			return receipt, "workspace.json", nil
+		},
+		now: func() time.Time { return now.Add(time.Minute) },
+	}
+	for _, operation := range []string{providerOperationReview, providerOperationWorkspaceWrite} {
+		input.Operation = operation
+		if digest, err := authorizeProviderOperationWithDependencies(input, deps); err != nil || digest != receipt.ReceiptSHA256 {
+			t.Fatalf("operation %q digest=%q err=%v", operation, digest, err)
+		}
+	}
+	input.Operation = providerOperationLifecycle
+	if digest, err := authorizeProviderOperationWithDependencies(input, deps); err == nil || digest != "" {
+		t.Fatalf("lifecycle accepted workspace-only receipt: digest=%q err=%v", digest, err)
+	}
+
+	locallyAsserted := receipt
+	for index := range locallyAsserted.Checks {
+		if locallyAsserted.Checks[index].Name == providerqualification.CheckIdentity {
+			locallyAsserted.Checks[index].Provenance = "local_authoritative"
+		}
+	}
+	if err := locallyAsserted.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	localPayload, err := locallyAsserted.CanonicalPayload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	localSignature, err := newProviderNativeTestSigner()(context.Background(), localPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := locallyAsserted.AttachAttestation(localSignature); err != nil {
+		t.Fatal(err)
+	}
+	deps.load = func(string, string, string) (providerqualification.Receipt, string, error) {
+		return locallyAsserted, "locally-asserted-workspace.json", nil
+	}
+	input.Operation = providerOperationReview
+	input.TrustedSigner = localSignature.KeyMetadata
+	if digest, err := authorizeProviderOperationWithDependencies(input, deps); err == nil || digest != "" {
+		t.Fatalf("locally asserted Grok identity was accepted: digest=%q err=%v", digest, err)
+	}
+}

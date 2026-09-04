@@ -197,6 +197,64 @@ func TestRunPassesOnlyTypedNTMWorkspaceBrokerToSessionNew(t *testing.T) {
 	}
 }
 
+func TestWorkspaceBrokerDescriptorWithAuditBindsExactTemporaryParentPath(t *testing.T) {
+	parent := t.TempDir()
+	worktree := filepath.Join(parent, "linked")
+	auditFile := filepath.Join(parent, "broker-audit.jsonl")
+	ordinary, err := NewWorkspaceBrokerDescriptor(worktree, strings.Repeat("a", 40), []string{"go-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	audited, err := NewWorkspaceBrokerDescriptorWithAudit(worktree, strings.Repeat("a", 40), []string{"go-test"}, auditFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := audited.args; len(got) != 13 || got[9] != "--ntm-sha256" || !workspaceBrokerDigest(got[10]) || got[11] != "--audit-file" || got[12] != auditFile {
+		t.Fatalf("audited descriptor args = %#v", got)
+	}
+	if !workspaceBrokerProcExePath(audited.command) || audited.args[10] != mustWorkspaceBrokerExecutableSHA256(t, audited.command) {
+		t.Fatalf("descriptor did not bind current parent executable: command=%q args=%#v", audited.command, audited.args)
+	}
+	if audited.BindingSHA256() == "" || audited.BindingSHA256() == ordinary.BindingSHA256() {
+		t.Fatalf("audit path was not bound: ordinary=%q audited=%q", ordinary.BindingSHA256(), audited.BindingSHA256())
+	}
+	for _, invalid := range []string{filepath.Join(worktree, "audit.jsonl"), filepath.Join(t.TempDir(), "audit.jsonl"), "relative-audit.jsonl"} {
+		if _, err := NewWorkspaceBrokerDescriptorWithAudit(worktree, strings.Repeat("a", 40), []string{"go-test"}, invalid); err == nil {
+			t.Fatalf("invalid audit path %q was accepted", invalid)
+		}
+	}
+}
+
+func mustWorkspaceBrokerExecutableSHA256(t *testing.T, path string) string {
+	t.Helper()
+	digest, err := workspaceBrokerExecutableSHA256(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return digest
+}
+
+func TestRunAfterPromptWrittenRunsOnceAfterAcceptedWriteAndContainsPanics(t *testing.T) {
+	proc := newFakeProcess(strings.NewReader(successfulTranscript(`[{"id":"cached_token"}]`)), strings.NewReader(""))
+	called := 0
+	_, err := Run(t.Context(), &fakeRunner{proc: proc}, Request{
+		Prompt: "hello", CWD: "/repo",
+		AfterPromptWritten: func() {
+			called++
+			if !strings.Contains(proc.stdin.String(), `"method":"session/prompt"`) {
+				t.Fatal("callback ran before session/prompt was written")
+			}
+			panic("qualification callback must not break ACP runner")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if called != 1 {
+		t.Fatalf("callback count = %d, want 1", called)
+	}
+}
+
 func TestRunRejectsAnythingOtherThanTheTypedNTMWorkspaceBroker(t *testing.T) {
 	if _, err := NewWorkspaceBrokerDescriptor("/tmp/linked", strings.Repeat("a", 40), []string{"sh"}); err == nil {
 		t.Fatal("unapproved verifier command was accepted")

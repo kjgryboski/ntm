@@ -415,7 +415,11 @@ func newProviderQualifyCmd() *cobra.Command {
 
 This command is intentionally live-only. Full coding suites use and remove a
 disposable repository after recording controller-owned cleanup evidence. The
-The default Grok ACP producer is deliberately observe-only. The explicit
+default Grok ACP producer is deliberately observe-only. A profile selecting the
+exact grok-workspace-write-ci policy runs one bounded ACP turn in a disposable
+linked worktree through NTM's typed broker. It proves edit, isolated tests,
+protected-path denial, push-surface denial, and cleanup without claiming crash,
+cancellation, or resume. The explicit
 --grok-headless-lineage mode bootstraps a strict ACP session inside a disposable
 linked worktree, then proves native fork/resume lineage without authorizing
 review, writes, cancellation, or general lifecycle dispatch.
@@ -1686,8 +1690,7 @@ func providerDoctorWorkspaceEvidence(report providerDoctorReport) bool {
 		return report.Policy.Name == provider.NativeZAIToolsPolicyName && qualificationChecksPassed(report.Qualification,
 			"exact_model_request_id", "controller_tool_loop", "workspace_edit", "isolated_verification", "protected_path_denial", "shell_and_push_absent")
 	default:
-		// Grok's workspace policy and broker are necessary, but a signed live
-		// edit/test/denial qualification is not yet produced for this transport.
+		// Unknown transports have no workspace-evidence contract.
 		return false
 	}
 }

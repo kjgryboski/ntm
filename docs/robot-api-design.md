@@ -371,6 +371,20 @@ and local cleanup checks. Every edit, test, denial, cancellation, and crash
 check remains false; the partial receipt therefore cannot unlock ordinary
 session dispatch.
 
+For an exact `grok-workspace-write-ci` profile, ordinary
+`ntm provider qualify --profile=PROFILE --live` is a separate one-turn producer.
+The ACP agent receives only the NTM workspace broker and must perform exactly
+one bounded read, one hash-checked edit, one rejected protected-path read, and
+one fixed isolated verification request. NTM binds the broker to the live parent
+executable inode and digest, consumes redacted evidence through a parent-held
+private audit inode, independently validates the receipt schemas and manifest,
+then removes the worktree and isolated runtime home. Its signed partial receipt
+can promote review and workspace-write for that exact identity; it cannot
+promote lifecycle while crash, cancellation, and resume remain unproven.
+Arbitrary code already executing as the same controller OS account remains
+inside the local trust boundary; inode guarding is not a hardware-backed or
+cross-user attestation mechanism.
+
 Z.ai Coding Plan and native API access are intentionally different identities:
 the Claude-compatible Coding Plan lane accepts only `ZAI_API_KEY`, while the
 native API lane reads a separately authorized key only from the OS credential
