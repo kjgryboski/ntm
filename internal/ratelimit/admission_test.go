@@ -14,6 +14,36 @@ import (
 
 const admissionConfigHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
+func TestObservedReleaseKeepsOtherLeaseAndUnknownUsage(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := DefaultSubscriptionAdmissionConfig()
+	cfg.MaxConcurrent, cfg.Exact.MaxConcurrent = 2, 2
+	cfg.Exact.TokenCapacity = 10
+	controller, err := NewSubscriptionAdmissionController(cfg, filepath.Join(t.TempDir(), "capacity.json"), func() time.Time { return now }, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := subscriptionIdentity(t, "test-account", "glm-5.3", "https://api.z.ai/api/v1")
+	first, second := controller.Acquire(id), controller.Acquire(id)
+	if !first.Allowed || !second.Allowed {
+		t.Fatal("fixture admission failed")
+	}
+	if err := controller.RecordUnknownUsage(id, first); err != nil {
+		t.Fatal(err)
+	}
+	observation := controller.ReleaseObserved(id, first)
+	if !observation.LocalSlotReleased || !observation.PlanSlotReleased || observation.UsageState != "unknown_reserved" || observation.LeaseSHA256 == "" {
+		t.Fatalf("release=%+v", observation)
+	}
+	if snapshot := controller.Snapshot(id); snapshot.PlanRunning != 1 || !snapshot.UnknownUsageReserved {
+		t.Fatalf("release cleared unrelated lease or usage: %+v", snapshot)
+	}
+	if duplicate := controller.ReleaseObserved(id, first); duplicate.LocalSlotReleased || duplicate.PlanSlotReleased {
+		t.Fatal("duplicate release claimed a new release")
+	}
+	controller.Release(id, second)
+}
+
 func admissionIdentity(t *testing.T, account, model string) provider.Identity {
 	t.Helper()
 	id, err := provider.NewIdentity("zai", account, model, "https://api.z.ai/api/anthropic", "claude-glm", admissionConfigHash)

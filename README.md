@@ -562,6 +562,8 @@ ntm send --provider-profile PROFILE --operation-id task-1 --cwd WORKTREE --timeo
 ntm spawn task-1 --provider-profile PROFILE --cwd WORKTREE --prompt "Implement the task and run its tests" --timeout 5m
 ntm status --provider-profile PROFILE --operation-id task-1 --json
 ntm health --provider-profile PROFILE --operation-id task-1 --json
+ntm interrupt --provider-profile PROFILE --operation-id task-1 --json
+ntm restart task-1 --provider-profile PROFILE --operation-id task-2 --cwd WORKTREE --prompt "Continue from the verified result" --timeout 5m
 ```
 
 Choose one dispatch command per logical assignment. Reusing an operation ID
@@ -569,17 +571,38 @@ continues to use the adapter's existing replay boundary. Status and health read
 the durable receipt and verify its signer and exact identity. An unfinished row
 is outcome-unknown, not proof of a running or stopped process. Provider, runtime,
 account digest, billing identity, and requested/served model remain separate.
-The status report does not infer capacity release from local process cleanup.
+Status includes a separate local controller observation for release of the exact
+lease, plan lease, and usage reconciliation. It does not infer capacity release
+from process cleanup, refund unknown usage, or claim remote provider release.
 
 Interrupting the running command requests local cancellation through the same
-adapter. Cancellation from a separate command and automatic crash restart are
-not implemented for these structured assignments. Z.ai's supported session
+adapter. A separate `interrupt` command records an identity-bound cancellation
+request in the existing durable ledger; the owning controller observes it.
+An orphaned controller remains outcome-unknown and cannot be replayed. Explicit
+restart requires a distinct new operation ID, a verified terminal outcome,
+observed cleanup and exact local capacity release. Z.ai additionally requires
+reconciled usage. Automatic crash replay remains prohibited. Z.ai's supported session
 resume is reachable through `ntm resume --provider-profile PROFILE
 --operation-id NEW_ID --parent-session SESSION --cwd WORKTREE --prompt TEXT`;
 it still requires lifecycle qualification. Grok ACP workspace resume is
 unsupported and never falls back to a fresh run. These controls do not qualify
 an untested provider, bypass Z.ai capacity admission, or establish Codex/Claude
 comparison evidence.
+
+Primary runtimes can produce comparison receipts using
+`ntm provider compare --profile PRIMARY --signer-profile SIGNER --live --timeout 90s`.
+The primary profile must bind the canonical manifest, exact account/model,
+absolute executable and isolated credential home, version/hash pins, and
+`primary-controlled-workspace-comparison-v1`. The signer profile supplies only
+the pinned local signing helper; it does not select the execution provider.
+Both runtimes use the same broker, disposable edit fixture, and isolated verifier
+as Grok. Missing account authority and unverified runtime tool boundaries remain
+unsupported; lifecycle scenarios remain untested. These comparison receipts do
+not grant ordinary assignment readiness. No account is switched or substituted.
+Execution requires a native Linux executable and subscription OAuth credentials
+(`credential_class = "oauth"`, `billing_class = "subscription"`,
+`entitlement = "primary_cli"`). The Codex subscription endpoint is
+`https://chatgpt.com/backend-api/codex`; an API-key account is not substituted.
 
 Grok qualification checks diagnostic storage before dispatch and flushes a
 separate unsigned observation before process cleanup. It retains only reviewed

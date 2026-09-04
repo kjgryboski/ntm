@@ -450,7 +450,17 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 		}
 		return output, err
 	}
-	defer deps.Admission.Release(opts.Identity, decision)
+	defer func() {
+		if observer, ok := deps.Admission.(interface {
+			ReleaseObserved(provider.Identity, ratelimit.Decision) provider.CapacityReleaseObservation
+		}); ok {
+			if err := provider.ObserveCapacityRelease(ctx, observer.ReleaseObserved(opts.Identity, decision)); err != nil {
+				returnErr = errors.Join(returnErr, errors.New("local capacity observation could not be persisted"))
+			}
+		} else {
+			deps.Admission.Release(opts.Identity, decision)
+		}
+	}()
 	dispatched := true
 	defer func() {
 		if !dispatched {

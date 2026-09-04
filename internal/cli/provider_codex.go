@@ -199,7 +199,7 @@ OpenAI, Anthropic, or native API billing.`,
 	return cmd
 }
 
-func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps providerCodexRunDependencies) error {
+func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps providerCodexRunDependencies) (returnErr error) {
 	if strings.TrimSpace(opts.profile) == "" || strings.TrimSpace(opts.prompt) == "" || strings.TrimSpace(opts.cwd) == "" {
 		return errors.New("provider codex run requires exact --profile, --prompt, and --cwd values")
 	}
@@ -340,7 +340,17 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 		}
 		return finishProviderCodex(cmd, output, errors.New("provider capacity admission denied for the exact Z.ai Coding Plan identity"))
 	}
-	defer deps.admission.Release(identity, decision)
+	defer func() {
+		if observer, ok := deps.admission.(interface {
+			ReleaseObserved(provider.Identity, ratelimit.SubscriptionDecision) provider.CapacityReleaseObservation
+		}); ok {
+			if err := provider.ObserveCapacityRelease(commandCtx, observer.ReleaseObserved(identity, decision)); err != nil {
+				returnErr = errors.Join(returnErr, errors.New("local capacity observation could not be persisted"))
+			}
+		} else {
+			deps.admission.Release(identity, decision)
+		}
+	}()
 	nonce, err := deps.newNonce()
 	if err != nil {
 		_ = ledger.ReleaseSendOperation(claimed.OperationID, claimed.SessionName)

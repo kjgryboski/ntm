@@ -28,7 +28,19 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
   profile selection on assign, send, and one-shot spawn preserves qualification,
   identity, replay, and capacity boundaries. Status/health verify durable
   completion receipts; supported Z.ai resume still requires lifecycle evidence.
-  Cross-command cancellation and automatic crash restart remain unavailable.
+  Cross-command cancellation now uses the exact durable operation binding.
+  Explicit restart requires a new operation ID, verified terminal outcome,
+  cleanup and exact capacity release; unknown outcomes cannot be replayed.
+- **Capacity release is independently observable.** Status records the local
+  exact/plan lease releases and usage reconciliation without refunding unknown
+  reservations or claiming remote generation termination.
+- **Primary comparison producers share the workspace fixture.** A pinned
+  Codex or Claude profile can run the same audited edit/test/denial scenario.
+  Missing account authority, incomplete tool boundaries and unexercised
+  lifecycle behavior remain explicit; comparison is not dispatch admission.
+- **Grok ACP tool-result arrays preserve lifecycle observations.** The parser
+  decodes assistant text only for message chunks; valid tool-content arrays no
+  longer discard completion updates or become nonce acknowledgements.
 
 - **Z.ai Codex admission now shares CAAM's v2 manifest contract.** NTM
   recomputes the versioned identity/file digest and strictly validates the

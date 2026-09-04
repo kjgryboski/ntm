@@ -260,6 +260,39 @@ func (c *SubscriptionAdmissionController) Release(identity provider.Identity, de
 	c.exact.Release(identity, decision.exact)
 }
 
+// ReleaseObserved verifies both exact leases without refunding usage. The
+// accounting state belongs to this operation's reservation, not a plan total.
+func (c *SubscriptionAdmissionController) ReleaseObserved(identity provider.Identity, decision SubscriptionDecision) provider.CapacityReleaseObservation {
+	o := provider.CapacityReleaseObservation{IdentitySHA256: identity.Hash(), UsageState: "unverified", ObservedAt: time.Now().UTC()}
+	if c == nil || !decision.Allowed || !validIdentity(identity) {
+		return o
+	}
+	o.Scope = c.CapacityStatus().Scope
+	o.LeaseSHA256 = hashLease(decision.exact.leaseID)
+	o.PlanLeaseSHA256 = hashLease(decision.plan.leaseID)
+	o.LocalSlotReleased = c.exact.releaseScopeObserved(identity.CapacityScope(), decision.exact)
+	o.PlanSlotReleased = c.plan.releaseScopeObserved(identity.SubscriptionCapacityScope(), decision.plan)
+	state, _, err := c.plan.subscriptionState(identity.SubscriptionCapacityScope())
+	if err == nil {
+		for _, event := range state.subscriptionUsage {
+			if event.LeaseID != decision.plan.leaseID {
+				continue
+			}
+			switch {
+			case event.Unknown:
+				o.UsageState = "unknown_reserved"
+			case event.Conservative:
+				o.UsageState = "conservative_recorded"
+			case event.Reconciled:
+				o.UsageState = "reconciled"
+			default:
+				o.UsageState = "reserved"
+			}
+		}
+	}
+	return o
+}
+
 // CapacityStatus reports shared only when both exact and subscription plan
 // controllers can coordinate through their local durable store.
 func (c *SubscriptionAdmissionController) CapacityStatus() CapacityStatus {
@@ -959,12 +992,29 @@ func (c *AdmissionController) Release(identity provider.Identity, decision Decis
 	c.releaseScope(identity.CapacityScope(), decision)
 }
 
-func (c *AdmissionController) releaseScope(scope provider.CapacityScope, decision Decision) {
-	if c == nil || scope == "" || !decision.Allowed || decision.leaseID == "" {
-		return
+func hashLease(id string) string {
+	if id == "" {
+		return ""
 	}
-	c.withState(scope, c.now(), func(state *admissionState) {
-		c.reclaimLocalExpiredLeases(state, c.now())
+	digest := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(digest[:])
+}
+
+func (c *AdmissionController) ReleaseObserved(identity provider.Identity, decision Decision) provider.CapacityReleaseObservation {
+	o := provider.CapacityReleaseObservation{IdentitySHA256: identity.Hash(), LeaseSHA256: hashLease(decision.leaseID), UsageState: "not_metered_by_controller", ObservedAt: time.Now().UTC()}
+	if c != nil && validIdentity(identity) {
+		o.Scope = c.CapacityStatus().Scope
+		o.LocalSlotReleased = c.releaseScopeObserved(identity.CapacityScope(), decision)
+	}
+	return o
+}
+
+func (c *AdmissionController) releaseScopeObserved(scope provider.CapacityScope, decision Decision) bool {
+	if c == nil || scope == "" || !decision.Allowed || decision.leaseID == "" {
+		return false
+	}
+	released := false
+	committed := c.withAuthoritativeState(scope, c.now(), func(state *admissionState) {
 		lease, ok := state.leases[decision.leaseID]
 		if !ok || lease.OwnerID != c.ownerID || lease.OperationID != decision.leaseID {
 			return
@@ -975,7 +1025,13 @@ func (c *AdmissionController) releaseScope(scope provider.CapacityScope, decisio
 		}
 		delete(state.leases, decision.leaseID)
 		state.running = len(state.leases)
+		released = true
 	})
+	return committed && released
+}
+
+func (c *AdmissionController) releaseScope(scope provider.CapacityScope, decision Decision) {
+	_ = c.releaseScopeObserved(scope, decision)
 }
 
 func (c *AdmissionController) subscriptionState(scope provider.CapacityScope) (admissionState, bool, error) {

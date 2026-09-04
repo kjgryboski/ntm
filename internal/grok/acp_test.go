@@ -21,6 +21,29 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 )
 
+func TestToolContentArraysPreserveTerminalLifecycleWithoutAcknowledgement(t *testing.T) {
+	// Pinned ACP schema 0.11.4 ToolCallUpdateFields.content is an array;
+	// Grok bb7f39d5 acp_conversion.rs emits it with terminal status. Tool
+	// output must close the lifecycle, but must never acknowledge the nonce.
+	for _, status := range []string{"completed", "failed"} {
+		t.Run(status, func(t *testing.T) {
+			a := newUpdateAccumulator(sha256.New(), "secret-nonce", "grok-4.6")
+			a.providerSessionID = "bound"
+			for _, event := range []string{
+				`{"sessionId":"bound","update":{"sessionUpdate":"tool_call","toolCallId":"one","status":"pending","content":[]}}`,
+				`{"sessionId":"bound","update":{"sessionUpdate":"tool_call_update","toolCallId":"one","status":"` + status + `","content":[{"type":"content","content":{"type":"text","text":"secret-nonce"}}]}}`,
+			} {
+				if err := a.observe(json.RawMessage(event)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if a.toolRequestCount != 1 || a.toolCompleteCount != 1 || a.toolEventCount != 2 || a.chunks != 0 || a.nonce.verified {
+				t.Fatalf("wrong tool evidence: requests=%d completions=%d chunks=%d", a.toolRequestCount, a.toolCompleteCount, a.chunks)
+			}
+		})
+	}
+}
+
 func TestRunCompletesFromACPTranscript(t *testing.T) {
 	transcript := strings.Join([]string{
 		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"},{"id":"xai.api_key"}]}}`,

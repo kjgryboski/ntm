@@ -18,6 +18,35 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 )
 
+func TestPrimaryComparisonDiagnosticsSurviveWithoutGrantingReadiness(t *testing.T) {
+	base := t.TempDir()
+	now := time.Now().UTC()
+	identity := testHash("primary-account")
+	observation := PrimaryComparisonDiagnostic{Completed: true, NonceVerified: false, ModelSHA256: testHash("synthetic-served-model-canary"), EventCount: 5, ExitOK: true}
+	path, err := StorePrimaryComparisonDiagnostics(base, "openai_codex_comparison", identity, testHash("policy"), testHash("runtime"), now, now, "before_cleanup", observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record DiagnosticObservation
+	if err = json.Unmarshal(data, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Transport != "openai_codex_comparison" || record.Trust != "unsigned_diagnostic_only" || record.Comparison == nil || record.Comparison.EventCount != 5 || record.Comparison.NonceVerified || strings.Contains(string(data), "synthetic-served-model-canary") {
+		t.Fatalf("invalid redacted diagnostic: %s", data)
+	}
+	if _, _, err = LoadLatest(base, identity); err == nil {
+		t.Fatal("unsigned comparison granted qualification")
+	}
+	observation.ModelSHA256 = "credential-canary"
+	if _, err = StorePrimaryComparisonDiagnostics(base, "openai_codex_comparison", identity, testHash("policy"), testHash("runtime"), now, now, "before_cleanup", observation); err == nil {
+		t.Fatal("provider text accepted as model digest")
+	}
+}
+
 func testHash(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])

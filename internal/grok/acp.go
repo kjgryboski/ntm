@@ -2062,9 +2062,10 @@ func (a *updateAccumulator) observe(params json.RawMessage) error {
 			SessionUpdate string          `json:"sessionUpdate"`
 			ToolCallID    string          `json:"toolCallId"`
 			Status        json.RawMessage `json:"status"`
-			Content       struct {
-				Text string `json:"text"`
-			} `json:"content"`
+			// ACP message chunks use a content object; tool calls/updates use
+			// an array of ToolCallContent. Decode only the selected variant so a
+			// valid tool result array cannot discard its terminal status.
+			Content json.RawMessage `json:"content"`
 		} `json:"update"`
 	}
 	if json.Unmarshal(params, &envelope) != nil {
@@ -2087,13 +2088,19 @@ func (a *updateAccumulator) observe(params json.RawMessage) error {
 		}
 		return nil
 	}
-	if envelope.Update.Content.Text == "" {
+	var content struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(envelope.Update.Content, &content) != nil {
+		return protocolError(provider.ProtocolMalformedSessionUpdate)
+	}
+	if content.Text == "" {
 		return nil
 	}
-	_, _ = io.WriteString(a.hasher, envelope.Update.Content.Text)
-	a.nonce.WriteString(envelope.Update.Content.Text)
+	_, _ = io.WriteString(a.hasher, content.Text)
+	a.nonce.WriteString(content.Text)
 	a.chunks++
-	a.bytes += int64(len(envelope.Update.Content.Text))
+	a.bytes += int64(len(content.Text))
 	return nil
 }
 

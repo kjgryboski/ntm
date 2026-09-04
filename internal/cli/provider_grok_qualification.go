@@ -828,6 +828,12 @@ func prepareProviderGrokQualificationWorkspace(ctx context.Context, sourceRuntim
 	if err != nil {
 		return providerGrokLineageWorkspace{}, errors.New("Grok qualification could not read the cached login")
 	}
+	return prepareProviderComparisonWorkspace(ctx, auth, workspaceWrite)
+}
+
+// All comparison producers use the same fixture, audited broker, and verifier.
+// Primary runtimes provision their own isolated credential format separately.
+func prepareProviderComparisonWorkspace(ctx context.Context, auth []byte, workspaceWrite bool) (providerGrokLineageWorkspace, error) {
 	root, err := os.MkdirTemp("", "ntm-grok-lineage-qualification-")
 	if err != nil {
 		return providerGrokLineageWorkspace{}, err
@@ -843,8 +849,10 @@ func prepareProviderGrokQualificationWorkspace(ctx context.Context, sourceRuntim
 	if err := os.Mkdir(workspace.RuntimeHome, 0o700); err != nil {
 		return fail(err)
 	}
-	if err := os.WriteFile(filepath.Join(workspace.RuntimeHome, "auth.json"), auth, 0o600); err != nil {
-		return fail(errors.New("Grok qualification could not isolate the cached login"))
+	if len(auth) != 0 {
+		if err := os.WriteFile(filepath.Join(workspace.RuntimeHome, "auth.json"), auth, 0o600); err != nil {
+			return fail(errors.New("Grok qualification could not isolate the cached login"))
+		}
 	}
 	if err := os.WriteFile(filepath.Join(workspace.Primary, "README.md"), []byte("lineage qualification\n"), 0o600); err != nil {
 		return fail(err)

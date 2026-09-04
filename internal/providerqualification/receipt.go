@@ -352,7 +352,7 @@ func requiredChecksForTransport(transport string) ([]string, error) {
 		return requiredChecks, nil
 	case "zai_codex_runtime":
 		return codexRequiredChecks, nil
-	case "xai_acp", "xai_headless_session":
+	case "xai_acp", "xai_headless_session", "openai_codex_comparison", "anthropic_claude_comparison":
 		return grokRequiredChecks, nil
 	case "zai_codex_capacity_recovery_authorization":
 		return codexCapacityRecoveryAuthorizationRequiredChecks, nil
@@ -449,6 +449,7 @@ func DefaultCodexIdentityPreflightStoreDir() string {
 // authorize work even if copied into the qualification store. Free-form text
 // is excluded; only fixed check names, closed reasons, and digests survive.
 type DiagnosticObservation struct {
+	Comparison     *PrimaryComparisonDiagnostic  `json:"comparison,omitempty"`
 	Phase          string                        `json:"phase,omitempty"`
 	Protocol       *provider.ProtocolObservation `json:"protocol,omitempty"`
 	SchemaVersion  string                        `json:"schema_version"`
@@ -461,6 +462,27 @@ type DiagnosticObservation struct {
 	StartedAt      time.Time                     `json:"started_at"`
 	CompletedAt    time.Time                     `json:"completed_at"`
 	Observations   []DiagnosticCheck             `json:"observations"`
+}
+
+// PrimaryComparisonDiagnostic retains closed observations and a model digest,
+// never provider text, credentials, prompts, or a purported account identity.
+type PrimaryComparisonDiagnostic struct {
+	Completed      bool   `json:"completed"`
+	NonceVerified  bool   `json:"nonce_verified"`
+	ModelSHA256    string `json:"model_sha256,omitempty"`
+	ModelMatched   bool   `json:"model_matched"`
+	ModelConflict  bool   `json:"model_conflict"`
+	Malformed      bool   `json:"malformed"`
+	UnexpectedTool bool   `json:"unexpected_tool"`
+	EventCount     int    `json:"event_count"`
+	ExitOK         bool   `json:"exit_ok"`
+}
+
+func StorePrimaryComparisonDiagnostics(baseDir, transport, identity, policy, runtime string, started, observed time.Time, phase string, observation PrimaryComparisonDiagnostic) (string, error) {
+	if (transport != "openai_codex_comparison" && transport != "anthropic_claude_comparison") || !isSHA256(identity) || !isSHA256(policy) || !isSHA256(runtime) || started.IsZero() || observed.Before(started) || (phase != "before_dispatch" && phase != "before_cleanup") || (observation.ModelSHA256 != "" && !isSHA256(observation.ModelSHA256)) || observation.EventCount < 0 {
+		return "", errors.New("invalid primary comparison diagnostic")
+	}
+	return storeDiagnosticRecord(baseDir, DiagnosticObservation{SchemaVersion: "ntm.provider-diagnostic.v1", Trust: "unsigned_diagnostic_only", Transport: transport, IdentitySHA256: identity, PolicySHA256: policy, RuntimeSHA256: runtime, StartedAt: started, CompletedAt: observed, Phase: phase, Comparison: &observation})
 }
 
 type DiagnosticCheck struct {

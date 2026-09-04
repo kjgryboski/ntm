@@ -31,6 +31,7 @@ const providerRoutingSchema = "ntm.provider-routing.v1"
 type providerAssignmentRequest struct {
 	Profile, OperationID, Prompt, CWD string
 	ParentSession                     string
+	RestartOf                         string
 	Timeout                           time.Duration
 }
 
@@ -40,25 +41,43 @@ type providerAssignmentRequest struct {
 var dispatchProviderAssignment = runProviderAssignment
 
 type providerAssignmentStatus struct {
-	Schema                  string `json:"schema_version"`
-	Profile                 string `json:"profile"`
-	Provider                string `json:"provider"`
-	Runtime                 string `json:"runtime"`
-	AccountSHA256           string `json:"account_sha256"`
-	IdentitySHA256          string `json:"identity_sha256"`
-	BillingClass            string `json:"billing_class"`
-	RequestedModel          string `json:"requested_model"`
-	ServedModel             string `json:"served_model,omitempty"`
-	State                   string `json:"state"`
-	IdentityBindingVerified bool   `json:"identity_binding_verified"`
-	CompletionConfirmed     bool   `json:"completion_confirmed"`
-	LocalCleanupVerified    bool   `json:"local_cleanup_verified"`
-	RemoteTermination       string `json:"remote_generation_termination"`
+	Schema                  string                               `json:"schema_version"`
+	Profile                 string                               `json:"profile"`
+	Provider                string                               `json:"provider"`
+	Runtime                 string                               `json:"runtime"`
+	AccountSHA256           string                               `json:"account_sha256"`
+	IdentitySHA256          string                               `json:"identity_sha256"`
+	BillingClass            string                               `json:"billing_class"`
+	RequestedModel          string                               `json:"requested_model"`
+	ServedModel             string                               `json:"served_model,omitempty"`
+	State                   string                               `json:"state"`
+	IdentityBindingVerified bool                                 `json:"identity_binding_verified"`
+	CompletionConfirmed     bool                                 `json:"completion_confirmed"`
+	LocalCleanupVerified    bool                                 `json:"local_cleanup_verified"`
+	RemoteTermination       string                               `json:"remote_generation_termination"`
+	CapacityObservation     *provider.CapacityReleaseObservation `json:"local_controller_capacity_observation,omitempty"`
+	CancellationObserved    bool                                 `json:"local_cancellation_observed"`
 }
 
 var inspectProviderAssignment = runProviderAssignmentStatus
 
 func runProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID string) error {
+	return withProviderAssignmentStatus(cmd, profileName, operationID, func(out providerAssignmentStatus) error {
+		if IsJSONOutput() {
+			return encodeIndentedJSON(cmd.OutOrStdout(), out)
+		}
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "Provider: %s; runtime: %s; billing: %s\nRequested model: %s; served model: %s\nState: %s; verified identity: %t; completion: %t; local cleanup: %t\nRemote generation termination: unverified\n", out.Provider, out.Runtime, out.BillingClass, out.RequestedModel, out.ServedModel, out.State, out.IdentityBindingVerified, out.CompletionConfirmed, out.LocalCleanupVerified)
+		if err != nil {
+			return err
+		}
+		if out.CapacityObservation != nil {
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "Local slot released: %t; plan slot released: %t; usage: %s (local controller observation)\n", out.CapacityObservation.LocalSlotReleased, out.CapacityObservation.PlanSlotReleased, out.CapacityObservation.UsageState)
+		}
+		return err
+	})
+}
+
+func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID string, visit func(providerAssignmentStatus) error) error {
 	if strings.TrimSpace(profileName) == "" || !validProviderNativeOperationID(operationID) {
 		return errors.New("provider status requires an exact profile and operation ID")
 	}
@@ -129,11 +148,21 @@ func runProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID st
 		}
 		out.IdentityBindingVerified = true
 	}
-	if IsJSONOutput() {
-		return encodeIndentedJSON(cmd.OutOrStdout(), out)
+	control, err := ledger.GetSendOperation(operationID, providerControlScope)
+	if err != nil {
+		return err
 	}
-	_, err = fmt.Fprintf(cmd.OutOrStdout(), "Provider: %s; runtime: %s; billing: %s\nRequested model: %s; served model: %s\nState: %s; verified identity: %t; completion: %t; local cleanup: %t\nRemote generation termination: unverified\n", out.Provider, out.Runtime, out.BillingClass, out.RequestedModel, out.ServedModel, out.State, out.IdentityBindingVerified, out.CompletionConfirmed, out.LocalCleanupVerified)
-	return err
+	if control != nil && control.Status == state.SendOperationCompleted && control.PayloadSHA256 == identity.Hash() {
+		var observation providerControlOutcome
+		if json.Unmarshal([]byte(control.OutcomeJSON), &observation) != nil || observation.IdentitySHA256 != identity.Hash() || observation.OperationBindingSHA256 != row.BindingHash {
+			return errors.New("provider control observation binding is invalid")
+		}
+		out.CancellationObserved = observation.CancelObserved
+		if observation.Capacity != nil && observation.Capacity.IdentitySHA256 == identity.Hash() {
+			out.CapacityObservation = observation.Capacity
+		}
+	}
+	return visit(out)
 }
 
 func validProviderCodexStatusReceipt(receipt providerCodexRunOutput, row *state.SendOperation, profile string, identity provider.Identity, trusted providerattestation.KeyMetadata) bool {
@@ -158,7 +187,7 @@ func validateProviderControlFlags(cmd *cobra.Command, allowed ...string) error {
 	return invalid
 }
 
-func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest) error {
+func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest) (returnErr error) {
 	if strings.TrimSpace(request.Profile) == "" || strings.TrimSpace(request.OperationID) == "" || strings.TrimSpace(request.Prompt) == "" || strings.TrimSpace(request.CWD) == "" || request.Timeout <= 0 {
 		return errors.New("provider assignment requires exact profile, operation ID, prompt, worktree, and positive timeout")
 	}
@@ -177,6 +206,16 @@ func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest
 	previousContext := cmd.Context()
 	ctx, stop := signal.NotifyContext(providerCommandContext(cmd), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ledger, closeLedger, err := openProviderNativeLedger()
+	if err != nil {
+		return err
+	}
+	defer closeLedger()
+	ctx, finishControl, err := beginProviderControl(ctx, ledger, identity, request)
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, finishControl()) }()
 	cmd.SetContext(ctx)
 	defer cmd.SetContext(previousContext)
 	switch {

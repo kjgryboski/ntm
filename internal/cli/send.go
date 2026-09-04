@@ -2479,6 +2479,7 @@ func printSendDryRunResult(result SendDryRunResult) error {
 
 func newInterruptCmd() *cobra.Command {
 	var tags []string
+	var providerProfile, operationID string
 
 	cmd := &cobra.Command{
 		Use:   "interrupt <session>",
@@ -2489,13 +2490,29 @@ User panes are not affected.
 Examples:
   ntm interrupt myproject
   ntm interrupt myproject --tag=frontend`,
-		Args: cobra.ExactArgs(1),
+		Args: func(cmd *cobra.Command, args []string) error {
+			if providerProfile != "" {
+				return cobra.NoArgs(cmd, args)
+			}
+			return cobra.ExactArgs(1)(cmd, args)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if providerProfile != "" {
+				if err := validateProviderControlFlags(cmd, "provider-profile", "operation-id"); err != nil {
+					return err
+				}
+				return runProviderInterrupt(cmd, providerProfile, operationID)
+			}
+			if operationID != "" {
+				return errors.New("--operation-id requires --provider-profile")
+			}
 			return runInterrupt(args[0], tags)
 		},
 	}
 
 	cmd.Flags().StringSliceVar(&tags, "tag", nil, "filter panes by tag (OR logic)")
+	cmd.Flags().StringVar(&providerProfile, "provider-profile", "", "Exact structured provider assignment profile")
+	cmd.Flags().StringVar(&operationID, "operation-id", "", "Exact durable assignment to cancel")
 	cmd.ValidArgsFunction = completeSessionArgs
 
 	return cmd

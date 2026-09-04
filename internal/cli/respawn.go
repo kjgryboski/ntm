@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -18,6 +19,8 @@ func newRespawnCmd() *cobra.Command {
 	var agentType string
 	var all bool
 	var dryRun bool
+	var providerProfile, operationID, prompt, cwd string
+	var timeout time.Duration
 
 	cmd := &cobra.Command{
 		Use:     "respawn <session>",
@@ -42,6 +45,15 @@ Examples:
   ntm respawn myproject --dry-run    # Preview which panes would be restarted`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if providerProfile != "" {
+				if err := validateProviderControlFlags(cmd, "provider-profile", "operation-id", "prompt", "cwd", "timeout"); err != nil {
+					return err
+				}
+				return runProviderRestart(cmd, args[0], providerAssignmentRequest{Profile: providerProfile, OperationID: operationID, Prompt: prompt, CWD: cwd, Timeout: timeout})
+			}
+			if operationID != "" || prompt != "" || cwd != "" || cmd.Flags().Changed("timeout") {
+				return fmt.Errorf("provider restart flags require --provider-profile")
+			}
 			return runRespawn(cmd.Context(), args[0], force, panes, agentType, all, dryRun)
 		},
 	}
@@ -51,6 +63,11 @@ Examples:
 	cmd.Flags().StringVarP(&agentType, "type", "t", "", "filter by agent type (cc, claude, cod, codex, gmi, gemini, agy, antigravity, grok, grok-build)")
 	cmd.Flags().BoolVarP(&all, "all", "a", false, "include all panes (including user pane)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "preview which panes would be restarted")
+	cmd.Flags().StringVar(&providerProfile, "provider-profile", "", "Exact qualified provider profile; positional argument is the previous operation ID")
+	cmd.Flags().StringVar(&operationID, "operation-id", "", "New durable assignment ID; never replays an uncertain operation")
+	cmd.Flags().StringVar(&prompt, "prompt", "", "Explicit new assignment prompt")
+	cmd.Flags().StringVar(&cwd, "cwd", "", "Isolated linked worktree for the new assignment")
+	cmd.Flags().DurationVar(&timeout, "timeout", 5*time.Minute, "Bound for the new provider assignment")
 
 	return cmd
 }
