@@ -719,8 +719,24 @@ func TestRunFailsClosedWhenAuthMethodUnavailable(t *testing.T) {
 	proc := newFakeProcess(strings.NewReader(`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"browser_login"}]}}`+"\n"), strings.NewReader(""))
 	result, err := Run(t.Context(), &fakeRunner{proc: proc}, Request{Prompt: "hello", CWD: "/repo"})
 	assertCode(t, err, ErrCachedAuthUnavailable)
-	if result.State != StateFailed || result.ProviderSessionID != "" {
+	if result.State != StateFailed || result.ProviderSessionID != "" || result.FailureStage != "auth_method_selection" {
 		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestRunReportsBoundedSessionNewFailureStage(t *testing.T) {
+	transcript := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
+		`{"jsonrpc":"2.0","id":2,"result":{}}`,
+		`{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"redacted provider setup failure"}}`,
+	}, "\n") + "\n"
+	result, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader("diagnostic body must not be retained"))}, Request{Prompt: "hello", CWD: "/repo"})
+	assertCode(t, err, ErrProvider)
+	if result.FailureStage != "session_new" || result.ProviderSessionID != "" || result.Stderr.SHA256 == "" {
+		t.Fatalf("result = %+v", result)
+	}
+	if strings.Contains(string(mustJSON(t, result)), "redacted provider setup failure") || strings.Contains(string(mustJSON(t, result)), "diagnostic body") {
+		t.Fatal("bounded failure diagnostics retained provider text")
 	}
 }
 

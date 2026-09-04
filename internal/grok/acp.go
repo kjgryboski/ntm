@@ -410,16 +410,20 @@ type StderrDigest struct {
 // Result is a redaction-safe provider receipt. Assistant output is never
 // retained, only counted and hashed.
 type Result struct {
-	Success                 bool      `json:"success"`
-	State                   string    `json:"state"`
-	FailureCode             ErrorCode `json:"failure_code,omitempty"`
-	ProviderSessionID       string    `json:"provider_session_id,omitempty"`
-	StopReason              string    `json:"stop_reason,omitempty"`
-	CompletionConfirmed     bool      `json:"completion_confirmed"`
-	AcknowledgementVerified bool      `json:"acknowledgement_verified"`
-	AssistantTextChunks     int       `json:"assistant_text_chunks"`
-	AssistantTextBytes      int64     `json:"assistant_text_bytes"`
-	OutputSHA256            string    `json:"output_sha256,omitempty"`
+	Success     bool      `json:"success"`
+	State       string    `json:"state"`
+	FailureCode ErrorCode `json:"failure_code,omitempty"`
+	// FailureStage is a bounded controller label, never provider text. It lets
+	// operators distinguish setup/handshake/tooling failures without retaining
+	// stderr, RPC payloads, prompts, paths, or credentials.
+	FailureStage            string `json:"failure_stage,omitempty"`
+	ProviderSessionID       string `json:"provider_session_id,omitempty"`
+	StopReason              string `json:"stop_reason,omitempty"`
+	CompletionConfirmed     bool   `json:"completion_confirmed"`
+	AcknowledgementVerified bool   `json:"acknowledgement_verified"`
+	AssistantTextChunks     int    `json:"assistant_text_chunks"`
+	AssistantTextBytes      int64  `json:"assistant_text_bytes"`
+	OutputSHA256            string `json:"output_sha256,omitempty"`
 	// ToolEventCount and ToolEventsSHA256 cover only the ACP tool_call and
 	// tool_call_update session-update variants. They never include raw tool
 	// arguments, results, tool-call IDs, or any other update payload.
@@ -536,6 +540,12 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 			ResidualPIDs:     []int32{},
 		},
 	}
+	failureStage := "request_validation"
+	defer func() {
+		if returnErr != nil && result.FailureStage == "" {
+			result.FailureStage = failureStage
+		}
+	}()
 	if ctx == nil {
 		return finishFailure(result, ErrInvalidRequest, errors.New("context is required"))
 	}
@@ -578,6 +588,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	}
 	args = append(args, "agent", "stdio")
 
+	failureStage = "process_start"
 	proc, err := runner.Start(ctx, StartSpec{
 		Binary:         req.Binary,
 		Args:           args,
@@ -668,6 +679,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 		return waitResponse(ctx, events, id, &updates)
 	}
 
+	failureStage = "initialize"
 	initRaw, err := call("initialize", initializeParams{
 		ProtocolVersion:    1,
 		ClientCapabilities: map[string]any{},
@@ -681,9 +693,11 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	}
 	methodID, err := selectAuthMethod(init.AuthMethods)
 	if err != nil {
+		failureStage = "auth_method_selection"
 		return finishFailure(result, ErrCachedAuthUnavailable, err)
 	}
 	cachedTokenAuthenticated := false
+	failureStage = "authenticate"
 	if _, err := call("authenticate", authenticateParams{MethodID: methodID, Meta: map[string]bool{"headless": true}}); err != nil {
 		if isRPCError(err) {
 			return finishFailure(result, ErrAuthFailed, err)
@@ -695,6 +709,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	// does not establish that the cache can serve a completed session.
 	cachedTokenAuthenticated = true
 
+	failureStage = "session_new"
 	newRaw, err := call("session/new", sessionNewParams{CWD: req.CWD, MCPServers: mcpServers})
 	if err != nil {
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
@@ -713,6 +728,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 
 	promptID := nextID
 	nextID++
+	failureStage = "prompt_write"
 	promptMayHaveBeenAccepted, err = writeRequestWithEvidence(ctx, proc.Stdin(), promptID, "session/prompt", sessionPromptParams{
 		SessionID: session.SessionID,
 		Prompt:    []promptPart{{Type: "text", Text: req.Prompt}},
@@ -721,6 +737,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
 	}
 	invokeAfterPromptWritten(req.AfterPromptWritten)
+	failureStage = "prompt_response"
 	promptRaw, cancellation, err := waitPromptResponseOrCancellation(
 		ctx,
 		proc.Stdin(),
@@ -742,6 +759,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	if err := json.Unmarshal(promptRaw, &prompt); err != nil {
 		return finishFailure(result, ErrProtocol, fmt.Errorf("decode session/prompt result: %w", err))
 	}
+	failureStage = "completion_metadata"
 	promptModel, resolvedModel, usage, err := prompt.completionMetadata()
 	if err != nil {
 		return finishFailure(result, ErrProtocol, err)
@@ -796,16 +814,19 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	if strings.TrimSpace(prompt.StopReason) == "" {
 		return finishFailure(result, ErrOutcomeUnknown, errors.New("session/prompt completion omitted stopReason"))
 	}
+	failureStage = "post_response_updates"
 	if err := drainPostResponseUpdates(ctx, events, &updates, postResponseQuietWindow(req.PostResponseQuietWindow)); err != nil {
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
 	}
 	result.CompletionConfirmed = true
 	applyUpdateReceipt(&result, &updates, outputHasher)
 	if req.ExpectedNonce != "" && !result.AcknowledgementVerified {
+		failureStage = "completion_validation"
 		return finishFailure(result, ErrAcknowledgementUnconfirmed, errors.New("session/prompt completion omitted the required standalone nonce acknowledgement"))
 	}
 	result.Success = true
 	result.State = StateCompleted
+	result.FailureStage = ""
 	if cachedTokenAuthenticated {
 		result.Authenticated = true
 		result.AuthenticationEvidence = "cached_token_authenticate_plus_completed_session"

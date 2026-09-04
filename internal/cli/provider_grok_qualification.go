@@ -805,7 +805,15 @@ func providerGrokLineageWorkspaceRemoved(workspace providerGrokLineageWorkspace)
 func grokQualificationModelDetail(result grok.Result, runErr error, expectedPublicModel, expectedResolvedModel string) string {
 	switch {
 	case runErr != nil:
-		return "provider_run_failed"
+		exit := "none"
+		if result.ExitCode != nil {
+			exit = fmt.Sprint(*result.ExitCode)
+		}
+		stage := strings.TrimSpace(result.FailureStage)
+		if stage == "" {
+			stage = "unknown"
+		}
+		return fmt.Sprintf("provider_run_failed:%s:stage=%s:exit=%s:stderr_bytes=%d:stderr_sha256=%s", result.FailureCode, stage, exit, result.Stderr.Bytes, result.Stderr.SHA256)
 	case !result.Success || !result.CompletionConfirmed:
 		return "terminal_completion_unverified"
 	case !result.AcknowledgementVerified:
