@@ -2,6 +2,8 @@ package config
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -799,9 +801,9 @@ type ProviderProfileConfig struct {
 	// ModelProbeReceiptSHA256 identifies a separately reviewed historical
 	// diagnostic receipt. Production Z.ai spawn always performs a fresh probe.
 	ModelProbeReceiptSHA256 string `toml:"model_probe_receipt_sha256"`
-	// RuntimeHome is the dedicated, provider-owned CODEX_HOME for the Z.ai
-	// Coding Plan Codex runtime. It is a local path, never a credential, and
-	// its reviewed contents are bound by ConfigSHA256.
+	// RuntimeHome is the dedicated provider-owned state root: CODEX_HOME for
+	// Z.ai/Codex and GROK_HOME for xAI/Grok. It is a local path, never a
+	// credential, and its reviewed contents are bound by ConfigSHA256.
 	RuntimeHome string `toml:"runtime_home"`
 	// BrokerCredentialID is an opaque, separately provisioned current-user OS
 	// broker key for the Z.ai Coding Plan Codex Responses lane. It is never an
@@ -821,8 +823,142 @@ func (p ProviderProfileConfig) Identity() (provider.Identity, error) {
 	if p.CredentialClass == "" && p.BillingClass == "" && p.Entitlement == "" {
 		return provider.NewIdentity(p.Provider, p.AccountAlias, p.Model, p.Endpoint, p.Runtime, p.ConfigSHA256)
 	}
+	if p.Provider == "zai" && p.Runtime == "codex" && p.CredentialClass == provider.CredentialClassCodingPlan && p.BillingClass == provider.BillingClassCodingPlan && p.Entitlement == provider.EntitlementCodexResponses {
+		if _, err := canonicalCAAMZaiCodexAccountAlias(p.AccountAlias); err != nil {
+			return provider.Identity{}, err
+		}
+		return provider.NewIdentityWithAuthorizationAndBridge(p.Provider, p.AccountAlias, p.Model, p.Endpoint, p.Runtime,
+			p.CredentialClass, p.BillingClass, p.Entitlement, p.CredentialBridgeCommand, p.CredentialBridgeCommandSHA256, p.ConfigSHA256)
+	}
 	return provider.NewIdentityWithAuthorization(p.Provider, p.AccountAlias, p.Model, p.Endpoint, p.Runtime,
 		p.CredentialClass, p.BillingClass, p.Entitlement, p.ConfigSHA256)
+}
+
+const providerProfileManifestVersion = "ntm.provider-profile-manifest.v1"
+
+// canonicalCAAMZaiCodexAccountAlias is shared by the CAAM-compatible
+// manifest, subscription scope, and bridge-bound identity projection. CAAM v2
+// hashes the account alias as supplied; accepting mixed case here while NTM
+// silently lowercases its general identity fields would make the two contracts
+// disagree. Governed profiles therefore require the exact trimmed lowercase
+// representation rather than coalescing aliases.
+func canonicalCAAMZaiCodexAccountAlias(value string) (string, error) {
+	canonical := strings.TrimSpace(value)
+	if canonical == "" || canonical != value || canonical != strings.ToLower(canonical) {
+		return "", errors.New("Z.ai Codex account_alias must be trimmed lowercase canonical")
+	}
+	return canonical, nil
+}
+
+// CanonicalManifestSHA256 is the non-secret, deterministic configuration
+// binding consumed by governed provider paths. It deliberately includes every
+// field that can alter provider identity, executable selection, credential
+// broker selection, policy, or runtime state, while excluding ConfigSHA256
+// itself to avoid recursive hashing. Field labels and NUL separators make the
+// format unambiguous and versioned for future migrations.
+func (p ProviderProfileConfig) CanonicalManifestSHA256() string {
+	fields := []string{
+		providerProfileManifestVersion,
+		"provider", p.Provider,
+		"account_alias", p.AccountAlias,
+		"model", p.Model,
+		"endpoint", p.Endpoint,
+		"runtime", p.Runtime,
+		"runtime_version", p.RuntimeVersion,
+		"credential_class", p.CredentialClass,
+		"billing_class", p.BillingClass,
+		"entitlement", p.Entitlement,
+		"command", p.Command,
+		"runtime_sha256", p.RuntimeSHA256,
+		"broker_command", p.BrokerCommand,
+		"broker_command_sha256", p.BrokerCommandSHA256,
+		"credential_bridge_command", p.CredentialBridgeCommand,
+		"credential_bridge_command_sha256", p.CredentialBridgeCommandSHA256,
+		"automation_policy", p.AutomationPolicy,
+		"exact_target_only", strconv.FormatBool(p.ExactTargetOnly),
+		"probe_required", strconv.FormatBool(p.ProbeRequired),
+		"runtime_home", p.RuntimeHome,
+		"broker_credential_id", p.BrokerCredentialID,
+	}
+	sum := sha256.Sum256([]byte(strings.Join(fields, "\x00")))
+	return hex.EncodeToString(sum[:])
+}
+
+// CAAMCompatibleManifestSHA256 is the CAAM v2 Z.ai Codex profile projection.
+// It is deliberately byte-for-byte compatible with CAAM's
+// zaiCodexManifestDigest: the exact metadata field order, NUL delimiters,
+// normalization, and private file bytes are part of the preimage. The return
+// value is separate because non-CAAM provider profiles have no corresponding
+// private Codex files.
+func (p ProviderProfileConfig) CAAMCompatibleManifestSHA256() (string, error) {
+	if p.Provider != "zai" || p.Runtime != "codex" || p.CredentialClass != provider.CredentialClassCodingPlan || p.BillingClass != provider.BillingClassCodingPlan || p.Entitlement != provider.EntitlementCodexResponses {
+		return "", errors.New("CAAM manifest projection requires a Z.ai Coding Plan Codex profile")
+	}
+	runtimeHome := filepath.Clean(strings.TrimSpace(p.RuntimeHome))
+	if filepath.Base(runtimeHome) != ".codex" || !filepath.IsAbs(runtimeHome) {
+		return "", errors.New("Z.ai Codex runtime_home must be the absolute private .codex directory")
+	}
+	endpoint := strings.TrimRight(strings.TrimSpace(p.Endpoint), "/")
+	accountAlias, err := canonicalCAAMZaiCodexAccountAlias(p.AccountAlias)
+	if err != nil {
+		return "", err
+	}
+	bridgePath := strings.TrimSpace(p.CredentialBridgeCommand)
+	bridgeSHA := strings.ToLower(strings.TrimSpace(p.CredentialBridgeCommandSHA256))
+	capacityFields := []string{"zai", accountAlias, endpoint, "coding_plan", "coding_plan", "codex_responses"}
+	capacity := sha256.New()
+	for _, field := range capacityFields {
+		_, _ = capacity.Write([]byte(field))
+		_, _ = capacity.Write([]byte{0})
+	}
+	fields := []string{
+		"caam.zai-codex.manifest.v2", "zai-codex", "caam.zai-codex.v2", "zai",
+		accountAlias, "coding_plan", "coding_plan", "codex_responses",
+		"codex", endpoint, strings.TrimSpace(p.Model), strings.TrimSpace(p.BrokerCredentialID),
+		"subscription:" + hex.EncodeToString(capacity.Sum(nil)), "host-local-metadata-only", bridgePath, bridgeSHA,
+	}
+	h := sha256.New()
+	for _, field := range fields {
+		_, _ = h.Write([]byte(field))
+		_, _ = h.Write([]byte{0})
+	}
+	for _, name := range []string{"config.toml", "models.json", "zai-codex.json"} {
+		path := filepath.Join(runtimeHome, name)
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+			return "", fmt.Errorf("Z.ai Codex manifest file %s is not a private regular file", name)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read Z.ai Codex manifest file %s: %w", name, err)
+		}
+		_, _ = h.Write([]byte(name))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write(data)
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// VerifyCanonicalManifest rejects a hand-entered configuration digest when it
+// no longer describes the profile that will be signed or launched. This is
+// intentionally called only by governed Grok/Codex paths; legacy pane profiles
+// remain parseable but cannot borrow that authority.
+func (p ProviderProfileConfig) VerifyCanonicalManifest() error {
+	if !validProviderSHA256(p.ConfigSHA256) {
+		return errors.New("provider profile config_sha256 is invalid")
+	}
+	if p.Provider == "zai" && p.Runtime == "codex" && p.CredentialClass == provider.CredentialClassCodingPlan && p.BillingClass == provider.BillingClassCodingPlan && p.Entitlement == provider.EntitlementCodexResponses {
+		observed, err := p.CAAMCompatibleManifestSHA256()
+		if err != nil || p.ConfigSHA256 != observed {
+			return errors.New("provider profile config_sha256 does not match the CAAM v2 Z.ai Codex manifest")
+		}
+		return nil
+	}
+	if p.ConfigSHA256 != p.CanonicalManifestSHA256() {
+		return errors.New("provider profile config_sha256 does not match canonical ntm.provider-profile-manifest.v1")
+	}
+	return nil
 }
 
 // ValidateProviderProfiles validates every profile independently so callers
@@ -875,6 +1011,18 @@ func validateProviderProfile(name string, profile ProviderProfileConfig) []error
 		}
 		if !profile.ExactTargetOnly {
 			errs = append(errs, fmt.Errorf("provider_profiles.%s Grok ACP profiles must set exact_target_only = true", target))
+		}
+		if !filepath.IsAbs(profile.RuntimeHome) || containsControlCharacter(profile.RuntimeHome) {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Grok profiles require an absolute runtime_home dedicated to GROK_HOME", target))
+		}
+		// Every Grok receipt path is signed through the exact bridge named by
+		// this profile.  Ambient bridge selection would allow a doctor or
+		// dispatch gate to compare receipts against a different local key.
+		if !filepath.IsAbs(profile.CredentialBridgeCommand) || containsControlCharacter(profile.CredentialBridgeCommand) {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Grok profiles require an absolute credential_bridge_command", target))
+		}
+		if !validProviderSHA256(profile.CredentialBridgeCommandSHA256) {
+			errs = append(errs, fmt.Errorf("provider_profiles.%s Grok profiles require credential_bridge_command_sha256", target))
 		}
 	}
 	if providerName == "zai" {

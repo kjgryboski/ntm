@@ -11,6 +11,7 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
+	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 )
 
@@ -27,14 +28,19 @@ type GrokACPOperationLedger interface {
 	GetSendOperation(operationID, sessionName string) (*state.SendOperation, error)
 }
 
-func grokACPBindingHash(identity provider.Identity, logicalPromptHash, cwd, binary, policyHash string) string {
+func grokACPBindingHash(identity provider.Identity, logicalPromptHash, cwd, binary, runtimeHome, runtimeVersion, policyHash, brokerHash string, operationScope GrokACPOperationScope, qualificationReceiptSHA256 string) string {
 	fields := []string{
-		"ntm.grok-acp.binding.v1",
+		"ntm.grok-acp.binding.v5",
 		identity.Hash(),
 		logicalPromptHash,
 		sha256String(strings.TrimSpace(cwd)),
 		sha256String(strings.TrimSpace(binary)),
+		sha256String(strings.TrimSpace(runtimeHome)),
+		strings.TrimSpace(runtimeVersion),
 		policyHash,
+		brokerHash,
+		string(operationScope),
+		qualificationReceiptSHA256,
 	}
 	return sha256String(strings.Join(fields, "\x00"))
 }
@@ -76,7 +82,7 @@ func claimGrokACPOperation(ledger GrokACPOperationLedger, operationID, bindingHa
 	})
 }
 
-func applyStoredGrokACPOutcome(output *GrokACPOperationOutput, stored *state.SendOperation) error {
+func applyStoredGrokACPOutcome(output *GrokACPOperationOutput, stored *state.SendOperation, trustedSigner providerattestation.KeyMetadata) error {
 	if output == nil || stored == nil || stored.Status != state.SendOperationCompleted || strings.TrimSpace(stored.OutcomeJSON) == "" {
 		return errors.New("durable Grok ACP outcome is unavailable")
 	}
@@ -84,9 +90,13 @@ func applyStoredGrokACPOutcome(output *GrokACPOperationOutput, stored *state.Sen
 	if err := json.Unmarshal([]byte(stored.OutcomeJSON), &replay); err != nil {
 		return fmt.Errorf("decode durable Grok ACP outcome: %w", err)
 	}
+	if trustedSigner.KeyID != "" && !validGrokACPOperationOutput(replay, trustedSigner) {
+		return errors.New("durable Grok ACP outcome signature is invalid")
+	}
 	if replay.OperationID != output.OperationID || replay.BindingSHA256 != output.BindingSHA256 || replay.BindingSHA256 != stored.BindingHash ||
 		replay.Provider != grokACPProvider || replay.Transport != grokACPTransport || replay.Target != grokACPTarget ||
-		replay.ProviderIdentitySHA256 != output.ProviderIdentitySHA256 || replay.ToolDigest != output.ToolDigest || replay.ReceiptState != "completed" {
+		replay.ProviderIdentitySHA256 != output.ProviderIdentitySHA256 || replay.ToolDigest != output.ToolDigest || replay.BrokerSHA256 != output.BrokerSHA256 ||
+		replay.OperationScope != output.OperationScope || replay.QualificationReceiptSHA256 != output.QualificationReceiptSHA256 || replay.ReceiptState != "completed" {
 		return errors.New("durable Grok ACP outcome does not match its operation binding")
 	}
 	*output = replay
@@ -169,12 +179,20 @@ func GetGrokACPOperationReceipt(operationID string, ledger GrokACPOperationLedge
 	if err := json.Unmarshal([]byte(stored.OutcomeJSON), &output); err != nil {
 		return nil, fmt.Errorf("decode durable Grok ACP receipt: %w", err)
 	}
-	if output.OperationID != operationID || output.BindingSHA256 != stored.BindingHash || output.Provider != grokACPProvider || output.Transport != grokACPTransport || output.Target != grokACPTarget || output.ReceiptState != "completed" {
+	if output.OperationID != operationID || output.BindingSHA256 != stored.BindingHash || output.Provider != grokACPProvider || output.Transport != grokACPTransport || output.Target != grokACPTarget || output.ReceiptState != "completed" ||
+		!validGrokACPOperationScopeForReceipt(output.OperationScope, output.QualificationReceiptSHA256) {
 		return nil, errors.New("durable Grok ACP receipt does not match its operation binding")
 	}
 	output.ReceiptState = "queried"
 	output.Replayed = false
 	return &output, nil
+}
+
+func validGrokACPOperationScopeForReceipt(scope GrokACPOperationScope, qualificationReceiptSHA256 string) bool {
+	if scope == GrokACPOperationScopeObserve {
+		return qualificationReceiptSHA256 == ""
+	}
+	return (scope == GrokACPOperationScopeReview || scope == GrokACPOperationScopeWorkspaceWrite) && validGrokACPQualificationReceiptSHA256(qualificationReceiptSHA256)
 }
 
 func PrintGrokACPOperationReceipt(operationID string) error {

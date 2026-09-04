@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 )
 
@@ -109,10 +111,34 @@ func codexSuccessEvents(t *testing.T, session, model, nonce string) []byte {
 	return codexJSONL(t,
 		map[string]any{"type": "thread.started", "thread_id": session},
 		map[string]any{"type": "turn.started"},
+		map[string]any{"type": "item.started", "item": map[string]any{"id": "tool-1", "type": "command_execution"}},
 		map[string]any{"type": "item.completed", "item": map[string]any{"id": "tool-1", "type": "command_execution", "aggregated_output": nonce, "exit_code": 0, "status": "completed"}},
 		map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": nonce}},
 		map[string]any{"type": "turn.completed", "server_model": model, "usage": map[string]any{"input_tokens": 10, "cached_input_tokens": 2, "output_tokens": 3, "total_tokens": 13}},
 	)
+}
+
+func TestCodexRuntimeEventsPreserveCompletionBeforeRequest(t *testing.T) {
+	raw := codexJSONL(t,
+		map[string]any{"type": "thread.started", "thread_id": codexTestSession},
+		map[string]any{"type": "turn.started"},
+		map[string]any{"type": "item.completed", "item": map[string]any{"id": "tool-1", "type": "command_execution", "exit_code": 0, "status": "completed"}},
+		map[string]any{"type": "item.started", "item": map[string]any{"id": "tool-1", "type": "command_execution"}},
+		map[string]any{"type": "item.completed", "item": map[string]any{"id": "message-1", "type": "agent_message", "text": "nonce"}},
+		map[string]any{"type": "turn.completed", "server_model": "glm-5.3", "usage": map[string]any{"input_tokens": 1, "output_tokens": 1}},
+	)
+	parsed, err := parseCodexEvents(raw, "nonce", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.runtimeToolEvents) != 2 || parsed.runtimeToolEvents[0].Type != provider.EventToolCompleted || parsed.runtimeToolEvents[1].Type != provider.EventToolRequested {
+		t.Fatalf("tool order was normalized instead of preserved: %+v", parsed.runtimeToolEvents)
+	}
+	receipt := newCodexRunReceipt(CodexRunSpec{RequestedModel: "glm-5.3", WorkspaceWrite: true})
+	applyCodexParsed(&receipt, parsed, CodexRunSpec{RequestedModel: "glm-5.3", WorkspaceWrite: true})
+	if receipt.RuntimeEventContract.Passed || !slices.Contains(receipt.RuntimeEventContract.Violations, "tool_completed has no matching request") {
+		t.Fatalf("completion-before-request stream passed: %+v", receipt.RuntimeEventContract)
+	}
 }
 
 func TestRunCodexStructuredBindsOnlyFinalAgentNonce(t *testing.T) {
@@ -579,5 +605,22 @@ func TestParseCodexEventsRejectsMalformedAndGenericModelOnlyEvidence(t *testing.
 	)
 	if _, err := parseCodexEvents(raw, "nonce", "", false); err == nil {
 		t.Fatal("generic model fields were accepted as provider evidence")
+	}
+}
+
+func TestParseCodexEventsPreservesStructuredProviderErrorEvidence(t *testing.T) {
+	raw := codexJSONL(t,
+		map[string]any{"type": "thread.started", "thread_id": codexTestSession},
+		map[string]any{"type": "turn.started"},
+		map[string]any{"type": "turn.failed", "http_status": 429, "error": map[string]any{"code": "1308", "message": "quota text is intentionally ignored"}},
+	)
+	parsed, err := parseCodexEvents(raw, "nonce", "", false)
+	if err == nil || parsed.providerHTTPStatus != 429 || parsed.providerErrorCode != "1308" {
+		t.Fatalf("parsed=%+v err=%v", parsed, err)
+	}
+	receipt := newCodexRunReceipt(codexFixtureSpec(t, &codexRunnerFixture{}))
+	applyCodexParsed(&receipt, parsed, codexFixtureSpec(t, &codexRunnerFixture{}))
+	if receipt.ProviderErrorClass != provider.ErrorLongPeriodQuota {
+		t.Fatalf("provider error class=%q", receipt.ProviderErrorClass)
 	}
 }

@@ -202,6 +202,7 @@ func runProviderCodexCapacityRecovery(cmd *cobra.Command, opts providerCodexCapa
 		IdentitySHA256:     identity.Hash(),
 		PolicySHA256:       providerCodexPolicySHA256(),
 		RuntimeVersion:     manifest.RuntimeVersion,
+		RuntimeSHA256:      manifest.BinarySHA256,
 		StartedAt:          original.CreatedAt.UTC(),
 		CompletedAt:        deps.now().UTC(),
 		DisposableRepoHash: sha256StringCLI(strings.Join([]string{"codex-capacity-recovery-anchor-v1", evidence.RolloutSHA256, original.BindingHash, original.PayloadSHA256}, "\x00")),

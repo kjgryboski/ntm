@@ -50,6 +50,7 @@ type providerCodexSubscriptionAdmissionFake struct {
 	unknownErr           error
 	canceledReservations int
 	cancelErr            error
+	results              []ratelimit.ErrorClass
 }
 
 type providerCodexUsageReconciliation struct {
@@ -99,6 +100,11 @@ func (f *providerCodexSubscriptionAdmissionFake) CancelReservation(provider.Iden
 	return f.cancelErr
 }
 
+func (f *providerCodexSubscriptionAdmissionFake) RecordResult(_ provider.Identity, class ratelimit.ErrorClass, _ time.Duration) ratelimit.Decision {
+	f.results = append(f.results, class)
+	return ratelimit.Decision{Reason: class, NoFailover: true}
+}
+
 func (f *providerCodexSubscriptionAdmissionFake) RecordSuccess(provider.Identity) { f.successes++ }
 
 func (f *providerCodexSubscriptionAdmissionFake) CapacityStatus() ratelimit.CapacityStatus {
@@ -119,7 +125,10 @@ func providerCodexTestDeps(profile config.ProviderProfileConfig, admission *prov
 		newNonce:         func() (string, error) { return "NTM_ACK_0123456789abcdef0123456789abcdef", nil },
 		isLinkedWorktree: func(context.Context, string) (bool, error) { return true, nil },
 		sign:             newProviderNativeTestSigner(),
-		admission:        admission,
+		authorizeOperation: func(providerOperationAuthorization) (string, error) {
+			return strings.Repeat("9", 64), nil
+		},
+		admission: admission,
 		openLedger: func() (providerNativeOperationLedger, func() error, error) {
 			return ledger, func() error { return nil }, nil
 		},
@@ -134,7 +143,7 @@ func successfulProviderCodexReceipt(spec zai.CodexRunSpec) zai.CodexRunReceipt {
 		action = "resume"
 		parent = sha256StringCLI(strings.TrimSpace(spec.ParentSession))
 	}
-	return zai.CodexRunReceipt{
+	receipt := zai.CodexRunReceipt{
 		AdapterVersion: zai.CodexRuntimeAdapterVersion, Action: action, RequestedModel: spec.RequestedModel,
 		ResolvedModel: spec.RequestedModel, ModelEvidence: "turn.completed.server_model", ConfigSHA256: spec.ConfigSHA256,
 		BinarySHA256: spec.BinarySHA256, BrokerCommandSHA256: spec.BrokerCommandSHA256, CredentialBridgeSHA256: spec.CredentialBridgeCommandSHA256,
@@ -147,6 +156,23 @@ func successfulProviderCodexReceipt(spec zai.CodexRunSpec) zai.CodexRunReceipt {
 		Usage:     zai.CodexUsage{InputTokens: 100, CachedInputTokens: 10, OutputTokens: 20},
 		StartedAt: time.Unix(1, 0).UTC(), CompletedAt: time.Unix(2, 0).UTC(),
 	}
+	refreshProviderCodexRuntimeContract(&receipt, spec)
+	return receipt
+}
+
+func refreshProviderCodexRuntimeContract(receipt *zai.CodexRunReceipt, spec zai.CodexRunSpec) {
+	if receipt == nil {
+		return
+	}
+	receipt.RuntimeEventRequirements = provider.RuntimeEventRequirements{ToolLifecycle: spec.WorkspaceWrite}
+	receipt.RuntimeEvents = provider.NormalizeTerminalRuntimeObservation(provider.TerminalRuntimeObservation{
+		SessionRef: receipt.SessionIDSHA256, Model: receipt.ResolvedModel, Accepted: true,
+		ToolRequests: receipt.ToolEventCount, ToolCompletions: receipt.ToolEventCount,
+		Completed: true, UsageObserved: true,
+		InputTokens: receipt.Usage.InputTokens + receipt.Usage.CachedInputTokens, OutputTokens: receipt.Usage.OutputTokens,
+		CleanupObserved: true,
+	})
+	receipt.RuntimeEventContract = provider.ValidateRuntimeEventsForModel(spec.RequestedModel, receipt.RuntimeEvents, receipt.RuntimeEventRequirements)
 }
 
 func TestProviderCodexRunRequiresLiveOptIn(t *testing.T) {
@@ -161,6 +187,30 @@ func TestProviderCodexRunRequiresLiveOptIn(t *testing.T) {
 	err := runProviderCodex(&cobra.Command{}, providerCodexRunOptions{profile: "zai-codex", prompt: "p", cwd: root, operationID: "codex-1"}, deps)
 	if err == nil || called || admission.acquires != 0 {
 		t.Fatalf("err=%v called=%t admission=%+v", err, called, admission)
+	}
+}
+
+func TestProviderCodexRunOperationGateBlocksBeforeDispatch(t *testing.T) {
+	root := t.TempDir()
+	admission := &providerCodexSubscriptionAdmissionFake{status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	deps := providerCodexTestDeps(providerCodexProfile(root), admission, &providerNativeLedgerFake{})
+	providerCalled := false
+	deps.authorizeOperation = func(input providerOperationAuthorization) (string, error) {
+		if input.Operation != providerOperationWorkspaceWrite {
+			t.Fatalf("operation = %q", input.Operation)
+		}
+		return "", errors.New("qualification missing")
+	}
+	deps.run = func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		providerCalled = true
+		return zai.CodexRunReceipt{}, nil
+	}
+	err := runProviderCodex(&cobra.Command{}, providerCodexRunOptions{
+		profile: "zai-codex", prompt: "bounded edit", cwd: root, operationID: "codex-gate", live: true,
+		workspaceWrite: true, timeout: time.Minute,
+	}, deps)
+	if err == nil || !strings.Contains(err.Error(), "operation gate denied") || providerCalled || admission.acquires != 0 {
+		t.Fatalf("err=%v called=%t admission=%+v", err, providerCalled, admission)
 	}
 }
 

@@ -2,6 +2,8 @@ package config
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -13,6 +15,56 @@ import (
 )
 
 const providerProfileTestHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+func TestCAAMCompatibleZaiCodexManifestBindsPrivateFilesAndBridge(t *testing.T) {
+	root := t.TempDir()
+	runtimeHome := filepath.Join(root, ".codex")
+	if err := os.MkdirAll(runtimeHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]string{"config.toml": "model=\"glm-5.3\"\n", "models.json": "{}\n", "zai-codex.json": "{}\n"} {
+		if err := os.WriteFile(filepath.Join(runtimeHome, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	profile := validZAIProviderProfile()
+	profile.Model, profile.Endpoint, profile.Runtime, profile.Command = "glm-5.3", zai.OfficialCodexEndpoint, "codex", "/usr/bin/codex"
+	profile.Entitlement, profile.AutomationPolicy, profile.RuntimeHome = provider.EntitlementCodexResponses, provider.DefaultZAICodexAutomationPolicyName, runtimeHome
+	profile.BrokerCredentialID = "ntm.zai.coding_plan.kevin"
+	profile.RuntimeSHA256, profile.BrokerCommand, profile.BrokerCommandSHA256 = providerProfileTestHash, "/usr/bin/caam", providerProfileTestHash
+	profile.CredentialBridgeCommand, profile.CredentialBridgeCommandSHA256 = "/usr/local/libexec/ntm/ntm-provider-bridge", providerProfileTestHash
+	profile.RuntimeVersion = "0.149.0"
+	digest, err := profile.CAAMCompatibleManifestSHA256()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile.ConfigSHA256 = digest
+	if err := profile.VerifyCanonicalManifest(); err != nil {
+		t.Fatalf("matching CAAM manifest was rejected: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(runtimeHome, "models.json"), []byte("{\"changed\":true}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := profile.VerifyCanonicalManifest(); err == nil {
+		t.Fatal("changed private Codex file retained manifest authority")
+	}
+}
+
+func TestCAAMCompatibleZaiCodexRejectsNoncanonicalAccountAlias(t *testing.T) {
+	profile := validZAIProviderProfile()
+	profile.AccountAlias = "Kevin-Dev"
+	profile.Model, profile.Endpoint, profile.Runtime = "glm-5.3", zai.OfficialCodexEndpoint, "codex"
+	profile.Entitlement = provider.EntitlementCodexResponses
+	profile.RuntimeHome = "/tmp/zai-codex/.codex"
+	profile.CredentialBridgeCommand = "/usr/local/libexec/ntm/ntm-provider-bridge"
+	profile.CredentialBridgeCommandSHA256 = providerProfileTestHash
+	if _, err := profile.CAAMCompatibleManifestSHA256(); err == nil {
+		t.Fatal("mixed-case Z.ai Codex account alias retained CAAM manifest authority")
+	}
+	if _, err := profile.Identity(); err == nil {
+		t.Fatal("mixed-case Z.ai Codex account alias retained NTM identity authority")
+	}
+}
 
 func validZAIProviderProfile() ProviderProfileConfig {
 	return ProviderProfileConfig{
@@ -249,6 +301,7 @@ func TestValidateProviderProfilesRejectsACPCommandArgumentsAndWrongPolicy(t *tes
 		Runtime:          "grok",
 		ConfigSHA256:     providerProfileTestHash,
 		Command:          "grok --no-auto-update",
+		RuntimeHome:      "/home/kevin/orch-homes/grok-primary/.grok",
 		AutomationPolicy: "always-approve",
 		ExactTargetOnly:  true,
 	}
@@ -262,18 +315,35 @@ func TestValidateProviderProfilesRejectsACPCommandArgumentsAndWrongPolicy(t *tes
 
 func TestValidateProviderProfilesAllowsAbsoluteACPExecutablePathWithSpaces(t *testing.T) {
 	profile := ProviderProfileConfig{
-		Provider:         "xai",
-		AccountAlias:     "kevin-dev",
-		Model:            "grok-code-fast-1",
-		Endpoint:         "https://api.x.ai",
-		Runtime:          "grok",
-		ConfigSHA256:     providerProfileTestHash,
-		Command:          "/opt/Grok CLI/grok",
-		AutomationPolicy: agent.DefaultGrokAutomationPolicyName,
-		ExactTargetOnly:  true,
+		Provider:                      "xai",
+		AccountAlias:                  "kevin-dev",
+		Model:                         "grok-code-fast-1",
+		Endpoint:                      "https://api.x.ai",
+		Runtime:                       "grok",
+		ConfigSHA256:                  providerProfileTestHash,
+		Command:                       "/opt/Grok CLI/grok",
+		RuntimeHome:                   "/home/kevin/orch-homes/grok-primary/.grok",
+		CredentialBridgeCommand:       "/usr/local/libexec/ntm/ntm-provider-bridge.exe",
+		CredentialBridgeCommandSHA256: providerProfileTestHash,
+		AutomationPolicy:              agent.DefaultGrokAutomationPolicyName,
+		ExactTargetOnly:               true,
 	}
 	if errs := ValidateProviderProfiles(map[string]ProviderProfileConfig{"xai-grok-primary": profile}); len(errs) != 0 {
 		t.Fatalf("ValidateProviderProfiles() errors = %v", errs)
+	}
+}
+
+func TestValidateProviderProfilesRejectsUnpinnedGrokSigningBridge(t *testing.T) {
+	profile := ProviderProfileConfig{
+		Provider: "xai", AccountAlias: "kevin-dev", Model: "grok-code-fast-1", Endpoint: "https://api.x.ai", Runtime: "grok",
+		ConfigSHA256: providerProfileTestHash, Command: "/usr/local/libexec/ntm/grok", RuntimeHome: "/home/kevin/orch-homes/grok-primary/.grok",
+		AutomationPolicy: agent.DefaultGrokAutomationPolicyName, ExactTargetOnly: true,
+	}
+	joined := errorsString(ValidateProviderProfiles(map[string]ProviderProfileConfig{"xai-grok-primary": profile}))
+	for _, want := range []string{"credential_bridge_command", "credential_bridge_command_sha256"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("Grok bridge pin validation missing %q: %s", want, joined)
+		}
 	}
 }
 

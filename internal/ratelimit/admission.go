@@ -287,6 +287,21 @@ func (c *SubscriptionAdmissionController) RecordSuccess(identity provider.Identi
 	c.plan.recordSuccessScope(identity.SubscriptionCapacityScope())
 }
 
+// RecordResult applies an exact structured provider classification to both the
+// identity and its shared subscription scope. This is not a routing decision:
+// callers remain pinned to the exact provider/account/entitlement identity.
+func (c *SubscriptionAdmissionController) RecordResult(identity provider.Identity, class ErrorClass, retryAfter time.Duration) Decision {
+	if c == nil || c.exact == nil || c.plan == nil || !validIdentity(identity) || identity.SubscriptionCapacityScope() == "" {
+		return Decision{Reason: ErrorIdentityMismatch, NoFailover: true}
+	}
+	exact := c.exact.RecordResult(identity, class, retryAfter)
+	plan := c.plan.recordResultScope(identity.SubscriptionCapacityScope(), class, retryAfter)
+	if plan.RetryAt != nil || plan.Reason != "" {
+		return plan
+	}
+	return exact
+}
+
 // BindReservation attaches controller-owned operation and nonce digests
 // before provider dispatch. Future recovery can then require an exact link
 // instead of relying on a legacy timestamp coincidence.
@@ -992,7 +1007,13 @@ func (c *AdmissionController) RecordResult(identity provider.Identity, class Err
 	if !validIdentity(identity) {
 		return Decision{Reason: ErrorIdentityMismatch, NoFailover: true}
 	}
-	scope := identity.CapacityScope()
+	return c.recordResultScope(identity.CapacityScope(), class, retryAfter)
+}
+
+func (c *AdmissionController) recordResultScope(scope provider.CapacityScope, class ErrorClass, retryAfter time.Duration) Decision {
+	if c == nil || scope == "" {
+		return Decision{Reason: ErrorIdentityMismatch, NoFailover: true}
+	}
 	now := c.now()
 	var decision Decision
 	c.withState(scope, now, func(state *admissionState) {

@@ -10,11 +10,14 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Dicklesworthstone/ntm/internal/provider"
 )
 
 func TestValidateBridgePayloadAllowsOnlyNamedReceiptSchemas(t *testing.T) {
@@ -29,7 +32,7 @@ func TestValidateBridgePayloadAllowsOnlyNamedReceiptSchemas(t *testing.T) {
 			t.Fatalf("payload %q rejected: %v", payload, err)
 		}
 	}
-	for _, payload := range [][]byte{nil, []byte(`{"schema_version":"other"}`), []byte(`{"schema_version":"ntm.provider-session.v2"}`), []byte(`{"schema_version":"ntm.provider-session.v2"}{}`), []byte("not json")} {
+	for _, payload := range [][]byte{nil, []byte("ntm.provider-receipt-attestation-preflight.v1"), []byte(`{"schema_version":"other"}`), []byte(`{"schema_version":"ntm.provider-session.v2"}`), []byte(`{"schema_version":"ntm.provider-session.v2"}{}`), []byte("not json")} {
 		if err := ValidateBridgePayload(payload); !errors.Is(err, ErrBridgePayloadDenied) {
 			t.Fatalf("payload %q error=%v", payload, err)
 		}
@@ -40,6 +43,36 @@ func TestValidateBridgePayloadAcceptsObservedProcessTreeQualificationEvidence(t 
 	payload := bytes.Replace(validBridgeQualificationPayload(), []byte(`"provenance":"live"`), []byte(`"provenance":"local_observed_process_tree"`), 1)
 	if err := ValidateBridgePayload(payload); err != nil {
 		t.Fatalf("observed-process-tree qualification evidence rejected: %v", err)
+	}
+}
+
+func TestValidateBridgePayloadRequiresRuntimeDigestForBinaryQualification(t *testing.T) {
+	for _, transport := range []string{
+		"zai_codex_runtime",
+		"zai_codex_identity_preflight",
+		"xai_acp",
+		"xai_headless_session",
+	} {
+		t.Run(transport, func(t *testing.T) {
+			payload := bytes.Replace(
+				validBridgeQualificationPayload(),
+				[]byte(`"transport":"zai_native_api"`),
+				[]byte(`"transport":"`+transport+`"`),
+				1,
+			)
+			if err := ValidateBridgePayload(payload); !errors.Is(err, ErrBridgePayloadDenied) {
+				t.Fatalf("binary qualification without runtime digest error=%v", err)
+			}
+			payload = bytes.Replace(
+				payload,
+				[]byte(`"runtime_version":"zai-native-http-v1"`),
+				[]byte(`"runtime_version":"0.153.0","runtime_sha256":"`+bridgeTestDigest+`"`),
+				1,
+			)
+			if err := ValidateBridgePayload(payload); err != nil {
+				t.Fatalf("binary qualification with runtime digest rejected: %v", err)
+			}
+		})
 	}
 }
 
@@ -60,6 +93,39 @@ func TestValidateBridgePayloadRejectsCodexRawOrUnboundFields(t *testing.T) {
 		if err := ValidateBridgePayload(payload); !errors.Is(err, ErrBridgePayloadDenied) {
 			t.Fatalf("payload %q error=%v", payload, err)
 		}
+	}
+}
+
+func TestValidateBridgePayloadRecomputesCodexRuntimeEventContract(t *testing.T) {
+	var payload map[string]any
+	if err := json.Unmarshal(validBridgeCodexRunPayload(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	receipt := payload["receipt"].(map[string]any)
+	events := []provider.RuntimeEvent{
+		{Type: provider.EventAccepted, SessionID: bridgeTestDigest},
+		{Type: provider.EventModelObserved, SessionID: bridgeTestDigest, Model: "glm-5.3"},
+		{Type: provider.EventCompleted, SessionID: bridgeTestDigest},
+		{Type: provider.EventUsage, SessionID: bridgeTestDigest, InputTokens: 1, OutputTokens: 2},
+		{Type: provider.EventCleanup, SessionID: bridgeTestDigest},
+	}
+	requirements := provider.RuntimeEventRequirements{}
+	contract := provider.ValidateRuntimeEventsForModel("glm-5.3", events, requirements)
+	receipt["runtime_events"] = events
+	receipt["runtime_event_requirements"] = requirements
+	receipt["runtime_event_contract"] = contract
+	encoded, err := json.Marshal(payload)
+	if err != nil || ValidateBridgePayload(encoded) != nil {
+		t.Fatalf("valid recomputable runtime contract was rejected: marshal=%v validate=%v", err, ValidateBridgePayload(encoded))
+	}
+	contract.ReceiptSHA256 = bridgeTestDigest
+	receipt["runtime_event_contract"] = contract
+	forged, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateBridgePayload(forged); !errors.Is(err, ErrBridgePayloadDenied) {
+		t.Fatalf("forged runtime contract error=%v", err)
 	}
 }
 
@@ -173,11 +239,11 @@ func validBridgeNativePayload() []byte {
 }
 
 func validBridgeSessionPayload() []byte {
-	return []byte(`{"schema_version":"ntm.provider-session.v2","success":true,"profile":"grok-observe","transport":"xai_headless_session","identity_sha256":"` + bridgeTestDigest + `","policy":"grok-readonly-ci","policy_sha256":"` + bridgeTestDigest + `","config_sha256":"` + bridgeTestDigest + `","binary_sha256":"` + bridgeTestDigest + `","cwd_sha256":"` + bridgeTestDigest + `","worktree_sha256":"` + bridgeTestDigest + `","dispatched":true,"admission":{"allowed":true,"no_failover":true,"capacity_control_scope":"local_shared"},"receipt":{"action":"resume","fork":false,"parent_session_sha256":"` + bridgeTestDigest + `","child_session_sha256":"` + bridgeTestDigest + `","cwd_sha256":"` + bridgeTestDigest + `","worktree_sha256":"` + bridgeTestDigest + `","policy_sha256":"` + bridgeTestDigest + `","config_sha256":"` + bridgeTestDigest + `","binary_sha256":"` + bridgeTestDigest + `","nonce_sha256":"` + bridgeTestDigest + `","lineage_bound":true,"provider_acknowledged":true,"completion_confirmed":true,"stop_reason":"end_turn","requested_model":"grok-4.6","expected_receipt_model":"grok-4.6-build","model":"grok-4.6-build","model_evidence":"end.modelUsage_singleton","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3},"output_sha256":"` + bridgeTestDigest + `","stderr":{"bytes":0,"sha256":"` + bridgeTestDigest + `","truncated":false},"exit_code":0,"cancellation":{"provider_acknowledged":false,"local_termination":"not_required_process_exited","residual_pids":[],"observed_at":"2026-09-02T12:00:00Z"}},"telemetry":{"state":"recorded","observation_id":"0123456789abcdef0123456789abcdef","observation_sha256":"` + bridgeTestDigest + `"}}`)
+	return []byte(`{"schema_version":"ntm.provider-session.v2","success":true,"profile":"grok-observe","transport":"xai_headless_session","identity_sha256":"` + bridgeTestDigest + `","policy":"grok-readonly-ci","policy_sha256":"` + bridgeTestDigest + `","config_sha256":"` + bridgeTestDigest + `","binary_sha256":"` + bridgeTestDigest + `","qualification_receipt_sha256":"` + bridgeTestDigest + `","cwd_sha256":"` + bridgeTestDigest + `","worktree_sha256":"` + bridgeTestDigest + `","dispatched":true,"admission":{"allowed":true,"no_failover":true,"capacity_control_scope":"local_shared"},"receipt":{"action":"resume","fork":false,"parent_session_sha256":"` + bridgeTestDigest + `","child_session_sha256":"` + bridgeTestDigest + `","cwd_sha256":"` + bridgeTestDigest + `","worktree_sha256":"` + bridgeTestDigest + `","policy_sha256":"` + bridgeTestDigest + `","config_sha256":"` + bridgeTestDigest + `","binary_sha256":"` + bridgeTestDigest + `","nonce_sha256":"` + bridgeTestDigest + `","lineage_bound":true,"provider_acknowledged":true,"completion_confirmed":true,"stop_reason":"end_turn","requested_model":"grok-4.6","expected_receipt_model":"grok-4.6-build","model":"grok-4.6-build","model_evidence":"end.modelUsage_singleton","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3},"output_sha256":"` + bridgeTestDigest + `","stderr":{"bytes":0,"sha256":"` + bridgeTestDigest + `","truncated":false},"exit_code":0,"cancellation":{"provider_acknowledged":false,"local_termination":"not_required_process_exited","residual_pids":[],"observed_at":"2026-09-02T12:00:00Z"}},"telemetry":{"state":"recorded","observation_id":"0123456789abcdef0123456789abcdef","observation_sha256":"` + bridgeTestDigest + `"}}`)
 }
 
 func validBridgeCodexRunPayload() []byte {
-	return []byte(`{"schema_version":"ntm.provider-codex-run.v1","success":true,"profile":"zai-codex-kevin","transport":"zai_codex_runtime","identity_sha256":"` + bridgeTestDigest + `","config_sha256":"` + bridgeTestDigest + `","binary_sha256":"` + bridgeTestDigest + `","broker_command_sha256":"` + bridgeTestDigest + `","credential_bridge_sha256":"` + bridgeTestDigest + `","runtime_version":"0.149.0","broker_credential_sha256":"` + bridgeTestDigest + `","operation_id_sha256":"` + bridgeTestDigest + `","binding_sha256":"` + bridgeTestDigest + `","receipt_state":"completed","state":"completed","admission":{"allowed":true,"no_failover":true,"capacity_control_scope":"local_shared"},"receipt":{"adapter_version":"zai-codex-runtime-v1","action":"start","requested_model":"glm-5.3","resolved_model":"glm-5.3","model_evidence":"turn.completed.server_model","config_sha256":"` + bridgeTestDigest + `","binary_sha256":"` + bridgeTestDigest + `","broker_command_sha256":"` + bridgeTestDigest + `","credential_bridge_sha256":"` + bridgeTestDigest + `","policy_sha256":"` + bridgeTestDigest + `","runtime_version":"0.149.0","cwd_sha256":"` + bridgeTestDigest + `","prompt_sha256":"` + bridgeTestDigest + `","session_id_sha256":"` + bridgeTestDigest + `","nonce_sha256":"` + bridgeTestDigest + `","output_sha256":"` + bridgeTestDigest + `","event_stream_sha256":"` + bridgeTestDigest + `","stderr_sha256":"` + bridgeTestDigest + `","tool_events_sha256":"` + bridgeTestDigest + `","tool_event_count":0,"expected_tool_observed":false,"expected_tool_denied":false,"expected_file_observed":false,"usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":2,"total_tokens":3},"exit_code":0,"stop_reason":"turn.completed","provider_started":true,"process_started":true,"outcome_known":true,"completion_confirmed":true,"nonce_verified":true,"model_verified":true,"lineage_verified":true,"zero_residuals":true,"cancellation":{"provider_acknowledged":false,"local_termination":"cleanup_not_observed_process_exited","residual_process_ids":[],"observed_at":"2026-09-02T12:00:00Z"},"started_at":"2026-09-02T12:00:00Z","completed_at":"2026-09-02T12:01:00Z"}}`)
+	return []byte(`{"schema_version":"ntm.provider-codex-run.v1","success":true,"profile":"zai-codex-kevin","transport":"zai_codex_runtime","identity_sha256":"` + bridgeTestDigest + `","config_sha256":"` + bridgeTestDigest + `","binary_sha256":"` + bridgeTestDigest + `","broker_command_sha256":"` + bridgeTestDigest + `","credential_bridge_sha256":"` + bridgeTestDigest + `","runtime_version":"0.149.0","broker_credential_sha256":"` + bridgeTestDigest + `","qualification_receipt_sha256":"` + bridgeTestDigest + `","operation_id_sha256":"` + bridgeTestDigest + `","binding_sha256":"` + bridgeTestDigest + `","receipt_state":"completed","state":"completed","admission":{"allowed":true,"no_failover":true,"capacity_control_scope":"local_shared"},"receipt":{"adapter_version":"zai-codex-runtime-v1","action":"start","requested_model":"glm-5.3","resolved_model":"glm-5.3","model_evidence":"turn.completed.server_model","config_sha256":"` + bridgeTestDigest + `","binary_sha256":"` + bridgeTestDigest + `","broker_command_sha256":"` + bridgeTestDigest + `","credential_bridge_sha256":"` + bridgeTestDigest + `","policy_sha256":"` + bridgeTestDigest + `","runtime_version":"0.149.0","cwd_sha256":"` + bridgeTestDigest + `","prompt_sha256":"` + bridgeTestDigest + `","session_id_sha256":"` + bridgeTestDigest + `","nonce_sha256":"` + bridgeTestDigest + `","output_sha256":"` + bridgeTestDigest + `","event_stream_sha256":"` + bridgeTestDigest + `","stderr_sha256":"` + bridgeTestDigest + `","tool_events_sha256":"` + bridgeTestDigest + `","tool_event_count":0,"expected_tool_observed":false,"expected_tool_denied":false,"expected_file_observed":false,"usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":2,"total_tokens":3},"exit_code":0,"stop_reason":"turn.completed","provider_started":true,"process_started":true,"outcome_known":true,"completion_confirmed":true,"nonce_verified":true,"model_verified":true,"lineage_verified":true,"zero_residuals":true,"cancellation":{"provider_acknowledged":false,"local_termination":"cleanup_not_observed_process_exited","residual_process_ids":[],"observed_at":"2026-09-02T12:00:00Z"},"started_at":"2026-09-02T12:00:00Z","completed_at":"2026-09-02T12:01:00Z"}}`)
 }
 
 func TestWindowsBridgeSignerRejectsUnallowlistedPayloadBeforeInvoke(t *testing.T) {
@@ -199,8 +265,8 @@ func TestWindowsBridgeSignerPinsExecutableDigest(t *testing.T) {
 	}
 	digest := sha256.Sum256(contents)
 	signer := &windowsBridgeSigner{path: path, expectedSHA256: fmt.Sprintf("%x", digest[:]), invoke: invokeWindowsBridge}
-	if !signer.pinnedPathValid() {
-		t.Fatal("matching private executable bridge was rejected")
+	if signer.pinnedPathValid() {
+		t.Fatal("operator-owned bridge was accepted for a governed signer")
 	}
 	if err := os.WriteFile(path, []byte("replacement"), 0o700); err != nil {
 		t.Fatal(err)

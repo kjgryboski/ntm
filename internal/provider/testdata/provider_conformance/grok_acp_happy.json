@@ -1,0 +1,26 @@
+{
+  "id": "grok-acp-redacted-v2",
+  "transport": "xai_acp",
+  "wire_family": "acp",
+  "captured_at": "2026-09-03T00:00:00Z",
+  "runtime_version": "grok-agent-acp-redacted-1",
+  "expected_pass": true,
+  "requirements": {"tool_lifecycle":true,"checkpoint":true,"cancellation_requested":true},
+  "events": [
+    {"type":"session/prompt","session_id":"redacted-acp-session"},
+    {"type":"session/model","session_id":"redacted-acp-session","model":"grok-code"},
+    {"type":"tool/call","session_id":"redacted-acp-session","tool":"ntm.command_broker"},
+    {"type":"tool/result","session_id":"redacted-acp-session","tool":"ntm.command_broker"},
+    {"type":"session/checkpoint","session_id":"redacted-acp-session","checkpoint_id":"checkpoint-redacted"},
+    {"type":"session/cancelled","session_id":"redacted-acp-session"},
+    {"type":"session/complete","session_id":"redacted-acp-session"},
+    {"type":"session/usage","session_id":"redacted-acp-session","input_tokens":12,"output_tokens":8},
+    {"type":"session/cleanup","session_id":"redacted-acp-session","residual_processes":0}
+  ],
+  "golden_signature": {
+    "algorithm": "ed25519",
+    "key_id": "ntm-offline-fixture-ed25519-v1",
+    "payload_sha256": "f32047f0ada1e6f2b4eef0d2d8d8b0d64bb3a2ef43950b124d5523bff2c55287",
+    "signature": "620c4d6e8f7b7545fb46efdeacd7bbdbb028aab335a2eda0228218262b20bef34b8e0654888902cc4e80376504cffe85e9557d8afd67f0a9a9f5e1e039b01609"
+  }
+}

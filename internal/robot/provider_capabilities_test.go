@@ -39,12 +39,15 @@ func TestGetProviderCapabilitiesRedactsConfiguredProfiles(t *testing.T) {
 	if acp.Completion != provider.EvidenceAuthoritative || acp.Cancellation != provider.EvidenceAuthoritative || acp.CancellationAuthorityScope != provider.EvidenceAuthorityScopeAgentACP || acp.Cleanup != provider.EvidenceAuthoritative || acp.CleanupAuthorityScope != provider.EvidenceAuthorityScopeLocalProcessTree || acp.CapacityControlScope != provider.CapacityControlScopeLocalShared || !output.OfflineConformanceHarness.Available {
 		t.Fatalf("transport/conformance capability = %+v", output)
 	}
-	if len(output.GrokAutomationPolicies) != 2 || output.GrokAutomationPolicy.Name == "" || output.GrokAutomationPolicy.Sandbox != "read-only" || output.GrokAutomationPolicy.SHA256 == "" || output.GrokAutomationPolicy.SystemRequirementsSHA256 == "" || output.GrokAutomationPolicy.AllowRuleCount == 0 || output.GrokAutomationPolicy.DenyRuleCount == 0 {
+	if len(output.GrokAutomationPolicies) != 2 || output.GrokAutomationPolicy.Name == "" || output.GrokAutomationPolicy.Sandbox != "strict" || output.GrokAutomationPolicy.SHA256 == "" || output.GrokAutomationPolicy.SystemRequirementsSHA256 == "" || output.GrokAutomationPolicy.SystemRequirementsScope != "global" || output.GrokAutomationPolicy.AllowRuleCount == 0 || output.GrokAutomationPolicy.DenyRuleCount == 0 {
 		t.Fatalf("Grok policy capability = %+v", output.GrokAutomationPolicy)
 	}
 	workspace := output.GrokAutomationPolicies[1]
-	if workspace.Name != "grok-workspace-write-ci" || workspace.Sandbox != "strict" || workspace.SystemRequirementsSHA256 == "" || workspace.AllowRuleCount == 0 || workspace.DenyRuleCount == 0 {
+	if workspace.Name != "grok-workspace-write-ci" || workspace.Sandbox != "strict" || workspace.SystemRequirementsSHA256 == "" || workspace.SystemRequirementsScope != "global" || workspace.AllowRuleCount == 0 || workspace.DenyRuleCount == 0 {
 		t.Fatalf("workspace policy capability = %+v", workspace)
+	}
+	if output.GrokAutomationPolicy.SystemRequirementsSHA256 != workspace.SystemRequirementsSHA256 {
+		t.Fatalf("global system requirements digest differs by invocation policy: observe=%+v workspace=%+v", output.GrokAutomationPolicy, workspace)
 	}
 	native := output.Transports["zai_native_api"]
 	if native.Completion != provider.EvidenceAuthoritative || native.CompletionAuthorityScope != provider.EvidenceAuthorityScopeProvider || native.LiveErrorFeedback != provider.EvidenceAuthoritative || native.Cancellation != provider.EvidenceUnavailable || native.CancellationAuthorityScope != provider.EvidenceAuthorityScopeUnavailable || native.Resume != provider.EvidenceUnavailable || native.Cleanup != provider.EvidenceSubmission || native.CleanupAuthorityScope != provider.EvidenceAuthorityScopeLocalClient || native.CapacityControlScope != provider.CapacityControlScopeLocalShared {
@@ -81,7 +84,7 @@ func TestGetProviderCapabilitiesDoesNotCallConfiguredGrokProfileLaunchable(t *te
 		"xai-grok": {
 			Provider: "xai", AccountAlias: "operator", Model: "grok-4.6",
 			Endpoint: "https://api.x.ai/v1", Runtime: "grok", ConfigSHA256: hash,
-			Command: "grok", AutomationPolicy: "grok-readonly-ci", ExactTargetOnly: true,
+			Command: "grok", RuntimeHome: "/tmp/grok-operator", AutomationPolicy: "grok-readonly-ci", ExactTargetOnly: true,
 		},
 	}}
 	output, err := GetProviderCapabilities(cfg)

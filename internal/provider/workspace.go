@@ -316,8 +316,20 @@ func normalizeWorkspaceRelative(value string) (string, error) {
 func workspacePathDenied(value string) bool {
 	lower := strings.ToLower(filepath.ToSlash(value))
 	segments := strings.Split(lower, "/")
-	for _, segment := range segments {
-		if segment == ".git" || segment == ".ssh" || segment == ".aws" || segment == ".gnupg" || segment == ".kube" || segment == "credentials" || segment == "id_rsa" || segment == "id_ed25519" || segment == ".netrc" || segment == ".npmrc" || segment == ".pypirc" || segment == "secrets" || strings.HasPrefix(segment, ".env") {
+	for index, segment := range segments {
+		if segment == ".git" || segment == ".ssh" || segment == ".aws" || segment == ".gnupg" || segment == ".kube" ||
+			segment == ".grok" || segment == ".azure" || segment == ".docker" || segment == ".config" ||
+			segment == "credentials" || segment == "id_rsa" || segment == "id_ed25519" || segment == ".netrc" ||
+			segment == ".npmrc" || segment == ".pypirc" || segment == "secrets" || strings.HasPrefix(segment, ".env") ||
+			strings.Contains(segment, "credential") || strings.Contains(segment, "secret") ||
+			strings.HasSuffix(segment, ".pem") || strings.HasSuffix(segment, ".key") || strings.HasSuffix(segment, ".p12") || strings.HasSuffix(segment, ".pfx") {
+			return true
+		}
+		// Some tools use a non-dot config directory in repositories. Treat the
+		// two credential-bearing provider subtrees exactly like ~/.config/gh and
+		// ~/.config/gcloud so the MCP broker cannot bypass the Grok policy by
+		// spelling the same path without a leading dot.
+		if index > 0 && (segments[index-1] == "config" || segments[index-1] == ".config") && (segment == "gh" || segment == "gcloud") {
 			return true
 		}
 	}

@@ -10,12 +10,12 @@ import (
 
 func TestDefaultGrokAutomationPolicyIsLeastPrivilege(t *testing.T) {
 	policy := DefaultGrokAutomationPolicy()
-	if policy.Name != DefaultGrokAutomationPolicyName || policy.Sandbox != "read-only" || policy.PermissionMode != "dontAsk" {
+	if policy.Name != DefaultGrokAutomationPolicyName || policy.Sandbox != "strict" || policy.PermissionMode != "dontAsk" {
 		t.Fatalf("policy = %+v", policy)
 	}
 	command := DefaultGrokAutomationCommandTemplate
 	for _, required := range []string{
-		"--no-auto-update", "--sandbox read-only", "--permission-mode dontAsk", "--allow 'Read'",
+		"--no-auto-update", "--sandbox strict", "--permission-mode dontAsk", "--allow 'Read'",
 		"--deny 'Edit'", "--deny 'Bash(*)'", "--deny 'Read(**/.grok/**)'",
 		"--deny 'Read(**/.config/gh/**)'", "--deny 'Read(**/.azure/**)'", "--deny 'Read(**/*.key)'",
 		"--deny 'Grep(**/.grok/**)'", "--deny 'Grep(**/.config/gh/**)'", "--deny 'Grep(**/.azure/**)'", "--deny 'Grep(**/*.key)'",
@@ -40,7 +40,7 @@ func TestDefaultGrokAutomationPolicyReturnsCopies(t *testing.T) {
 
 func TestDefaultGrokAutomationACPPolicyIsExplicitAndDigestStable(t *testing.T) {
 	args := DefaultGrokAutomationACPPolicyArgs()
-	if len(args) < 2 || args[0] != "--sandbox=read-only" || args[1] != "--permission-mode=dontAsk" {
+	if len(args) < 2 || args[0] != "--sandbox=strict" || args[1] != "--permission-mode=dontAsk" {
 		t.Fatalf("ACP policy args = %#v", args)
 	}
 	joined := strings.Join(args, "\n")
@@ -84,12 +84,20 @@ func TestGrokWorkspaceWritePolicyIsNarrowAndPinned(t *testing.T) {
 	}
 	joinedAllow := strings.Join(policy.AllowRules, "\n")
 	joinedDeny := strings.Join(policy.DenyRules, "\n")
-	for _, required := range []string{"Edit"} {
+	for _, required := range []string{
+		"MCPTool(ntm-controlled-workspace__list_files)",
+		"MCPTool(ntm-controlled-workspace__read_file)",
+		"MCPTool(ntm-controlled-workspace__write_file)",
+		"MCPTool(ntm-controlled-workspace__verify_worktree)",
+	} {
 		if !strings.Contains(joinedAllow, required) {
 			t.Errorf("workspace allow rules omit %q", required)
 		}
 	}
-	for _, required := range []string{"Bash(*)", "WebFetch", "WebSearch", "Read(**/.ssh/**)", "Read(**/*secret*)", "Edit(**/.grok/**)", "Edit(**/.ssh/**)", "Edit(**/*secret*)"} {
+	if strings.Contains(joinedAllow, "\nEdit\n") || joinedAllow == "Edit" || strings.HasPrefix(joinedAllow, "Edit\n") || strings.HasSuffix(joinedAllow, "\nEdit") {
+		t.Fatal("workspace policy exposes Grok's built-in Edit surface")
+	}
+	for _, required := range []string{"Edit", "Bash(*)", "WebFetch", "WebSearch", "Read(**/.ssh/**)", "Read(**/*secret*)", "Edit(**/.grok/**)", "Edit(**/.ssh/**)", "Edit(**/*secret*)"} {
 		if !strings.Contains(joinedDeny, required) {
 			t.Errorf("workspace deny rules omit %q", required)
 		}
@@ -103,21 +111,47 @@ func TestGrokWorkspaceWritePolicyIsNarrowAndPinned(t *testing.T) {
 }
 
 func TestGrokSystemRequirementsAreDeterministicAndLockBypass(t *testing.T) {
-	requirements, ok := GrokSystemRequirementsForPolicy(GrokWorkspaceWritePolicyName)
-	if !ok || requirements.PolicyName != GrokWorkspaceWritePolicyName || len(requirements.SHA256) != 64 {
-		t.Fatalf("requirements = %+v, ok=%v", requirements, ok)
+	observe, ok := GrokSystemRequirementsForPolicy(DefaultGrokAutomationPolicyName)
+	if !ok || observe.PolicyName != DefaultGrokAutomationPolicyName || len(observe.SHA256) != 64 {
+		t.Fatalf("observe requirements = %+v, ok=%v", observe, ok)
 	}
-	for _, want := range []string{"[sandbox]", "profile = \"strict\"", "[ui]", "permission_mode = \"dontAsk\"", "disable_bypass_permissions_mode = true", "[permission]", `action = "deny", tool = "bash", pattern = "*"`} {
-		if !strings.Contains(requirements.Contents, want) {
+	workspace, ok := GrokSystemRequirementsForPolicy(GrokWorkspaceWritePolicyName)
+	if !ok || workspace.PolicyName != GrokWorkspaceWritePolicyName || len(workspace.SHA256) != 64 {
+		t.Fatalf("workspace requirements = %+v, ok=%v", workspace, ok)
+	}
+	if observe.SHA256 != workspace.SHA256 || observe.Contents != workspace.Contents {
+		t.Fatalf("global requirements differ by invocation policy: observe=%+v workspace=%+v", observe, workspace)
+	}
+	for _, want := range []string{
+		"[sandbox]", "profile = \"strict\"",
+		"[ui]", "permission_mode = \"dontAsk\"", "disable_bypass_permissions_mode = true",
+		"[features]", "write_file = false", "lsp_tools = false",
+		"[subagents]", "enabled = false",
+		"[memory]",
+		"[plugins]", "paths = []",
+		"[compat.claude]", "skills = false", "rules = false", "agents = false", "mcps = false", "hooks = false",
+		"[compat.cursor]", "skills = false", "rules = false", "agents = false", "mcps = false", "hooks = false",
+		"[permission]",
+		`action = "deny", tool = "bash", pattern = "*"`,
+		`action = "deny", tool = "edit", pattern = "**/.grok/**"`,
+		`action = "allow", tool = "mcp", pattern = "ntm-controlled-workspace__write_file"`,
+	} {
+		if !strings.Contains(observe.Contents, want) {
 			t.Errorf("requirements omit %q", want)
 		}
 	}
-	again, _ := GrokSystemRequirementsForPolicy(GrokWorkspaceWritePolicyName)
-	if requirements.SHA256 != again.SHA256 || requirements.Contents != again.Contents {
+	if strings.Contains(observe.Contents, `tool = "mcptool"`) {
+		t.Fatal("requirements used the CLI MCPTool spelling instead of the documented verbose TOML mcp tool name")
+	}
+	if strings.Contains(observe.Contents, "tool_search") {
+		t.Fatal("requirements emitted a setting that pinned Grok 1.0.13 reports as unsupported")
+	}
+	again, _ := GrokSystemRequirementsForPolicy(DefaultGrokAutomationPolicyName)
+	if observe.SHA256 != again.SHA256 || observe.Contents != again.Contents {
 		t.Fatal("requirements rendering is not deterministic")
 	}
 	var decoded map[string]any
-	if _, err := toml.Decode(requirements.Contents, &decoded); err != nil {
-		t.Fatalf("requirements TOML is invalid: %v\n%s", err, requirements.Contents)
+	if _, err := toml.Decode(observe.Contents, &decoded); err != nil {
+		t.Fatalf("requirements TOML is invalid: %v\n%s", err, observe.Contents)
 	}
 }

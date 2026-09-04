@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/provider"
 )
 
 func TestRunCompletesFromACPTranscript(t *testing.T) {
@@ -82,6 +84,70 @@ func TestRunCompletesFromACPTranscript(t *testing.T) {
 	}
 }
 
+func TestRuntimeEventsPreserveACPCompletionBeforeRequest(t *testing.T) {
+	updates := newUpdateAccumulator(io.Discard, "nonce", "grok-4.6")
+	if err := updates.observe(json.RawMessage(`{"update":{"sessionUpdate":"tool_call_update","toolCallId":"opaque-tool-id","status":"completed"}}`)); err == nil {
+		t.Fatal("completion-before-request was accepted")
+	}
+	if len(updates.runtimeToolEvents) != 0 {
+		t.Fatalf("unmatched terminal update created lifecycle evidence: %+v", updates.runtimeToolEvents)
+	}
+}
+
+func TestUpdateAccumulatorTracksACPToolLifecycleByOpaqueID(t *testing.T) {
+	updates := newUpdateAccumulator(io.Discard, "nonce", "grok-4.6")
+	for _, update := range []string{
+		`{"update":{"sessionUpdate":"tool_call","toolCallId":"opaque-tool-id"}}`,
+		`{"update":{"sessionUpdate":"tool_call_update","toolCallId":"opaque-tool-id","status":"pending"}}`,
+		`{"update":{"sessionUpdate":"tool_call_update","toolCallId":"opaque-tool-id","status":"in_progress"}}`,
+	} {
+		if err := updates.observe(json.RawMessage(update)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if updates.toolRequestCount != 1 || updates.toolCompleteCount != 0 || len(updates.runtimeToolEvents) != 1 || updates.runtimeToolEvents[0].Type != provider.EventToolRequested {
+		t.Fatalf("progress updates created a false completion: %+v", updates)
+	}
+	if err := updates.observe(json.RawMessage(`{"update":{"sessionUpdate":"tool_call_update","toolCallId":"opaque-tool-id","status":"completed"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	events := provider.NormalizeTerminalRuntimeObservation(provider.TerminalRuntimeObservation{
+		SessionRef: "session-digest", Model: "grok-4.6", Accepted: true,
+		ObservedToolEvents: updates.runtimeToolEvents, Completed: true, UsageObserved: true, CleanupObserved: true,
+	})
+	if len(events) < 4 || events[2].Type != provider.EventToolRequested || events[3].Type != provider.EventToolCompleted {
+		t.Fatalf("tool lifecycle order was not preserved: %+v", events)
+	}
+	report := provider.ValidateRuntimeEventsForModel("grok-4.6", events, provider.RuntimeEventRequirements{ToolLifecycle: true})
+	if !report.Passed {
+		t.Fatalf("valid tool lifecycle failed: %+v", report)
+	}
+	serialized := string(mustJSON(t, events))
+	if strings.Contains(serialized, "opaque-tool-id") {
+		t.Fatalf("runtime events retained raw tool-call id: %s", serialized)
+	}
+}
+
+func TestUpdateAccumulatorClosesFailedToolLifecycleWithoutClaimingSuccess(t *testing.T) {
+	updates := newUpdateAccumulator(io.Discard, "nonce", "grok-4.6")
+	if err := updates.observe(json.RawMessage(`{"update":{"sessionUpdate":"tool_call","toolCallId":"opaque-failed-id"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := updates.observe(json.RawMessage(`{"update":{"sessionUpdate":"tool_call_update","toolCallId":"opaque-failed-id","status":"failed"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if updates.toolRequestCount != 1 || updates.toolCompleteCount != 1 || len(updates.runtimeToolEvents) != 2 || updates.runtimeToolEvents[1].Type != provider.EventToolCompleted {
+		t.Fatalf("failed terminal did not close normalized lifecycle: %+v", updates)
+	}
+	report := provider.ValidateRuntimeEventsForModel("grok-4.6", provider.NormalizeTerminalRuntimeObservation(provider.TerminalRuntimeObservation{
+		SessionRef: "session-digest", Model: "grok-4.6", Accepted: true,
+		ObservedToolEvents: updates.runtimeToolEvents, Completed: true, UsageObserved: true, CleanupObserved: true,
+	}), provider.RuntimeEventRequirements{ToolLifecycle: true})
+	if !report.Passed {
+		t.Fatalf("terminal failed tool was mistaken for an open request: %+v", report)
+	}
+}
+
 func TestRunPlacesNamedPolicyAndExactModelBeforeACPSubcommand(t *testing.T) {
 	proc := newFakeProcess(strings.NewReader(successfulTranscript(`[{"id":"cached_token"}]`)), strings.NewReader(""))
 	runner := &fakeRunner{proc: proc}
@@ -97,6 +163,46 @@ func TestRunPlacesNamedPolicyAndExactModelBeforeACPSubcommand(t *testing.T) {
 	want = append(want, "--model", "grok-exact-model", "agent", "stdio")
 	if !sameStrings(runner.spec.Args, want) {
 		t.Fatalf("ACP args = %#v, want %#v", runner.spec.Args, want)
+	}
+}
+
+func TestRunPassesOnlyTypedNTMWorkspaceBrokerToSessionNew(t *testing.T) {
+	proc := newFakeProcess(strings.NewReader(successfulTranscript(`[{"id":"cached_token"}]`)), strings.NewReader(""))
+	broker, err := NewWorkspaceBrokerDescriptor("/tmp/linked", strings.Repeat("a", 40), []string{"go-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(t.Context(), &fakeRunner{proc: proc}, Request{Prompt: "hello", CWD: "/repo", Broker: broker}); err != nil {
+		t.Fatal(err)
+	}
+	requests := decodeRequests(t, proc.stdin.String())
+	if len(requests) < 3 || requests[2].Method != "session/new" {
+		t.Fatalf("session/new request = %#v", requests)
+	}
+	var params struct {
+		MCPServers []struct {
+			Name    string   `json:"name"`
+			Command string   `json:"command"`
+			Args    []string `json:"args"`
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(requests[2].Params, &params); err != nil {
+		t.Fatal(err)
+	}
+	if len(params.MCPServers) != 1 || params.MCPServers[0].Name != WorkspaceBrokerMCPName || !filepath.IsAbs(params.MCPServers[0].Command) || !slices.Equal(params.MCPServers[0].Args[:3], []string{"provider", "broker", "stdio"}) {
+		t.Fatalf("session/new MCP descriptor = %+v", params.MCPServers)
+	}
+	if strings.Contains(string(requests[2].Params), "toolset") || strings.Contains(string(requests[2].Params), "protocol") {
+		t.Fatalf("session/new included non-standard MCP fields: %s", requests[2].Params)
+	}
+}
+
+func TestRunRejectsAnythingOtherThanTheTypedNTMWorkspaceBroker(t *testing.T) {
+	if _, err := NewWorkspaceBrokerDescriptor("/tmp/linked", strings.Repeat("a", 40), []string{"sh"}); err == nil {
+		t.Fatal("unapproved verifier command was accepted")
+	}
+	if _, err := NewWorkspaceBrokerDescriptor("relative", strings.Repeat("a", 40), []string{"go-test"}); err == nil {
+		t.Fatal("relative worktree was accepted")
 	}
 }
 
@@ -256,10 +362,41 @@ func TestRunRequiresStopReasonForAuthoritativeCompletion(t *testing.T) {
 }
 
 func TestMinimalGrokEnvironmentExcludesUnrelatedValues(t *testing.T) {
-	env := minimalGrokEnvironment([]string{"Path=C:\\tools", "XAI_API_KEY=secret", "xai_api_key=secret-lowercase", "AWS_SECRET_ACCESS_KEY=must-not-pass", "HTTPS_PROXY=https://user:secret@proxy.example", "http_proxy=http://proxy-token@proxy.example", "NO_PROXY=localhost", "LANG=en_US.UTF-8", "HOME=/tmp/home", "systemroot=C:\\Windows"})
+	env := minimalGrokEnvironment([]string{"Path=C:\\tools", "XAI_API_KEY=secret", "xai_api_key=secret-lowercase", "AWS_SECRET_ACCESS_KEY=must-not-pass", "HTTPS_PROXY=https://user:secret@proxy.example", "http_proxy=http://proxy-token@proxy.example", "NO_PROXY=localhost", "SSL_CERT_FILE=/tmp/attacker-ca.pem", "SSL_CERT_DIR=/tmp/attacker-cas", "LANG=en_US.UTF-8", "HOME=/tmp/home", "systemroot=C:\\Windows"})
 	joined := strings.Join(env, "\n")
-	if !strings.Contains(joined, "PATH=C:\\tools") || !strings.Contains(joined, "SystemRoot=C:\\Windows") || !strings.Contains(joined, "HOME=/tmp/home") || strings.Contains(strings.ToLower(joined), "xai_api_key") || strings.Contains(joined, "AWS_SECRET") || strings.Contains(joined, "LANG=") || strings.Contains(strings.ToLower(joined), "proxy=") {
+	if !strings.Contains(joined, "PATH=C:\\tools") || !strings.Contains(joined, "SystemRoot=C:\\Windows") || !strings.Contains(joined, "HOME=/tmp/home") || strings.Contains(strings.ToLower(joined), "xai_api_key") || strings.Contains(joined, "AWS_SECRET") || strings.Contains(joined, "LANG=") || strings.Contains(strings.ToLower(joined), "proxy=") || strings.Contains(joined, "SSL_CERT") {
 		t.Fatalf("minimal environment = %q", joined)
+	}
+}
+
+func TestIsolatedProcessEnvironmentReplacesAmbientProviderState(t *testing.T) {
+	env, err := IsolatedProcessEnvironment([]string{
+		"PATH=/bin", "HOME=/real-home", "XDG_CONFIG_HOME=/real-config",
+		"GROK_HOME=/attacker", "GROK_DEFAULT_MODEL=third-party", "GROK_SANDBOX=off",
+		"GROK_CLAUDE_MCPS_ENABLED=1", "XAI_API_KEY=secret", "HTTPS_PROXY=https://user:secret@example.invalid", "SSL_CERT_FILE=/tmp/attacker-ca.pem",
+	}, "/profiles/grok-kevin/.grok", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := "\n" + strings.Join(env, "\n") + "\n"
+	for _, want := range []string{
+		"\nHOME=/profiles/grok-kevin/.grok\n",
+		"\nGROK_HOME=/profiles/grok-kevin/.grok\n",
+		"\nGROK_WRITE_FILE=0\n",
+		"\nGROK_CLAUDE_MCPS_ENABLED=0\n",
+		"\nGROK_CURSOR_HOOKS_ENABLED=0\n",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("isolated environment omitted %q: %q", want, joined)
+		}
+	}
+	for _, forbidden := range []string{"/real-home", "/attacker", "third-party", "GROK_SANDBOX", "XAI_API_KEY", "HTTPS_PROXY", "SSL_CERT_FILE", "attacker-ca", "secret"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("isolated environment retained %q: %q", forbidden, joined)
+		}
+	}
+	if _, err := IsolatedProcessEnvironment(nil, "relative", false); err == nil {
+		t.Fatal("relative runtime home was accepted")
 	}
 }
 
@@ -268,8 +405,8 @@ func TestRunSeparatesToolCallsFromOtherNonMessageUpdates(t *testing.T) {
 		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
 		`{"jsonrpc":"2.0","id":2,"result":{}}`,
 		`{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s"}}`,
-		`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","arguments":{"api_key":"must-not-retain"}}}}`,
-		`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","content":{"text":"must-not-retain"}}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"opaque-tool-id","arguments":{"api_key":"must-not-retain"}}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"opaque-tool-id","status":"completed","content":{"text":"must-not-retain"}}}}`,
 		`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_result","content":{"text":"must-not-retain"}}}}`,
 		`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"must-not-retain"}}}}`,
 		`{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"usage_update","used":12,"size":100}}}`,
@@ -290,7 +427,7 @@ func TestRunSeparatesToolCallsFromOtherNonMessageUpdates(t *testing.T) {
 		t.Fatalf("provider metadata = %+v", result)
 	}
 	serialized := string(mustJSON(t, result))
-	if strings.Contains(serialized, "must-not-retain") || strings.Contains(serialized, "api_key") {
+	if strings.Contains(serialized, "must-not-retain") || strings.Contains(serialized, "api_key") || strings.Contains(serialized, "opaque-tool-id") {
 		t.Fatalf("receipt retained raw event material: %s", serialized)
 	}
 }
@@ -318,7 +455,63 @@ func TestRunUsesStructuredCatalogOnlyWithExactModelLaunchAssertion(t *testing.T)
 	}
 }
 
-func TestRunAcceptsOnlySessionBoundVendorModelEvidence(t *testing.T) {
+func TestRunUsesTerminalMetadataForPublicResolvedModelAndUsage(t *testing.T) {
+	transcript := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
+		`{"jsonrpc":"2.0","id":2,"result":{}}`,
+		`{"jsonrpc":"2.0","id":3,"result":{"sessionId":"session-7","models":{"currentModelId":"grok-4.6","availableModels":[{"modelId":"grok-4.6"}]}}}`,
+		`{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn","_meta":{"modelId":"grok-4.6","usage":{"inputTokens":12,"outputTokens":34,"totalTokens":46,"cachedReadTokens":5,"reasoningTokens":7,"modelCalls":1,"numTurns":1,"apiDurationMs":900,"costUsdTicks":2,"modelUsage":{"grok-4.6-build":{}}}}}}`,
+	}, "\n") + "\n"
+	result, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{
+		Prompt: "hello", CWD: "/repo", Model: "grok-4.6", RuntimeVersion: "1.0.13",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Model != "grok-4.6" || result.ModelEvidence != "completion_metadata" || result.ResolvedModel != "grok-4.6-build" || result.ResolvedModelEvidence != "completion_metadata.usage.model_usage_singleton" {
+		t.Fatalf("terminal model metadata = %+v", result)
+	}
+	if result.Usage == nil || result.Usage.InputTokens == nil || *result.Usage.InputTokens != 12 || result.Usage.OutputTokens == nil || *result.Usage.OutputTokens != 34 || result.Usage.TotalTokens == nil || *result.Usage.TotalTokens != 46 || result.Usage.CachedReadTokens == nil || *result.Usage.CachedReadTokens != 5 || result.Usage.ReasoningTokens == nil || *result.Usage.ReasoningTokens != 7 {
+		t.Fatalf("terminal usage metadata = %+v", result.Usage)
+	}
+	if !result.RuntimeEventContract.Passed || len(result.RuntimeEvents) < 2 || result.RuntimeEvents[1].ResolvedModel != "grok-4.6-build" {
+		t.Fatalf("normalized terminal events = %+v report=%+v", result.RuntimeEvents, result.RuntimeEventContract)
+	}
+}
+
+func TestRunRejectsTerminalResolvedModelOutsidePinnedRuntimeBinding(t *testing.T) {
+	transcript := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
+		`{"jsonrpc":"2.0","id":2,"result":{}}`,
+		`{"jsonrpc":"2.0","id":3,"result":{"sessionId":"session-7"}}`,
+		`{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn","_meta":{"modelId":"grok-4.6","usage":{"inputTokens":1,"outputTokens":1,"modelUsage":{"other-model":{}}}}}}`,
+	}, "\n") + "\n"
+	_, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{
+		Prompt: "hello", CWD: "/repo", Model: "grok-4.6", RuntimeVersion: "1.0.13",
+	})
+	assertCode(t, err, ErrIdentityMismatch)
+}
+
+func TestRunRejectsAmbiguousTerminalModelsAndConflictingUsage(t *testing.T) {
+	for name, terminal := range map[string]string{
+		"multiple models":          `{"stopReason":"end_turn","_meta":{"modelId":"grok-4.6","usage":{"inputTokens":1,"outputTokens":1,"modelUsage":{"grok-4.6-build":{},"other":{}}}}}`,
+		"conflicting model fields": `{"stopReason":"end_turn","model":"grok-4.5","_meta":{"modelId":"grok-4.6","usage":{"inputTokens":1,"outputTokens":1,"modelUsage":{"grok-4.6-build":{}}}}}`,
+		"conflicting usage":        `{"stopReason":"end_turn","model":"grok-4.6","usage":{"inputTokens":2},"_meta":{"modelId":"grok-4.6","usage":{"inputTokens":1,"outputTokens":1,"modelUsage":{"grok-4.6-build":{}}}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			transcript := strings.Join([]string{
+				`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
+				`{"jsonrpc":"2.0","id":2,"result":{}}`,
+				`{"jsonrpc":"2.0","id":3,"result":{"sessionId":"session-7"}}`,
+				`{"jsonrpc":"2.0","id":4,"result":` + terminal + `}`,
+			}, "\n") + "\n"
+			_, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{Prompt: "hello", CWD: "/repo"})
+			assertCode(t, err, ErrProtocol)
+		})
+	}
+}
+
+func TestRunRetainsSessionBoundVendorModelSelectionWithoutPromotingIt(t *testing.T) {
 	transcript := strings.Join([]string{
 		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
 		`{"jsonrpc":"2.0","id":2,"result":{}}`,
@@ -329,12 +522,12 @@ func TestRunAcceptsOnlySessionBoundVendorModelEvidence(t *testing.T) {
 	result, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{
 		Prompt: "hello", CWD: "/repo", Model: "grok-4.6",
 	})
-	if err != nil || result.Model != "grok-4.6" || result.ModelEvidence != "provider_session_notification_plus_exact_launch" {
-		t.Fatalf("session-bound model evidence result=%+v err=%v", result, err)
+	if err != nil || result.Model != "" || result.ModelEvidence != "" || result.SessionSelectedModel != "grok-4.6" || result.SessionModelSelectionEvidence != "provider_session_notification_plus_exact_launch" {
+		t.Fatalf("session-bound model selection result=%+v err=%v", result, err)
 	}
 }
 
-func TestRunDerivesExactModelFromSessionConfigOption(t *testing.T) {
+func TestRunRetainsExactModelSelectionFromSessionConfigOption(t *testing.T) {
 	transcript := strings.Join([]string{
 		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
 		`{"jsonrpc":"2.0","id":2,"result":{}}`,
@@ -344,15 +537,15 @@ func TestRunDerivesExactModelFromSessionConfigOption(t *testing.T) {
 	result, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{
 		Prompt: "hello", CWD: "/repo", Model: "grok-4.6",
 	})
-	if err != nil || result.Model != "grok-4.6" || result.ModelEvidence != "session_config_option_plus_exact_launch" {
-		t.Fatalf("session config model evidence result=%+v err=%v", result, err)
+	if err != nil || result.Model != "" || result.ModelEvidence != "" || result.SessionSelectedModel != "grok-4.6" || result.SessionModelSelectionEvidence != "session_config_option_plus_exact_launch" {
+		t.Fatalf("session config model selection result=%+v err=%v", result, err)
 	}
 	if !result.Authenticated || result.AuthenticationEvidence != "cached_token_authenticate_plus_completed_session" {
 		t.Fatalf("completed cached authentication was not recorded safely: authenticated=%v evidence=%q", result.Authenticated, result.AuthenticationEvidence)
 	}
 }
 
-func TestRunDerivesExactModelFromTopLevelSessionModelState(t *testing.T) {
+func TestRunRetainsExactModelSelectionFromTopLevelSessionModelState(t *testing.T) {
 	transcript := strings.Join([]string{
 		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
 		`{"jsonrpc":"2.0","id":2,"result":{}}`,
@@ -362,8 +555,8 @@ func TestRunDerivesExactModelFromTopLevelSessionModelState(t *testing.T) {
 	result, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{
 		Prompt: "hello", CWD: "/repo", Model: "grok-4.6",
 	})
-	if err != nil || result.Model != "grok-4.6" || result.ModelEvidence != "session_model_state_plus_exact_launch" {
-		t.Fatalf("top-level session model-state evidence result=%+v err=%v", result, err)
+	if err != nil || result.Model != "" || result.ModelEvidence != "" || result.SessionSelectedModel != "grok-4.6" || result.SessionModelSelectionEvidence != "session_model_state_plus_exact_launch" {
+		t.Fatalf("top-level session model-state selection result=%+v err=%v", result, err)
 	}
 }
 

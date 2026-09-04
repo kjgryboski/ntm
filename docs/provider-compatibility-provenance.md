@@ -23,13 +23,37 @@ outputs, paths, or credentials.
 
 | Provider lane | Fixture version | Covered shape | Provenance | Known gap |
 | --- | --- | --- | --- | --- |
-| Grok native ACP | `grok-acp-1.0.13-v1` | Redacted post-completion economics/drift record | Synthetic replay fixture derived from the NTM receipt schema | Does not replay an ACP transcript, authenticate, or establish cloud cancellation |
+| Grok native ACP | `grok-acp-redacted-v2` | Redacted ACP lifecycle stream normalized into the shared provider-runtime contract | Embedded credential-free fixture with a verified Ed25519 golden signature | Does not authenticate or establish cloud cancellation |
+| Z.ai Codex Responses | `zai-responses-redacted-v2` | Redacted Responses lifecycle stream normalized into the shared provider-runtime contract | Embedded credential-free fixture with a verified Ed25519 golden signature | Does not establish plan entitlement, live served-model evidence, availability, cancellation, or resume |
 | Z.ai native HTTP | `zai-native-v4-v1` | Redacted structured chat-completion economics/drift record | Synthetic replay fixture derived from the native receipt schema | Does not establish key entitlement, API availability, cancellation, or resume |
 | Z.ai Claude-compatible runtime | none | Not replayable at per-request protocol level | Intentionally opaque compatibility lane | Must remain NO_GO for request-level authority unless a structured provider contract is qualified |
 
-The fixtures live under `internal/cli/testdata/provider_telemetry/` and are
-loaded by focused replay tests. Their identity/policy values are fixed hashes,
-not hashes of local users, accounts, prompts, keys, or repositories.
+Telemetry fixtures live under `internal/cli/testdata/provider_telemetry/`.
+The provider-runtime contract fixtures live under
+`internal/provider/testdata/provider_conformance/`, are embedded in the robot
+surface, and are loaded by focused replay tests. Their identity/policy values
+are fixed hashes, not hashes of local users, accounts, prompts, keys, or
+repositories.
+
+The shared contract is exactly: `accepted`, `model_observed`,
+`tool_requested`, `tool_completed`, `checkpoint`,
+`cancellation_acknowledged`, `completed`, `usage`, and `cleanup`. The replay
+harness fails closed on unrecognized ACP/Responses frame names, model absence,
+model conflicts/remapping, conflicting session IDs, malformed or reordered
+frames, unmatched tool results, negative usage, missing completion, and residual
+processes. The event receipt digest preserves order. Each embedded fixture is
+verified against a compiled Ed25519 public test anchor before it can influence
+conformance; that golden signature authenticates only the offline artifact, not
+a live provider. Quota/error frames are normalized through the existing
+provider error taxonomy. Coverage, provenance, and intentional discrepancies
+are maintained beside the fixtures.
+
+The live Grok ACP and Z.ai Codex adapters emit this same contract from observed
+structured events after local cleanup. Live validation never borrows fixture
+evidence: requested tool or cancellation events, a provider-observed model,
+usage, completion, and zero-residual cleanup must each be present when required.
+Signed qualification receipts consume that live validation report, while the
+offline golden fixtures remain parser and fault-injection evidence only.
 
 ## Drift and discrepancy policy
 

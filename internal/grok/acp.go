@@ -16,12 +16,14 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 	"unicode"
 
 	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
+	"github.com/Dicklesworthstone/ntm/internal/provider"
 )
 
 const (
@@ -96,9 +98,11 @@ func (e *Error) Unwrap() error { return e.Err }
 // represented here: automated ACP uses only the CLI's existing cached login,
 // and ACP authenticate carries only the cached_token method identifier.
 type StartSpec struct {
-	Binary string
-	Args   []string
-	CWD    string
+	Binary         string
+	Args           []string
+	CWD            string
+	RuntimeHome    string
+	WorkspaceWrite bool
 }
 
 // Process is the testable subset of an ACP child process.
@@ -127,7 +131,11 @@ func (OSRunner) Start(_ context.Context, spec StartSpec) (Process, error) {
 	// the ACP session/cancel notification and wait for the original response.
 	cmd := exec.Command(spec.Binary, spec.Args...)
 	cmd.Dir = spec.CWD
-	cmd.Env = minimalGrokEnvironment(os.Environ())
+	env, err := IsolatedProcessEnvironment(os.Environ(), spec.RuntimeHome, spec.WorkspaceWrite)
+	if err != nil {
+		return nil, err
+	}
+	cmd.Env = env
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -175,10 +183,18 @@ type Request struct {
 	Prompt string
 	CWD    string
 	Binary string
+	// RuntimeHome is the dedicated GROK_HOME selected by the exact provider
+	// profile. Production runners reject an absent or relative value so user
+	// auth/config, compatibility scanners, and session state cannot bleed in.
+	RuntimeHome string
 	// Model is passed as an exact --model value before the ACP subcommand. It
 	// is not echoed in Result unless the provider's completion metadata confirms
 	// the effective model.
 	Model string
+	// RuntimeVersion selects the reviewed public-to-resolved model binding for
+	// terminal usage metadata. Production adapters supply the exact pinned CLI
+	// version; an unknown version cannot inherit another version's alias map.
+	RuntimeVersion string
 	// ExpectedNonce is a non-secret acknowledgement token supplied by an
 	// orchestrator. It is never retained in Result; only the verified boolean
 	// is exposed after a bounded streaming match over assistant chunks.
@@ -200,6 +216,104 @@ type Request struct {
 	// --allow/--deny flags placed before `agent stdio`. Raw approval bypasses
 	// such as --always-approve are rejected rather than silently accepted.
 	AutomationPolicyArgs []string
+	// Broker is the sole MCP server shape accepted by this ACP adapter.  It is
+	// deliberately a controller-owned workspace broker, not an arbitrary MCP
+	// configuration passed through from a prompt or provider response.
+	Broker *WorkspaceBrokerDescriptor
+}
+
+// WorkspaceBrokerDescriptor describes the sole local NTM MCP service an ACP
+// session may receive. Its executable and arguments are private so callers
+// cannot substitute a shell, remote transport, environment, or arbitrary MCP
+// server after NTM has constructed the descriptor.
+type WorkspaceBrokerDescriptor struct {
+	command string
+	args    []string
+}
+
+const WorkspaceBrokerMCPName = "ntm-controlled-workspace"
+
+// NewWorkspaceBrokerDescriptor is the sole construction path. It binds the
+// server to this exact running NTM executable rather than accepting a caller-
+// supplied program. Arguments are passed directly to the process, never
+// through a shell.
+func NewWorkspaceBrokerDescriptor(worktree, revision string, commands []string) (*WorkspaceBrokerDescriptor, error) {
+	command, err := os.Executable()
+	if err != nil {
+		return nil, errors.New("resolve current NTM executable for ACP workspace broker")
+	}
+	command, err = filepath.Abs(command)
+	if err != nil || !filepath.IsAbs(command) || len(command) > 4096 || strings.IndexFunc(command, unicode.IsControl) >= 0 {
+		return nil, errors.New("ACP workspace broker executable is not an absolute current-process path")
+	}
+	if !filepath.IsAbs(worktree) || len(worktree) > 4096 || strings.IndexFunc(worktree, unicode.IsControl) >= 0 || len(revision) < 40 || len(revision) > sha256.Size*2 || strings.IndexFunc(revision, func(r rune) bool { return !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) }) >= 0 {
+		return nil, errors.New("ACP workspace broker binding is invalid")
+	}
+	if len(commands) == 0 || len(commands) > 8 {
+		return nil, errors.New("ACP workspace broker requires a bounded verifier manifest")
+	}
+	allowed := map[string]bool{"go-test": true, "go-vet": true, "cargo-test": true}
+	seen := make(map[string]bool, len(commands))
+	for _, id := range commands {
+		if !allowed[id] || seen[id] {
+			return nil, errors.New("ACP workspace broker has an unapproved verifier command")
+		}
+		seen[id] = true
+	}
+	return &WorkspaceBrokerDescriptor{command: command, args: []string{
+		"provider", "broker", "stdio", "--worktree", worktree, "--revision", revision, "--commands", strings.Join(commands, ","),
+	}}, nil
+}
+
+func (d WorkspaceBrokerDescriptor) validate() error {
+	if !filepath.IsAbs(d.command) || len(d.command) > 4096 || strings.IndexFunc(d.command, unicode.IsControl) >= 0 {
+		return errors.New("ACP workspace broker descriptor is invalid")
+	}
+	if len(d.args) != 9 || !slices.Equal(d.args[:3], []string{"provider", "broker", "stdio"}) || d.args[3] != "--worktree" || d.args[5] != "--revision" || d.args[7] != "--commands" {
+		return errors.New("ACP workspace broker descriptor is incomplete")
+	}
+	for _, value := range d.args {
+		if value == "" || len(value) > 4096 || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+			return errors.New("ACP workspace broker descriptor has invalid arguments")
+		}
+	}
+	return nil
+}
+
+func (d WorkspaceBrokerDescriptor) MarshalJSON() ([]byte, error) {
+	if err := d.validate(); err != nil {
+		return nil, err
+	}
+	return json.Marshal(struct {
+		Name    string   `json:"name"`
+		Command string   `json:"command"`
+		Args    []string `json:"args"`
+	}{Name: WorkspaceBrokerMCPName, Command: d.command, Args: append([]string(nil), d.args...)})
+}
+
+// BindingSHA256 is safe receipt evidence for the exact current executable,
+// worktree, revision, and verifier manifest. It exposes none of those values.
+func (d WorkspaceBrokerDescriptor) BindingSHA256() string {
+	if err := d.validate(); err != nil {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.Join(append([]string{d.command}, d.args...), "\x00")))
+	return hex.EncodeToString(sum[:])
+}
+
+// SessionMCPServers returns the exact redaction-safe descriptor shape sent in
+// session/new. It returns no servers unless NTM explicitly supplied the typed
+// workspace broker above.
+func (r Request) SessionMCPServers() ([]WorkspaceBrokerDescriptor, error) {
+	if r.Broker == nil {
+		return []WorkspaceBrokerDescriptor{}, nil
+	}
+	if err := r.Broker.validate(); err != nil {
+		return nil, err
+	}
+	copy := *r.Broker
+	copy.args = append([]string(nil), r.Broker.args...)
+	return []WorkspaceBrokerDescriptor{copy}, nil
 }
 
 // defaultReadOnlyAutomationPolicyArgs returns a fresh copy of the compiled
@@ -231,9 +345,11 @@ type Result struct {
 	OutputSHA256            string    `json:"output_sha256,omitempty"`
 	// ToolEventCount and ToolEventsSHA256 cover only the ACP tool_call and
 	// tool_call_update session-update variants. They never include raw tool
-	// arguments, results, or any other update payload.
-	ToolEventCount   int    `json:"tool_event_count"`
-	ToolEventsSHA256 string `json:"tool_events_sha256"`
+	// arguments, results, tool-call IDs, or any other update payload.
+	ToolEventCount    int    `json:"tool_event_count"`
+	ToolEventsSHA256  string `json:"tool_events_sha256"`
+	ToolRequestCount  int    `json:"tool_request_count"`
+	ToolCompleteCount int    `json:"tool_complete_count"`
 	// NonMessageUpdateCount and NonMessageUpdatesSHA256 retain a redaction-safe
 	// name-only sequence of every session/update other than agent_message_chunk,
 	// including tool updates and unknown or malformed updates. This prevents
@@ -242,6 +358,13 @@ type Result struct {
 	NonMessageUpdatesSHA256 string `json:"non_message_updates_sha256"`
 	Model                   string `json:"model,omitempty"`
 	ModelEvidence           string `json:"model_evidence,omitempty"`
+	ResolvedModel           string `json:"resolved_model,omitempty"`
+	ResolvedModelEvidence   string `json:"resolved_model_evidence,omitempty"`
+	// SessionSelectedModel is diagnostic selection state observed before the
+	// terminal completion. It must never be treated as proof of the model that
+	// actually served the request: a provider can remap after session creation.
+	SessionSelectedModel          string `json:"session_selected_model,omitempty"`
+	SessionModelSelectionEvidence string `json:"session_model_selection_evidence,omitempty"`
 	// Authenticated records only a completed ACP session whose cached_token
 	// authenticate request succeeded. It identifies neither an account nor an
 	// entitlement, and therefore is safe to expose in a redacted receipt.
@@ -253,11 +376,14 @@ type Result struct {
 	// Cancellation is distinct from Cleanup. ACP acknowledgement proves only
 	// that the local Grok agent completed this session/prompt as cancelled;
 	// Cleanup proves local process-tree control and reaping separately.
-	Cancellation ACPCancellationReceipt `json:"cancellation"`
-	Cleanup      ProcessCleanupReceipt  `json:"cleanup"`
-	Stderr       StderrDigest           `json:"stderr"`
-	StartedAt    time.Time              `json:"started_at"`
-	CompletedAt  time.Time              `json:"completed_at"`
+	Cancellation             ACPCancellationReceipt            `json:"cancellation"`
+	Cleanup                  ProcessCleanupReceipt             `json:"cleanup"`
+	Stderr                   StderrDigest                      `json:"stderr"`
+	StartedAt                time.Time                         `json:"started_at"`
+	CompletedAt              time.Time                         `json:"completed_at"`
+	RuntimeEvents            []provider.RuntimeEvent           `json:"runtime_events"`
+	RuntimeEventRequirements provider.RuntimeEventRequirements `json:"runtime_event_requirements"`
+	RuntimeEventContract     provider.EventContractReport      `json:"runtime_event_contract"`
 }
 
 const (
@@ -360,6 +486,10 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	if err := validateAutomationPolicyArgs(req.AutomationPolicyArgs); err != nil {
 		return finishFailure(result, ErrInvalidRequest, err)
 	}
+	mcpServers, err := req.SessionMCPServers()
+	if err != nil {
+		return finishFailure(result, ErrInvalidRequest, err)
+	}
 	args := make([]string, 0, 2+len(req.AutomationPolicyArgs)+4)
 	args = append(args, "--no-auto-update")
 	args = append(args, req.AutomationPolicyArgs...)
@@ -372,9 +502,11 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	args = append(args, "agent", "stdio")
 
 	proc, err := runner.Start(ctx, StartSpec{
-		Binary: req.Binary,
-		Args:   args,
-		CWD:    req.CWD,
+		Binary:         req.Binary,
+		Args:           args,
+		CWD:            req.CWD,
+		RuntimeHome:    req.RuntimeHome,
+		WorkspaceWrite: req.Broker != nil,
 	})
 	if err != nil {
 		return finishFailure(result, ErrDependencyMissing, fmt.Errorf("start grok ACP: %w", err))
@@ -383,6 +515,8 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	stderrDone := make(chan StderrDigest, 1)
 	go func() { stderrDone <- drainAndDigest(proc.Stderr(), MaxStderrCaptureBytes) }()
 	events := readRPCEvents(proc.Stdout())
+	promptMayHaveBeenAccepted := false
+	var updates updateAccumulator
 
 	// Closing stdin and reaping the child is mandatory even after a confirmed
 	// reply: this is a one-shot adapter, not a daemon owner. This local cleanup
@@ -412,14 +546,41 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 		}
 		result.Stderr = <-stderrDone
 		result.CompletedAt = time.Now().UTC()
+		result.RuntimeEventRequirements = provider.RuntimeEventRequirements{
+			ToolLifecycle: req.Broker != nil, CancellationRequested: result.Cancellation.Requested,
+		}
+		inputTokens, outputTokens, usageObserved := int64(0), int64(0), false
+		if result.Usage != nil {
+			usageObserved = result.Usage.InputTokens != nil || result.Usage.OutputTokens != nil || result.Usage.TotalTokens != nil
+			if result.Usage.InputTokens != nil {
+				inputTokens = *result.Usage.InputTokens
+			}
+			if result.Usage.OutputTokens != nil {
+				outputTokens = *result.Usage.OutputTokens
+			}
+		}
+		sessionRef := ""
+		if result.ProviderSessionID != "" {
+			sessionDigest := sha256.Sum256([]byte(result.ProviderSessionID))
+			sessionRef = hex.EncodeToString(sessionDigest[:])
+		}
+		result.RuntimeEvents = provider.NormalizeTerminalRuntimeObservation(provider.TerminalRuntimeObservation{
+			SessionRef: sessionRef, Model: result.Model, ResolvedModel: result.ResolvedModel, Accepted: promptMayHaveBeenAccepted,
+			ObservedToolEvents:       updates.runtimeToolEvents,
+			CancellationAcknowledged: result.Cancellation.AgentACPAcknowledged,
+			Completed:                result.CompletionConfirmed, UsageObserved: usageObserved,
+			InputTokens: inputTokens, OutputTokens: outputTokens,
+			CleanupObserved:   !result.Cleanup.ObservedAt.IsZero() && result.Cleanup.ResidualPIDs != nil && result.Cleanup.Reaped,
+			ResidualProcesses: len(result.Cleanup.ResidualPIDs),
+		})
+		result.RuntimeEventContract = provider.ValidateRuntimeEventsForModel(strings.TrimSpace(req.Model), result.RuntimeEvents, result.RuntimeEventRequirements)
 	}()
 
 	// Once session/prompt has been written, the provider may accept it even if
 	// the local response is lost. From that point a timeout is never safe to
 	// replay automatically.
-	promptMayHaveBeenAccepted := false
 	outputHasher := sha256.New()
-	updates := newUpdateAccumulator(outputHasher, req.ExpectedNonce, strings.TrimSpace(req.Model))
+	updates = newUpdateAccumulator(outputHasher, req.ExpectedNonce, strings.TrimSpace(req.Model))
 	nextID := 1
 	call := func(method string, params any) (json.RawMessage, error) {
 		id := nextID
@@ -457,7 +618,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	// does not establish that the cache can serve a completed session.
 	cachedTokenAuthenticated = true
 
-	newRaw, err := call("session/new", sessionNewParams{CWD: req.CWD, MCPServers: []any{}})
+	newRaw, err := call("session/new", sessionNewParams{CWD: req.CWD, MCPServers: mcpServers})
 	if err != nil {
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
 	}
@@ -503,24 +664,43 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	if err := json.Unmarshal(promptRaw, &prompt); err != nil {
 		return finishFailure(result, ErrProtocol, fmt.Errorf("decode session/prompt result: %w", err))
 	}
+	promptModel, resolvedModel, usage, err := prompt.completionMetadata()
+	if err != nil {
+		return finishFailure(result, ErrProtocol, err)
+	}
+	if strings.TrimSpace(req.RuntimeVersion) != "" && !cancellation.Requested {
+		expectedResolvedModel := ExpectedResolvedModel(strings.TrimSpace(req.RuntimeVersion), strings.TrimSpace(req.Model))
+		if expectedResolvedModel == "" || resolvedModel != expectedResolvedModel {
+			return finishFailure(result, ErrIdentityMismatch, errors.New("ACP terminal provider model does not match the reviewed runtime binding"))
+		}
+	}
 	// Once a terminal response has been matched to the original prompt request,
 	// retain only the receipt-safe metadata before deciding whether it was a
 	// normal completion or a cancellation acknowledgement.
 	result.StopReason = prompt.StopReason
-	result.Model = strings.TrimSpace(prompt.Model)
+	result.Model = promptModel
 	if result.Model != "" {
+		// Only terminal completion metadata is served-model evidence. Session
+		// selection state is retained separately below and cannot promote an
+		// operation because it cannot rule out a provider-side remap.
 		result.ModelEvidence = "completion_metadata"
-	} else if updates.sessionModelObserved {
-		result.Model = strings.TrimSpace(req.Model)
-		result.ModelEvidence = "provider_session_notification_plus_exact_launch"
-	} else if sessionConfigModelObserved {
-		result.Model = sessionConfigModel
-		result.ModelEvidence = "session_config_option_plus_exact_launch"
-	} else if sessionModelStateObserved {
-		result.Model = sessionModelStateModel
-		result.ModelEvidence = "session_model_state_plus_exact_launch"
 	}
-	result.Usage = prompt.Usage.canonical()
+	result.ResolvedModel = resolvedModel
+	if result.ResolvedModel != "" {
+		result.ResolvedModelEvidence = "completion_metadata.usage.model_usage_singleton"
+	}
+	switch {
+	case updates.sessionModelObserved:
+		result.SessionSelectedModel = strings.TrimSpace(req.Model)
+		result.SessionModelSelectionEvidence = "provider_session_notification_plus_exact_launch"
+	case sessionConfigModelObserved:
+		result.SessionSelectedModel = sessionConfigModel
+		result.SessionModelSelectionEvidence = "session_config_option_plus_exact_launch"
+	case sessionModelStateObserved:
+		result.SessionSelectedModel = sessionModelStateModel
+		result.SessionModelSelectionEvidence = "session_model_state_plus_exact_launch"
+	}
+	result.Usage = usage
 	if cancellation.Requested {
 		result.CompletionConfirmed = strings.TrimSpace(result.StopReason) != ""
 		applyUpdateReceipt(&result, &updates, outputHasher)
@@ -566,6 +746,8 @@ func applyUpdateReceipt(result *Result, updates *updateAccumulator, outputHasher
 	result.OutputSHA256 = hex.EncodeToString(outputHasher.Sum(nil))
 	result.ToolEventCount = updates.toolEventCount
 	result.ToolEventsSHA256 = hex.EncodeToString(updates.toolEventHasher.Sum(nil))
+	result.ToolRequestCount = updates.toolRequestCount
+	result.ToolCompleteCount = updates.toolCompleteCount
 	result.NonMessageUpdateCount = updates.nonMessageUpdateCount
 	result.NonMessageUpdatesSHA256 = hex.EncodeToString(updates.nonMessageUpdateHasher.Sum(nil))
 }
@@ -701,7 +883,9 @@ func drainPostResponseUpdates(ctx context.Context, events <-chan rpcEvent, updat
 			if event.message.Method != "session/update" {
 				return errors.New("unexpected ACP message after session/prompt response")
 			}
-			updates.observe(event.message.Params)
+			if err := updates.observe(event.message.Params); err != nil {
+				return err
+			}
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
@@ -883,8 +1067,8 @@ type authenticateParams struct {
 }
 
 type sessionNewParams struct {
-	CWD        string `json:"cwd"`
-	MCPServers []any  `json:"mcpServers"`
+	CWD        string                      `json:"cwd"`
+	MCPServers []WorkspaceBrokerDescriptor `json:"mcpServers"`
 }
 
 type sessionNewResult struct {
@@ -986,17 +1170,44 @@ type sessionPromptParams struct {
 }
 
 type sessionPromptResult struct {
-	StopReason string      `json:"stopReason"`
-	Model      string      `json:"model"`
-	Usage      promptUsage `json:"usage"`
+	StopReason string                `json:"stopReason"`
+	Model      string                `json:"model"`
+	Usage      promptUsage           `json:"usage"`
+	Meta       sessionPromptMetadata `json:"_meta"`
+}
+
+type sessionPromptMetadata struct {
+	ModelID string              `json:"modelId"`
+	Usage   promptMetadataUsage `json:"usage"`
+}
+
+type promptMetadataUsage struct {
+	InputTokens         *int64                     `json:"inputTokens"`
+	OutputTokens        *int64                     `json:"outputTokens"`
+	TotalTokens         *int64                     `json:"totalTokens"`
+	CachedReadTokens    *int64                     `json:"cachedReadTokens"`
+	CacheCreationTokens *int64                     `json:"cacheCreationTokens"`
+	ReasoningTokens     *int64                     `json:"reasoningTokens"`
+	ModelCalls          *int64                     `json:"modelCalls"`
+	NumTurns            *int64                     `json:"numTurns"`
+	APIDurationMS       *int64                     `json:"apiDurationMs"`
+	CostUSDTicks        *int64                     `json:"costUsdTicks"`
+	ModelUsage          map[string]json.RawMessage `json:"modelUsage"`
 }
 
 // Usage records only provider-supplied counters. Nil means the corresponding
 // counter was absent, rather than falsely asserting a zero value.
 type Usage struct {
-	InputTokens  *int64 `json:"input_tokens,omitempty"`
-	OutputTokens *int64 `json:"output_tokens,omitempty"`
-	TotalTokens  *int64 `json:"total_tokens,omitempty"`
+	InputTokens         *int64 `json:"input_tokens,omitempty"`
+	OutputTokens        *int64 `json:"output_tokens,omitempty"`
+	TotalTokens         *int64 `json:"total_tokens,omitempty"`
+	CachedReadTokens    *int64 `json:"cached_read_tokens,omitempty"`
+	CacheCreationTokens *int64 `json:"cache_creation_tokens,omitempty"`
+	ReasoningTokens     *int64 `json:"reasoning_tokens,omitempty"`
+	ModelCalls          *int64 `json:"model_calls,omitempty"`
+	NumTurns            *int64 `json:"num_turns,omitempty"`
+	APIDurationMS       *int64 `json:"api_duration_ms,omitempty"`
+	CostUSDTicks        *int64 `json:"cost_usd_ticks,omitempty"`
 }
 
 type promptUsage struct {
@@ -1018,6 +1229,89 @@ func (u promptUsage) canonical() *Usage {
 		return nil
 	}
 	return usage
+}
+
+func (p sessionPromptResult) completionMetadata() (string, string, *Usage, error) {
+	topLevelModel := strings.TrimSpace(p.Model)
+	metaModel := strings.TrimSpace(p.Meta.ModelID)
+	if topLevelModel != "" && metaModel != "" && topLevelModel != metaModel {
+		return "", "", nil, errors.New("ACP terminal completion reported conflicting model identifiers")
+	}
+	model := firstNonEmpty(topLevelModel, metaModel)
+	if len(model) > 4096 || strings.IndexFunc(model, unicode.IsControl) >= 0 {
+		return "", "", nil, errors.New("ACP terminal completion reported an invalid model identifier")
+	}
+	resolvedModel, err := p.Meta.Usage.resolvedModel()
+	if err != nil {
+		return "", "", nil, err
+	}
+	usage, err := mergePromptUsage(p.Usage.canonical(), p.Meta.Usage.canonical())
+	if err != nil {
+		return "", "", nil, err
+	}
+	return model, resolvedModel, usage, nil
+}
+
+func (u promptMetadataUsage) resolvedModel() (string, error) {
+	if len(u.ModelUsage) == 0 {
+		return "", nil
+	}
+	if len(u.ModelUsage) != 1 {
+		return "", errors.New("ACP terminal completion reported multiple provider models")
+	}
+	for model := range u.ModelUsage {
+		model = strings.TrimSpace(model)
+		if model == "" || len(model) > 4096 || strings.IndexFunc(model, unicode.IsControl) >= 0 {
+			return "", errors.New("ACP terminal completion reported an invalid resolved model")
+		}
+		return model, nil
+	}
+	return "", nil
+}
+
+func (u promptMetadataUsage) canonical() *Usage {
+	usage := &Usage{
+		InputTokens: cloneInt64Pointer(u.InputTokens), OutputTokens: cloneInt64Pointer(u.OutputTokens), TotalTokens: cloneInt64Pointer(u.TotalTokens),
+		CachedReadTokens: cloneInt64Pointer(u.CachedReadTokens), CacheCreationTokens: cloneInt64Pointer(u.CacheCreationTokens), ReasoningTokens: cloneInt64Pointer(u.ReasoningTokens),
+		ModelCalls: cloneInt64Pointer(u.ModelCalls), NumTurns: cloneInt64Pointer(u.NumTurns), APIDurationMS: cloneInt64Pointer(u.APIDurationMS), CostUSDTicks: cloneInt64Pointer(u.CostUSDTicks),
+	}
+	if usage.InputTokens == nil && usage.OutputTokens == nil && usage.TotalTokens == nil && usage.CachedReadTokens == nil && usage.CacheCreationTokens == nil && usage.ReasoningTokens == nil && usage.ModelCalls == nil && usage.NumTurns == nil && usage.APIDurationMS == nil && usage.CostUSDTicks == nil {
+		return nil
+	}
+	return usage
+}
+
+func mergePromptUsage(primary, metadata *Usage) (*Usage, error) {
+	if primary == nil {
+		return metadata, nil
+	}
+	if metadata == nil {
+		return primary, nil
+	}
+	for _, pair := range [][2]*int64{{primary.InputTokens, metadata.InputTokens}, {primary.OutputTokens, metadata.OutputTokens}, {primary.TotalTokens, metadata.TotalTokens}} {
+		if pair[0] != nil && pair[1] != nil && *pair[0] != *pair[1] {
+			return nil, errors.New("ACP terminal completion reported conflicting usage counters")
+		}
+	}
+	merged := *metadata
+	if merged.InputTokens == nil {
+		merged.InputTokens = cloneInt64Pointer(primary.InputTokens)
+	}
+	if merged.OutputTokens == nil {
+		merged.OutputTokens = cloneInt64Pointer(primary.OutputTokens)
+	}
+	if merged.TotalTokens == nil {
+		merged.TotalTokens = cloneInt64Pointer(primary.TotalTokens)
+	}
+	return &merged, nil
+}
+
+func cloneInt64Pointer(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
 }
 
 func firstNonNilInt64(values ...*int64) *int64 {
@@ -1154,7 +1448,9 @@ func consumeResponseEvent(event rpcEvent, requestID int, updates *updateAccumula
 		return nil, false, event.err
 	}
 	if event.message.Method == "session/update" {
-		updates.observe(event.message.Params)
+		if err := updates.observe(event.message.Params); err != nil {
+			return nil, false, err
+		}
 		return nil, false, nil
 	}
 	if isBenignACPNotification(event.message) {
@@ -1208,6 +1504,10 @@ type updateAccumulator struct {
 	nonce                  nonceMatcher
 	toolEventHasher        hash.Hash
 	toolEventCount         int
+	toolRequestCount       int
+	toolCompleteCount      int
+	runtimeToolEvents      []provider.RuntimeEvent
+	toolCalls              map[string]acpToolCall
 	nonMessageUpdateHasher hash.Hash
 	nonMessageUpdateCount  int
 	expectedModel          string
@@ -1218,7 +1518,7 @@ type updateAccumulator struct {
 func newUpdateAccumulator(hasher io.Writer, nonce, expectedModel string) updateAccumulator {
 	return updateAccumulator{
 		hasher: hasher, nonce: newNonceMatcher(nonce), toolEventHasher: sha256.New(), nonMessageUpdateHasher: sha256.New(),
-		expectedModel: strings.TrimSpace(expectedModel),
+		expectedModel: strings.TrimSpace(expectedModel), toolCalls: make(map[string]acpToolCall),
 	}
 }
 
@@ -1249,10 +1549,12 @@ func (a *updateAccumulator) observeVendorNotification(method string, params json
 	}
 }
 
-func (a *updateAccumulator) observe(params json.RawMessage) {
+func (a *updateAccumulator) observe(params json.RawMessage) error {
 	var envelope struct {
 		Update struct {
-			SessionUpdate string `json:"sessionUpdate"`
+			SessionUpdate string          `json:"sessionUpdate"`
+			ToolCallID    string          `json:"toolCallId"`
+			Status        json.RawMessage `json:"status"`
 			Content       struct {
 				Text string `json:"text"`
 			} `json:"content"`
@@ -1260,7 +1562,7 @@ func (a *updateAccumulator) observe(params json.RawMessage) {
 	}
 	if json.Unmarshal(params, &envelope) != nil {
 		a.recordNonMessageUpdate("unknown")
-		return
+		return nil
 	}
 	if envelope.Update.SessionUpdate != "agent_message_chunk" {
 		name := envelope.Update.SessionUpdate
@@ -1269,24 +1571,102 @@ func (a *updateAccumulator) observe(params json.RawMessage) {
 		}
 		a.recordNonMessageUpdate(name)
 		if name == "tool_call" || name == "tool_call_update" {
-			a.recordToolEvent(name)
+			if err := a.recordToolEvent(name, envelope.Update.ToolCallID, envelope.Update.Status); err != nil {
+				return err
+			}
 		}
-		return
+		return nil
 	}
 	if envelope.Update.Content.Text == "" {
-		return
+		return nil
 	}
 	_, _ = io.WriteString(a.hasher, envelope.Update.Content.Text)
 	a.nonce.WriteString(envelope.Update.Content.Text)
 	a.chunks++
 	a.bytes += int64(len(envelope.Update.Content.Text))
+	return nil
 }
 
-func (a *updateAccumulator) recordToolEvent(name string) {
+type acpToolCall struct {
+	ref      string
+	terminal bool
+}
+
+func (a *updateAccumulator) recordToolEvent(name, toolCallID string, rawStatus json.RawMessage) error {
 	if a == nil {
-		return
+		return errors.New("ACP tool lifecycle accumulator is unavailable")
+	}
+	key, err := acpToolCallKey(toolCallID)
+	if err != nil {
+		return err
+	}
+	switch name {
+	case "tool_call":
+		if _, exists := a.toolCalls[key]; exists {
+			return errors.New("ACP emitted a duplicate tool_call id")
+		}
+		a.toolRequestCount++
+		ref := fmt.Sprintf("tool-%06d", a.toolRequestCount)
+		a.toolCalls[key] = acpToolCall{ref: ref}
+		a.runtimeToolEvents = append(a.runtimeToolEvents, provider.RuntimeEvent{
+			Type: provider.EventToolRequested, Tool: ref,
+		})
+	case "tool_call_update":
+		status, present, err := acpToolStatus(rawStatus)
+		if err != nil {
+			return err
+		}
+		if !present || status == "pending" || status == "in_progress" {
+			break
+		}
+		call, exists := a.toolCalls[key]
+		if !exists {
+			return errors.New("ACP terminal tool_call_update has no matching tool_call")
+		}
+		if call.terminal {
+			return errors.New("ACP emitted a duplicate terminal tool_call_update")
+		}
+		call.terminal = true
+		a.toolCalls[key] = call
+		// EventToolCompleted means the requested tool reached a terminal state,
+		// not that it succeeded. Provider-specific evidence retains the outcome;
+		// the shared contract uses this event to close the request lifecycle for
+		// completed, failed, and policy-denied calls alike.
+		a.toolCompleteCount++
+		a.runtimeToolEvents = append(a.runtimeToolEvents, provider.RuntimeEvent{
+			Type: provider.EventToolCompleted, Tool: call.ref,
+		})
+	default:
+		return errors.New("ACP tool lifecycle has an invalid update type")
 	}
 	a.recordUpdateName(a.toolEventHasher, &a.toolEventCount, name)
+	return nil
+}
+
+func acpToolCallKey(toolCallID string) (string, error) {
+	if toolCallID == "" || len(toolCallID) > 512 || strings.IndexFunc(toolCallID, unicode.IsControl) >= 0 {
+		return "", errors.New("ACP tool lifecycle update has no valid tool_call id")
+	}
+	// The raw provider ID is used only while parsing this notification. The
+	// accumulator keeps a digest key and receipts expose only synthetic refs.
+	sum := sha256.Sum256([]byte(toolCallID))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func acpToolStatus(raw json.RawMessage) (string, bool, error) {
+	if len(raw) == 0 {
+		return "", false, nil
+	}
+	var status string
+	if err := json.Unmarshal(raw, &status); err != nil || status == "" {
+		return "", false, errors.New("ACP tool_call_update has an invalid status")
+	}
+	switch status {
+	case "pending", "in_progress", "completed", "failed":
+		return status, true, nil
+	default:
+		return "", false, errors.New("ACP tool_call_update has an invalid status")
+	}
 }
 
 func (a *updateAccumulator) recordNonMessageUpdate(name string) {
@@ -1380,7 +1760,7 @@ func ValidNonce(value string) bool {
 func minimalGrokEnvironment(environ []string) []string {
 	order := []string{
 		"PATH", "HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
-		"SSL_CERT_FILE", "SSL_CERT_DIR", "TMPDIR", "TMP", "TEMP",
+		"TMPDIR", "TMP", "TEMP",
 		"SystemRoot", "WINDIR", "ComSpec", "PATHEXT",
 	}
 	allowed := make(map[string]string, len(order))
@@ -1418,6 +1798,71 @@ func minimalGrokEnvironment(environ []string) []string {
 		}
 	}
 	return result
+}
+
+// IsolatedProcessEnvironment returns the only environment accepted by live
+// Grok automation. It deliberately replaces HOME/XDG state and disables every
+// documented Claude/Cursor compatibility scanner so an ambient profile cannot
+// add tools, hooks, rules, agents, or credentials. Project configuration is
+// separately rejected by the live `grok inspect --json` authority check.
+func IsolatedProcessEnvironment(environ []string, runtimeHome string, workspaceWrite bool) ([]string, error) {
+	runtimeHome = filepath.Clean(strings.TrimSpace(runtimeHome))
+	if !filepath.IsAbs(runtimeHome) || runtimeHome == "." || len(runtimeHome) > 4096 || strings.IndexFunc(runtimeHome, unicode.IsControl) >= 0 {
+		return nil, errors.New("Grok runtime home must be an absolute isolated path")
+	}
+	base := minimalGrokEnvironment(environ)
+	overrides := map[string]string{
+		"HOME":                       runtimeHome,
+		"USERPROFILE":                runtimeHome,
+		"XDG_CONFIG_HOME":            filepath.Join(runtimeHome, ".xdg-config"),
+		"XDG_CACHE_HOME":             filepath.Join(runtimeHome, ".cache"),
+		"XDG_DATA_HOME":              filepath.Join(runtimeHome, ".local", "share"),
+		"GROK_HOME":                  runtimeHome,
+		"GROK_DISABLE_AUTOUPDATER":   "1",
+		"GROK_MEMORY":                "0",
+		"GROK_SUBAGENTS":             "0",
+		"GROK_TOOL_SEARCH":           "0",
+		"GROK_LSP_TOOLS":             "0",
+		"GROK_CURSOR_SKILLS_ENABLED": "0",
+		"GROK_CURSOR_RULES_ENABLED":  "0",
+		"GROK_CURSOR_AGENTS_ENABLED": "0",
+		"GROK_CURSOR_MCPS_ENABLED":   "0",
+		"GROK_CURSOR_HOOKS_ENABLED":  "0",
+		"GROK_CLAUDE_SKILLS_ENABLED": "0",
+		"GROK_CLAUDE_RULES_ENABLED":  "0",
+		"GROK_CLAUDE_AGENTS_ENABLED": "0",
+		"GROK_CLAUDE_MCPS_ENABLED":   "0",
+		"GROK_CLAUDE_HOOKS_ENABLED":  "0",
+	}
+	// Workspace mutations are available only through the typed NTM MCP
+	// broker. Grok's built-in write surface remains disabled in every mode.
+	overrides["GROK_WRITE_FILE"] = "0"
+	_ = workspaceWrite
+
+	order := []string{
+		"PATH", "TMPDIR", "TMP", "TEMP", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT",
+		"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "GROK_HOME",
+		"GROK_DISABLE_AUTOUPDATER", "GROK_MEMORY", "GROK_SUBAGENTS", "GROK_WRITE_FILE", "GROK_TOOL_SEARCH", "GROK_LSP_TOOLS",
+		"GROK_CURSOR_SKILLS_ENABLED", "GROK_CURSOR_RULES_ENABLED", "GROK_CURSOR_AGENTS_ENABLED", "GROK_CURSOR_MCPS_ENABLED", "GROK_CURSOR_HOOKS_ENABLED",
+		"GROK_CLAUDE_SKILLS_ENABLED", "GROK_CLAUDE_RULES_ENABLED", "GROK_CLAUDE_AGENTS_ENABLED", "GROK_CLAUDE_MCPS_ENABLED", "GROK_CLAUDE_HOOKS_ENABLED",
+	}
+	values := make(map[string]string, len(base)+len(overrides))
+	for _, entry := range base {
+		name, value, ok := strings.Cut(entry, "=")
+		if ok {
+			values[name] = value
+		}
+	}
+	for name, value := range overrides {
+		values[name] = value
+	}
+	result := make([]string, 0, len(order))
+	for _, name := range order {
+		if value, ok := values[name]; ok {
+			result = append(result, name+"="+value)
+		}
+	}
+	return result, nil
 }
 
 func drainAndDigest(reader io.Reader, capBytes int64) StderrDigest {

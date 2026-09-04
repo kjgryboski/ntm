@@ -110,7 +110,7 @@ func providerGrokBypassProbeArgs(resolvedBinary string) []string {
 	grokArgs := []string{
 		"--no-auto-update",
 		"--always-approve",
-		"--sandbox", "read-only",
+		"--sandbox", "strict",
 		"--disable-web-search",
 		"--no-subagents",
 		"--no-memory",

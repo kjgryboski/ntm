@@ -29,11 +29,13 @@ import (
 const providerSessionSchema = "ntm.provider-session.v2"
 
 type providerSessionOptions struct {
-	profile   string
-	sessionID string
-	cwd       string
-	prompt    string
-	timeout   time.Duration
+	profile          string
+	sessionID        string
+	cwd              string
+	prompt           string
+	timeout          time.Duration
+	qualificationDir string
+	qualificationAge time.Duration
 }
 
 type providerSessionAdmission interface {
@@ -52,11 +54,13 @@ type providerSessionDependencies struct {
 	rootOwned            func(os.FileInfo) bool
 	trustExecutable      func(string) (string, error)
 	readRequirements     func(string) ([]byte, os.FileInfo, error)
-	inspectGrok          func(context.Context, string, string) (providerGrokInspection, error)
+	inspectGrok          func(context.Context, string, string, string) (providerGrokInspection, error)
 	probeGrokBypassLock  func(context.Context, string) (providerGrokBypassProbe, error)
 	isLinkedWorktree     func(context.Context, string) (bool, error)
 	attestationPreflight func(context.Context) error
 	sign                 func(context.Context, []byte) (providerattestation.SignatureMetadata, error)
+	pinnedSigner         func(config.ProviderProfileConfig) (func(context.Context, []byte) (providerattestation.SignatureMetadata, error), error)
+	authorizeOperation   func(providerOperationAuthorization) (string, error)
 	hashBinary           func(string) (string, error)
 	recordTelemetry      func(context.Context, providertelemetry.Observation) (providertelemetry.Observation, error)
 	run                  func(context.Context, grok.LifecycleRunner, grok.SessionRequest) (grok.SessionReceipt, error)
@@ -79,6 +83,8 @@ var providerSessionDeps = providerSessionDependencies{
 	isLinkedWorktree:     providerIsLinkedGitWorktree,
 	attestationPreflight: providerSessionAttestationPreflight,
 	sign:                 signProviderReceiptPayload,
+	pinnedSigner:         providerGrokPinnedSigner,
+	authorizeOperation:   authorizeProviderOperation,
 	hashBinary:           hashProviderSessionExecutable,
 	recordTelemetry:      recordProviderTelemetryDefault,
 	run:                  grok.ExecuteSession,
@@ -96,24 +102,25 @@ type providerSessionAdmissionEvidence struct {
 }
 
 type providerSessionOutput struct {
-	SchemaVersion  string                                 `json:"schema_version"`
-	Success        bool                                   `json:"success"`
-	Profile        string                                 `json:"profile"`
-	Transport      string                                 `json:"transport"`
-	IdentitySHA256 string                                 `json:"identity_sha256"`
-	Policy         string                                 `json:"policy"`
-	PolicySHA256   string                                 `json:"policy_sha256"`
-	ConfigSHA256   string                                 `json:"config_sha256"`
-	BinarySHA256   string                                 `json:"binary_sha256"`
-	CWD_SHA256     string                                 `json:"cwd_sha256"`
-	WorktreeSHA256 string                                 `json:"worktree_sha256"`
-	Dispatched     bool                                   `json:"dispatched"`
-	Admission      providerSessionAdmissionEvidence       `json:"admission"`
-	Receipt        grok.SessionReceipt                    `json:"receipt"`
-	FailureCode    grok.ErrorCode                         `json:"failure_code,omitempty"`
-	ErrorSHA256    string                                 `json:"error_sha256,omitempty"`
-	Telemetry      providerTelemetryEvidence              `json:"telemetry"`
-	Attestation    *providerattestation.SignatureMetadata `json:"attestation,omitempty"`
+	SchemaVersion       string                                 `json:"schema_version"`
+	Success             bool                                   `json:"success"`
+	Profile             string                                 `json:"profile"`
+	Transport           string                                 `json:"transport"`
+	IdentitySHA256      string                                 `json:"identity_sha256"`
+	Policy              string                                 `json:"policy"`
+	PolicySHA256        string                                 `json:"policy_sha256"`
+	ConfigSHA256        string                                 `json:"config_sha256"`
+	BinarySHA256        string                                 `json:"binary_sha256"`
+	QualificationSHA256 string                                 `json:"qualification_receipt_sha256"`
+	CWD_SHA256          string                                 `json:"cwd_sha256"`
+	WorktreeSHA256      string                                 `json:"worktree_sha256"`
+	Dispatched          bool                                   `json:"dispatched"`
+	Admission           providerSessionAdmissionEvidence       `json:"admission"`
+	Receipt             grok.SessionReceipt                    `json:"receipt"`
+	FailureCode         grok.ErrorCode                         `json:"failure_code,omitempty"`
+	ErrorSHA256         string                                 `json:"error_sha256,omitempty"`
+	Telemetry           providerTelemetryEvidence              `json:"telemetry"`
+	Attestation         *providerattestation.SignatureMetadata `json:"attestation,omitempty"`
 }
 
 func newProviderSessionCmd() *cobra.Command {
@@ -126,7 +133,7 @@ func newProviderSessionCmd() *cobra.Command {
 }
 
 func newProviderSessionActionCmd(action grok.SessionAction) *cobra.Command {
-	opts := providerSessionOptions{cwd: ".", timeout: 10 * time.Minute}
+	opts := providerSessionOptions{cwd: ".", timeout: 10 * time.Minute, qualificationAge: 24 * time.Hour}
 	actionName := string(action)
 	actionTitle := strings.ToUpper(actionName[:1]) + actionName[1:]
 	cmd := &cobra.Command{
@@ -142,6 +149,8 @@ func newProviderSessionActionCmd(action grok.SessionAction) *cobra.Command {
 	cmd.Flags().StringVar(&opts.cwd, "cwd", opts.cwd, "Working directory for the provider session")
 	cmd.Flags().StringVar(&opts.prompt, "prompt", "", "Prompt to execute (required; never retained)")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", opts.timeout, "Bounded provider operation timeout")
+	cmd.Flags().StringVar(&opts.qualificationDir, "qualification-store", "", "Override signed lifecycle qualification receipt directory")
+	cmd.Flags().DurationVar(&opts.qualificationAge, "max-qualification-age", opts.qualificationAge, "Maximum age of the signed lifecycle qualification")
 	return cmd
 }
 
@@ -149,10 +158,13 @@ func runProviderSession(cmd *cobra.Command, action grok.SessionAction, opts prov
 	if strings.TrimSpace(opts.profile) == "" || strings.TrimSpace(opts.sessionID) == "" || strings.TrimSpace(opts.prompt) == "" {
 		return errors.New("provider session requires exact --profile, --session-id, and --prompt values")
 	}
-	if opts.timeout <= 0 {
-		return errors.New("provider session timeout must be positive")
+	if opts.qualificationAge == 0 {
+		opts.qualificationAge = 24 * time.Hour
 	}
-	if deps.loadConfig == nil || deps.lookPath == nil || deps.trustExecutable == nil || deps.version == nil || (deps.readRequirements == nil && (deps.readFile == nil || deps.stat == nil)) || deps.rootOwned == nil || deps.inspectGrok == nil || deps.probeGrokBypassLock == nil || deps.isLinkedWorktree == nil || deps.attestationPreflight == nil || deps.sign == nil || deps.hashBinary == nil || deps.recordTelemetry == nil || deps.run == nil || deps.runner == nil || deps.admission == nil || deps.now == nil {
+	if opts.timeout <= 0 || opts.qualificationAge <= 0 {
+		return errors.New("provider session timeout and qualification age must be positive")
+	}
+	if deps.loadConfig == nil || deps.lookPath == nil || deps.trustExecutable == nil || deps.version == nil || (deps.readRequirements == nil && (deps.readFile == nil || deps.stat == nil)) || deps.rootOwned == nil || deps.inspectGrok == nil || deps.probeGrokBypassLock == nil || deps.isLinkedWorktree == nil || deps.attestationPreflight == nil || deps.sign == nil || deps.authorizeOperation == nil || deps.hashBinary == nil || deps.recordTelemetry == nil || deps.run == nil || deps.runner == nil || deps.admission == nil || deps.now == nil {
 		return errors.New("provider session dependencies are incomplete")
 	}
 
@@ -170,6 +182,17 @@ func runProviderSession(cmd *cobra.Command, action grok.SessionAction, opts prov
 	}
 	if identity.Provider() != "xai" || identity.Runtime() != "grok" {
 		return errors.New("provider session resume/fork requires an exact native Grok profile")
+	}
+	sign := deps.sign
+	attestationPreflight := deps.attestationPreflight
+	if deps.pinnedSigner != nil {
+		sign, err = deps.pinnedSigner(profile)
+		if err != nil {
+			return errors.New("provider session profile-pinned receipt signer is unavailable")
+		}
+		attestationPreflight = func(ctx context.Context) error {
+			return providerSessionAttestationPreflightWithSigner(ctx, sign)
+		}
 	}
 	policy, ok := agent.GrokAutomationPolicy(profile.AutomationPolicy)
 	if !ok {
@@ -236,11 +259,24 @@ func runProviderSession(cmd *cobra.Command, action grok.SessionAction, opts prov
 	// Signing capability must be available before the provider can receive a
 	// prompt. Attestation keys are initialized only by `provider attestation
 	// init`; this preflight never creates a key during a live session run.
-	if err := deps.attestationPreflight(commandCtx); err != nil {
+	if err := attestationPreflight(commandCtx); err != nil {
 		output.FailureCode = grok.ErrProvider
 		output.ErrorSHA256 = safeErrorDigest(err)
 		return finishProviderSession(cmd, output, errors.New("provider session requires a ready OS-protected receipt attestation key before dispatch"))
 	}
+	signerPreflight, err := preflightProviderReceiptSignerMetadata(commandCtx, sign)
+	if err != nil {
+		return finishProviderSession(cmd, output, errors.New("provider session could not bind the trusted receipt signer before dispatch"))
+	}
+	qualificationSHA256, err := deps.authorizeOperation(providerOperationAuthorization{
+		Identity: identity, Transport: "xai_headless_session", PolicySHA256: output.PolicySHA256, RuntimeVersion: profile.RuntimeVersion, RuntimeSHA256: output.BinarySHA256,
+		Operation: providerOperationLifecycle, QualificationDir: opts.qualificationDir, MaxQualificationAge: opts.qualificationAge,
+		TrustedSigner: signerPreflight.KeyMetadata,
+	})
+	if err != nil {
+		return finishProviderSession(cmd, output, fmt.Errorf("provider lifecycle operation gate denied dispatch: %w", err))
+	}
+	output.QualificationSHA256 = qualificationSHA256
 	decision := deps.admission.Acquire(identity)
 	output.Admission = providerSessionAdmissionEvidence{
 		Allowed: decision.Allowed, Reason: decision.Reason, RetryAt: decision.RetryAt,
@@ -266,7 +302,7 @@ func runProviderSession(cmd *cobra.Command, action grok.SessionAction, opts prov
 	output.Dispatched = true
 	receipt, runErr := deps.run(runCtx, deps.runner, grok.SessionRequest{
 		Action: action, SessionID: opts.sessionID, Prompt: transmittedPrompt, CWD: cwd,
-		Worktree: cwd, Binary: binary, Model: identity.Model(), RuntimeVersion: profile.RuntimeVersion, ExpectedNonce: nonce,
+		Worktree: cwd, Binary: binary, RuntimeHome: profile.RuntimeHome, WorkspaceWrite: profile.AutomationPolicy == agent.GrokWorkspaceWritePolicyName, Model: identity.Model(), RuntimeVersion: profile.RuntimeVersion, ExpectedNonce: nonce,
 		PolicySHA256: output.PolicySHA256, ConfigSHA256: output.ConfigSHA256, BinarySHA256: output.BinarySHA256,
 		// Grok binds sessions to their original sandbox. The root-owned managed
 		// requirements above remain authoritative; lifecycle invocations retain
@@ -286,7 +322,7 @@ func runProviderSession(cmd *cobra.Command, action grok.SessionAction, opts prov
 		}
 		output.ErrorSHA256 = safeErrorDigest(runErr)
 		output.Telemetry = recordProviderTelemetryEvidence(commandCtx, deps.recordTelemetry, providerSessionTelemetryObservation(identity, output.PolicySHA256, profile.RuntimeVersion, receipt, provider.ErrorUnknown, "unchanged", startedAt, completedAt))
-		if err := sealProviderSessionOutput(commandCtx, &output, deps.sign); err != nil {
+		if err := sealProviderSessionOutput(commandCtx, &output, sign); err != nil {
 			output.ErrorSHA256 = safeErrorDigest(err)
 			return finishProviderSession(cmd, output, errors.New("Grok session failed and its execution receipt could not be attested"))
 		}
@@ -294,7 +330,7 @@ func runProviderSession(cmd *cobra.Command, action grok.SessionAction, opts prov
 	}
 	output.Success = true
 	output.Telemetry = recordProviderTelemetryEvidence(commandCtx, deps.recordTelemetry, providerSessionTelemetryObservation(identity, output.PolicySHA256, profile.RuntimeVersion, receipt, "", "closed", startedAt, completedAt))
-	if err := sealProviderSessionOutput(commandCtx, &output, deps.sign); err != nil {
+	if err := sealProviderSessionOutput(commandCtx, &output, sign); err != nil {
 		output.Success = false
 		output.FailureCode = grok.ErrProvider
 		output.ErrorSHA256 = safeErrorDigest(err)
@@ -323,6 +359,9 @@ func finishProviderSession(cmd *cobra.Command, output providerSessionOutput, run
 		}
 		_, err := fmt.Fprintf(cmd.OutOrStdout(), "Identity: %s\nChild session hash: %s\n", output.IdentitySHA256, output.Receipt.ChildSessionSHA256)
 		return err
+	}
+	if runErr != nil && !output.Dispatched {
+		return runErr
 	}
 	code := output.FailureCode
 	if code == "" {
@@ -362,6 +401,9 @@ func sealProviderSessionOutput(ctx context.Context, output *providerSessionOutpu
 	if err != nil {
 		return err
 	}
+	if err := providerattestation.ValidateBridgePayload(payload); err != nil {
+		return fmt.Errorf("Grok session receipt violates the signing bridge contract: %w", err)
+	}
 	signature, err := sign(ctx, payload)
 	if err != nil {
 		return err
@@ -378,7 +420,7 @@ func sealProviderSessionOutput(ctx context.Context, output *providerSessionOutpu
 // is applied immediately before output and remains available to a future
 // reader without trusting a decoded receipt by default.
 func validProviderSessionOutput(output providerSessionOutput) bool {
-	if output.Attestation == nil || !output.Dispatched || output.SchemaVersion != providerSessionSchema || output.Transport != "xai_headless_session" || !validProviderTelemetryEvidence(output.Telemetry) {
+	if output.Attestation == nil || !output.Dispatched || output.SchemaVersion != providerSessionSchema || output.Transport != "xai_headless_session" || !validProviderNativeDigest(output.QualificationSHA256) || !validProviderTelemetryEvidence(output.Telemetry) {
 		return false
 	}
 	if output.Success {
@@ -392,7 +434,7 @@ func validProviderSessionOutput(output providerSessionOutput) bool {
 		return false
 	}
 	payload, err := canonicalProviderSessionOutput(output)
-	return err == nil && providerattestation.Verify(payload, *output.Attestation) == nil
+	return err == nil && providerattestation.ValidateBridgePayload(payload) == nil && providerattestation.Verify(payload, *output.Attestation) == nil
 }
 
 func providerSessionTelemetryObservation(identity provider.Identity, policySHA256, runtimeVersion string, receipt grok.SessionReceipt, class provider.ErrorClass, circuitState string, startedAt, completedAt time.Time) providertelemetry.Observation {

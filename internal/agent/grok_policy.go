@@ -30,7 +30,7 @@ const GrokWorkspaceWritePolicyName = "grok-workspace-write-ci"
 // package installation, privilege escalation, and common credential paths
 // remain denied. --no-auto-update is mandatory for every NTM-managed automated
 // launch.
-const DefaultGrokAutomationCommand = `grok --no-auto-update --sandbox read-only --permission-mode dontAsk` +
+const DefaultGrokAutomationCommand = `grok --no-auto-update --sandbox strict --permission-mode dontAsk` +
 	` --allow 'Read' --allow 'Grep' --allow 'WebFetch' --allow 'WebSearch'` +
 	` --deny 'Edit' --deny 'Bash(*)'` +
 	` --deny 'Read(**/.env*)' --deny 'Read(**/.ssh/**)' --deny 'Read(**/.aws/**)'` +
@@ -66,8 +66,12 @@ type GrokAutomationPolicyDescriptor struct {
 // DefaultGrokAutomationPolicy returns a copy of the built-in policy metadata.
 func DefaultGrokAutomationPolicy() GrokAutomationPolicyDescriptor {
 	return GrokAutomationPolicyDescriptor{
-		Name:           DefaultGrokAutomationPolicyName,
-		Sandbox:        "read-only",
+		Name: DefaultGrokAutomationPolicyName,
+		// The root-owned requirements file is global, not profile-scoped. Both
+		// unattended invocation profiles therefore use its strict sandbox
+		// baseline; this observe profile is narrowed by its own no-MCP, no-Edit,
+		// no-Bash permission vector.
+		Sandbox:        "strict",
 		PermissionMode: "dontAsk",
 		AllowRules: []string{
 			"Read", "Grep", "WebFetch", "WebSearch",
@@ -90,25 +94,29 @@ func DefaultGrokAutomationPolicy() GrokAutomationPolicyDescriptor {
 
 // GrokSystemRequirements is the deterministic, non-secret system-layer
 // requirements document that an owner may install at /etc/grok/requirements.toml.
-// Installation is an explicit, create-only owner action: the root-owned system
-// layer is the authority that prevents an interactive bypass from weakening an
-// automated policy.
+// Installation is an explicit owner action: creation is non-overwriting, while
+// a separately confirmed managed replacement accepts only an existing
+// root-owned NTM-marked document and preserves a digest-named backup.
 type GrokSystemRequirements struct {
 	PolicyName string
 	Contents   string
 	SHA256     string
 }
 
-// GrokSystemRequirementsForPolicy renders the exact TOML and digest expected
-// for a named built-in policy. The ordering comes from the reviewed rule lists
-// and must not be changed without intentionally changing the receipt digest.
+// GrokSystemRequirementsForPolicy renders the one global, system-authoritative
+// baseline accepted for either named built-in invocation policy. /etc/grok/
+// requirements.toml cannot be profile-specific, so the returned content and
+// digest intentionally remain identical for both selectors. PolicyName records
+// the caller's compatible profile for diagnostics only; it does not claim that
+// a distinct root-owned document exists for that profile.
 func GrokSystemRequirementsForPolicy(name string) (GrokSystemRequirements, bool) {
-	policy, ok := GrokAutomationPolicy(name)
-	if !ok {
+	if _, ok := GrokAutomationPolicy(name); !ok {
 		return GrokSystemRequirements{}, false
 	}
+	policy := grokSystemRequirementsBaseline()
 	var builder strings.Builder
-	builder.WriteString("# NTM-managed Grok policy. Install as a root-owned system requirement.\n")
+	builder.WriteString("# NTM-managed global Grok baseline. Install as a root-owned system requirement.\n")
+	builder.WriteString("# Per-invocation policy arguments may only narrow this baseline.\n")
 	builder.WriteString("[sandbox]\nprofile = \"")
 	builder.WriteString(policy.Sandbox)
 	builder.WriteString("\"\n\n[ui]\npermission_mode = \"")
@@ -120,10 +128,51 @@ func GrokSystemRequirementsForPolicy(name string) (GrokSystemRequirements, bool)
 	for _, rule := range policy.DenyRules {
 		writeGrokRequirementRule(&builder, "deny", rule)
 	}
-	builder.WriteString("]\n")
+	builder.WriteString("]\n\n")
+	// These extension and built-in tool controls are compliance-critical. The
+	// system requirements layer outranks project/user configuration, so a
+	// repository cannot reconnect host extensions or re-enable Grok's native
+	// writer around the NTM-owned MCP broker.
+	// Grok 1.0.13 reports features.tool_search as unknown even though newer
+	// documentation lists it. Do not install a silently ignored root setting:
+	// the isolated profile and exact MCP descriptor constrain discovery, while
+	// built-in writing and LSP remain explicitly disabled here.
+	builder.WriteString("[features]\nwrite_file = false\nlsp_tools = false\n\n")
+	builder.WriteString("[subagents]\nenabled = false\n\n[memory]\nenabled = false\n\n")
+	builder.WriteString("[plugins]\npaths = []\nenabled = []\n\n")
+	builder.WriteString("[compat.claude]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\n\n")
+	builder.WriteString("[compat.cursor]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\n")
 	contents := builder.String()
 	sum := sha256.Sum256([]byte(contents))
-	return GrokSystemRequirements{PolicyName: policy.Name, Contents: contents, SHA256: hex.EncodeToString(sum[:])}, true
+	return GrokSystemRequirements{PolicyName: name, Contents: contents, SHA256: hex.EncodeToString(sum[:])}, true
+}
+
+// grokSystemRequirementsBaseline is deliberately the maximum reviewed common
+// envelope. It permits only read/search/web and the exact NTM workspace MCP
+// names. Observe launches install no MCP server at all; workspace launches
+// explicitly deny web and expose only the typed local broker. Built-in Edit
+// and Bash, and every credential/config read, grep, or edit path remain a
+// root-owned denial for both profiles.
+func grokSystemRequirementsBaseline() GrokAutomationPolicyDescriptor {
+	observe := DefaultGrokAutomationPolicy()
+	denyRules := append([]string(nil), observe.DenyRules...)
+	for _, rule := range observe.DenyRules {
+		if strings.HasPrefix(rule, "Read(") {
+			denyRules = append(denyRules, "Edit("+strings.TrimPrefix(rule, "Read("))
+		}
+	}
+	return GrokAutomationPolicyDescriptor{
+		Name:           "grok-system-baseline",
+		Sandbox:        "strict",
+		PermissionMode: "dontAsk",
+		AllowRules: append(append([]string(nil), observe.AllowRules...),
+			"MCPTool(ntm-controlled-workspace__list_files)",
+			"MCPTool(ntm-controlled-workspace__read_file)",
+			"MCPTool(ntm-controlled-workspace__write_file)",
+			"MCPTool(ntm-controlled-workspace__verify_worktree)",
+		),
+		DenyRules: denyRules,
+	}
 }
 
 // writeGrokRequirementRule converts the CLI's Tool(pattern) notation to the
@@ -135,10 +184,18 @@ func writeGrokRequirementRule(builder *strings.Builder, action, rule string) {
 	if open := strings.IndexByte(rule, '('); open > 0 && strings.HasSuffix(rule, ")") {
 		tool, pattern = rule[:open], rule[open+1:len(rule)-1]
 	}
+	// CLI selectors use MCPTool(...), while the documented verbose TOML
+	// schema names that tool family "mcp". Grok 1.0.13 silently drops the
+	// entire permission source when it receives tool = "mcptool", so keep
+	// this wire-format mapping explicit and covered by a live parse probe.
+	configTool := strings.ToLower(tool)
+	if strings.EqualFold(tool, "MCPTool") {
+		configTool = "mcp"
+	}
 	builder.WriteString("  { action = \"")
 	builder.WriteString(tomlEscape(action))
 	builder.WriteString("\", tool = \"")
-	builder.WriteString(tomlEscape(strings.ToLower(tool)))
+	builder.WriteString(tomlEscape(configTool))
 	builder.WriteString("\"")
 	if pattern != "" {
 		builder.WriteString(", pattern = \"")
@@ -170,13 +227,20 @@ func GrokWorkspaceWritePolicy() GrokAutomationPolicyDescriptor {
 			denyRules = append(denyRules, "Edit("+strings.TrimPrefix(rule, "Read("))
 		}
 	}
-	denyRules = append(denyRules, "WebFetch", "WebSearch", "Bash(*)")
+	// Workspace writes are controller-owned. The model may request an exact
+	// broker tool, but Grok's built-in Edit and Bash surfaces remain denied so
+	// it cannot bypass the optimistic-hash writer or isolated verifier.
+	denyRules = append(denyRules, "Edit", "WebFetch", "WebSearch", "Bash(*)")
 	return GrokAutomationPolicyDescriptor{
 		Name:           GrokWorkspaceWritePolicyName,
 		Sandbox:        "strict",
 		PermissionMode: "dontAsk",
 		AllowRules: []string{
-			"Read", "Grep", "Edit",
+			"Read", "Grep",
+			"MCPTool(ntm-controlled-workspace__list_files)",
+			"MCPTool(ntm-controlled-workspace__read_file)",
+			"MCPTool(ntm-controlled-workspace__write_file)",
+			"MCPTool(ntm-controlled-workspace__verify_worktree)",
 		},
 		DenyRules: denyRules,
 	}

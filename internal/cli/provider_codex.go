@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +54,7 @@ type providerCodexSubscriptionAdmission interface {
 	// provider process never started.
 	CancelReservation(provider.Identity, ratelimit.SubscriptionDecision) error
 	RecordSuccess(provider.Identity)
+	RecordResult(provider.Identity, ratelimit.ErrorClass, time.Duration) ratelimit.Decision
 	CapacityStatus() ratelimit.CapacityStatus
 }
 
@@ -82,40 +84,44 @@ func defaultProviderCodexSubscriptionAdmission() *ratelimit.SubscriptionAdmissio
 }
 
 type providerCodexRunOptions struct {
-	profile        string
-	prompt         string
-	operationID    string
-	cwd            string
-	parentSession  string
-	workloadClass  string
-	live           bool
-	workspaceWrite bool
-	timeout        time.Duration
+	profile          string
+	prompt           string
+	operationID      string
+	cwd              string
+	parentSession    string
+	workloadClass    string
+	live             bool
+	workspaceWrite   bool
+	timeout          time.Duration
+	qualificationDir string
+	qualificationAge time.Duration
 }
 
 type providerCodexRunDependencies struct {
-	loadConfig       func() *config.Config
-	attest           func(context.Context, zai.CodexManifestExpectation) (zai.CodexManifestAttestation, error)
-	run              func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error)
-	newNonce         func() (string, error)
-	isLinkedWorktree func(context.Context, string) (bool, error)
-	sign             func(context.Context, []byte) (providerattestation.SignatureMetadata, error)
-	pinnedSigner     func(config.ProviderProfileConfig) (func(context.Context, []byte) (providerattestation.SignatureMetadata, error), error)
-	admission        providerCodexSubscriptionAdmission
-	openLedger       func() (providerNativeOperationLedger, func() error, error)
-	now              func() time.Time
+	loadConfig         func() *config.Config
+	attest             func(context.Context, zai.CodexManifestExpectation) (zai.CodexManifestAttestation, error)
+	run                func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error)
+	newNonce           func() (string, error)
+	isLinkedWorktree   func(context.Context, string) (bool, error)
+	sign               func(context.Context, []byte) (providerattestation.SignatureMetadata, error)
+	pinnedSigner       func(config.ProviderProfileConfig) (func(context.Context, []byte) (providerattestation.SignatureMetadata, error), error)
+	authorizeOperation func(providerOperationAuthorization) (string, error)
+	admission          providerCodexSubscriptionAdmission
+	openLedger         func() (providerNativeOperationLedger, func() error, error)
+	now                func() time.Time
 }
 
 var providerCodexRunDeps = providerCodexRunDependencies{
-	loadConfig:       loadSelectedConfigOrDefault,
-	attest:           zai.AttestCodexManifest,
-	run:              zai.RunCodexStructured,
-	newNonce:         providerCodexNonce,
-	isLinkedWorktree: providerIsLinkedGitWorktree,
-	pinnedSigner:     providerCodexPinnedSigner,
-	admission:        defaultProviderCodexSubscriptionAdmission(),
-	openLedger:       openProviderNativeLedger,
-	now:              func() time.Time { return time.Now().UTC() },
+	loadConfig:         loadSelectedConfigOrDefault,
+	attest:             zai.AttestCodexManifest,
+	run:                zai.RunCodexStructured,
+	newNonce:           providerCodexNonce,
+	isLinkedWorktree:   providerIsLinkedGitWorktree,
+	pinnedSigner:       providerCodexPinnedSigner,
+	authorizeOperation: authorizeProviderOperation,
+	admission:          defaultProviderCodexSubscriptionAdmission(),
+	openLedger:         openProviderNativeLedger,
+	now:                func() time.Time { return time.Now().UTC() },
 }
 
 // providerCodexRunOutput never retains prompt, nonce, credential, command
@@ -134,10 +140,13 @@ type providerCodexRunOutput struct {
 	CredentialBridgeSHA256 string                                     `json:"credential_bridge_sha256"`
 	RuntimeVersion         string                                     `json:"runtime_version"`
 	BrokerCredentialSHA256 string                                     `json:"broker_credential_sha256"`
+	QualificationSHA256    string                                     `json:"qualification_receipt_sha256"`
 	OperationIDSHA256      string                                     `json:"operation_id_sha256"`
 	BindingSHA256          string                                     `json:"binding_sha256"`
 	ReceiptState           string                                     `json:"receipt_state"`
 	State                  string                                     `json:"state"`
+	ProviderErrorClass     provider.ErrorClass                        `json:"provider_error_class,omitempty"`
+	ErrorSHA256            string                                     `json:"error_sha256,omitempty"`
 	Admission              providerCodexSubscriptionAdmissionEvidence `json:"admission"`
 	Receipt                zai.CodexRunReceipt                        `json:"receipt"`
 	Attestation            *providerattestation.SignatureMetadata     `json:"attestation,omitempty"`
@@ -162,15 +171,15 @@ func newProviderCodexCmd() *cobra.Command {
 }
 
 func newProviderCodexRunCmd() *cobra.Command {
-	opts := providerCodexRunOptions{timeout: providerCodexRunTimeout, workloadClass: providerCodexWorkloadImplementation}
+	opts := providerCodexRunOptions{timeout: providerCodexRunTimeout, workloadClass: providerCodexWorkloadImplementation, qualificationAge: 24 * time.Hour}
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Run one manifest-attested structured Z.ai Codex turn",
 		Long: `Run one exact Z.ai Coding Plan Codex turn through the CAAM credential broker.
 
-This low-level transport remains NO_GO for promotion until a disposable-worktree
-qualification proves provider-reported model identity, cancellation, resume, and
-cleanup. It never falls through to OpenAI, Anthropic, or native API billing.`,
+This production transport requires a current signed qualification for the exact
+requested review or workspace-write operation. It never falls through to
+OpenAI, Anthropic, or native API billing.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runProviderCodex(cmd, opts, providerCodexRunDeps)
@@ -185,6 +194,8 @@ cleanup. It never falls through to OpenAI, Anthropic, or native API billing.`,
 	cmd.Flags().BoolVar(&opts.workspaceWrite, "workspace-write", false, "Allow Codex workspace-write only inside a linked Git worktree")
 	cmd.Flags().BoolVar(&opts.live, "live", false, "Explicitly authorize one real Coding Plan call")
 	cmd.Flags().DurationVar(&opts.timeout, "timeout", opts.timeout, "Bounded runtime timeout")
+	cmd.Flags().StringVar(&opts.qualificationDir, "qualification-store", "", "Override signed operation qualification receipt directory")
+	cmd.Flags().DurationVar(&opts.qualificationAge, "max-qualification-age", opts.qualificationAge, "Maximum age of the signed operation qualification")
 	return cmd
 }
 
@@ -198,10 +209,13 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 	if !validProviderNativeOperationID(strings.TrimSpace(opts.operationID)) {
 		return errors.New("provider codex run requires a valid --operation-id")
 	}
-	if opts.timeout <= 0 {
-		return errors.New("provider codex run timeout must be positive")
+	if opts.qualificationAge == 0 {
+		opts.qualificationAge = 24 * time.Hour
 	}
-	if deps.loadConfig == nil || deps.attest == nil || deps.run == nil || deps.newNonce == nil || deps.isLinkedWorktree == nil || (deps.sign == nil && deps.pinnedSigner == nil) || deps.admission == nil || deps.openLedger == nil || deps.now == nil {
+	if opts.timeout <= 0 || opts.qualificationAge <= 0 {
+		return errors.New("provider codex run timeout and qualification age must be positive")
+	}
+	if deps.loadConfig == nil || deps.attest == nil || deps.run == nil || deps.newNonce == nil || deps.isLinkedWorktree == nil || (deps.sign == nil && deps.pinnedSigner == nil) || deps.authorizeOperation == nil || deps.admission == nil || deps.openLedger == nil || deps.now == nil {
 		return errors.New("provider codex run dependencies are incomplete")
 	}
 	cfg := deps.loadConfig()
@@ -263,6 +277,18 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 	if err != nil {
 		return fmt.Errorf("provider codex run requires an initialized receipt signing key before dispatch: %w", err)
 	}
+	requiredOperation := providerOperationReview
+	if opts.workspaceWrite {
+		requiredOperation = providerOperationWorkspaceWrite
+	}
+	qualificationSHA256, err := deps.authorizeOperation(providerOperationAuthorization{
+		Identity: identity, Transport: "zai_codex_runtime", PolicySHA256: providerCodexPolicySHA256(), RuntimeVersion: manifest.RuntimeVersion, RuntimeSHA256: manifest.BinarySHA256,
+		Operation: requiredOperation, QualificationDir: opts.qualificationDir, MaxQualificationAge: opts.qualificationAge,
+		TrustedSigner: signerPreflight.KeyMetadata,
+	})
+	if err != nil {
+		return fmt.Errorf("provider codex operation gate denied dispatch: %w", err)
+	}
 	status := deps.admission.CapacityStatus()
 	if status.Scope != provider.CapacityControlScopeLocalShared {
 		return errors.New("provider codex run requires the cross-process local shared capacity store")
@@ -275,7 +301,8 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 		IdentitySHA256: identity.Hash(), ConfigSHA256: manifest.ConfigSHA256, BinarySHA256: manifest.BinarySHA256,
 		BrokerCommandSHA256: manifest.AuthHelperSHA256, CredentialBridgeSHA256: manifest.CredentialBridgeSHA256,
 		RuntimeVersion: manifest.RuntimeVersion, BrokerCredentialSHA256: sha256StringCLI(profile.BrokerCredentialID),
-		OperationIDSHA256: sha256StringCLI(operationID), BindingSHA256: binding,
+		QualificationSHA256: qualificationSHA256,
+		OperationIDSHA256:   sha256StringCLI(operationID), BindingSHA256: binding,
 		ReceiptState: "not_claimed", State: "preflight",
 	}
 	ledger, closeLedger, err := deps.openLedger()
@@ -374,6 +401,15 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 		}
 	}
 	if runErr != nil {
+		if receipt.ProviderHTTPStatus != 0 || receipt.ProviderErrorCode != "" {
+			class := provider.ClassifyProviderError(receipt.ProviderHTTPStatus, receipt.ProviderErrorCode)
+			output.ProviderErrorClass = class
+			output.ErrorSHA256 = sha256StringCLI(fmt.Sprintf("%d\x00%s", receipt.ProviderHTTPStatus, receipt.ProviderErrorCode))
+			// Preserve provider evidence in both capacity scopes. A structured
+			// permanent business error must not be retried as an opaque local
+			// failure, while a 429/overload receives the controller's backoff.
+			_ = deps.admission.RecordResult(identity, class, 0)
+		}
 		completedWithoutModel := validateProviderCodexTerminalReceipt(receipt, identity, logicalPrompt, nonce, cwd, opts, manifest, false) == nil
 		// A started process may have sent a billable provider request even when
 		// its structured result is incomplete (including stock Codex builds with
@@ -448,13 +484,7 @@ func reconcileProviderCodexSubscriptionUsage(admission providerCodexSubscription
 }
 
 func providerCodexPinnedSigner(profile config.ProviderProfileConfig) (func(context.Context, []byte) (providerattestation.SignatureMetadata, error), error) {
-	attestor, err := providerattestation.NewPinnedWindowsBridge(profile.CredentialBridgeCommand, profile.CredentialBridgeCommandSHA256)
-	if err != nil || attestor == nil {
-		return nil, providerattestation.ErrProtectionUnavailable
-	}
-	return func(ctx context.Context, payload []byte) (providerattestation.SignatureMetadata, error) {
-		return attestor.Sign(ctx, providerReceiptAttestationKey, payload)
-	}, nil
+	return providerProfilePinnedSigner(profile)
 }
 
 func replayProviderCodex(cmd *cobra.Command, expected providerCodexRunOutput, claimed *state.SendOperation, identity provider.Identity, trustedSigner providerattestation.KeyMetadata) error {
@@ -479,6 +509,7 @@ func validRecordedProviderCodexOutput(output, expected providerCodexRunOutput, i
 		output.Profile != expected.Profile || output.ConfigSHA256 != expected.ConfigSHA256 || output.BinarySHA256 != expected.BinarySHA256 ||
 		output.BrokerCommandSHA256 != expected.BrokerCommandSHA256 || output.CredentialBridgeSHA256 != expected.CredentialBridgeSHA256 ||
 		output.RuntimeVersion != expected.RuntimeVersion || output.BrokerCredentialSHA256 != expected.BrokerCredentialSHA256 ||
+		output.QualificationSHA256 != expected.QualificationSHA256 || !validProviderNativeDigest(output.QualificationSHA256) ||
 		output.OperationIDSHA256 != expected.OperationIDSHA256 || output.BindingSHA256 != expected.BindingSHA256 ||
 		!providerCodexReceiptHasNoResiduals(output.Receipt) {
 		return false
@@ -533,6 +564,9 @@ func validateProviderCodexTerminalReceipt(receipt zai.CodexRunReceipt, identity 
 		!receipt.LineageVerified || !providerCodexReceiptHasNoResiduals(receipt) || receipt.ExitCode != 0 || strings.TrimSpace(receipt.StopReason) == "" {
 		return errors.New("receipt lifecycle evidence is incomplete")
 	}
+	if !providerCodexRuntimeEventContractValid(receipt, identity, provider.RuntimeEventRequirements{ToolLifecycle: opts.workspaceWrite}, requireModel) {
+		return errors.New("receipt shared runtime-event contract is invalid or incomplete")
+	}
 	if action == "resume" {
 		if receipt.ParentSessionSHA256 != sha256StringCLI(strings.TrimSpace(opts.parentSession)) {
 			return errors.New("receipt resume lineage mismatch")
@@ -555,6 +589,18 @@ func providerCodexReceiptHasNoResiduals(receipt zai.CodexRunReceipt) bool {
 
 func providerCodexReceiptHasExactModelEvidence(receipt zai.CodexRunReceipt, identity provider.Identity) bool {
 	return receipt.ModelVerified && receipt.RequestedModel == identity.Model() && receipt.ResolvedModel == identity.Model() && receipt.ModelEvidence == providerCodexTerminalModelEvidence
+}
+
+func providerCodexRuntimeEventContractValid(receipt zai.CodexRunReceipt, identity provider.Identity, requirements provider.RuntimeEventRequirements, requirePass bool) bool {
+	if receipt.RuntimeEvents == nil || receipt.RuntimeEventRequirements != requirements {
+		return false
+	}
+	recomputed := provider.ValidateRuntimeEventsForOperation(identity, receipt.RuntimeEvents, requirements)
+	stored := receipt.RuntimeEventContract
+	if stored.Required != recomputed.Required || stored.Observed != recomputed.Observed || stored.Passed != recomputed.Passed || stored.ReceiptSHA256 != recomputed.ReceiptSHA256 || !slices.Equal(stored.Violations, recomputed.Violations) {
+		return false
+	}
+	return !requirePass || stored.Passed
 }
 
 func providerCodexBindingHash(identity provider.Identity, prompt, cwd string, opts providerCodexRunOptions, manifest zai.CodexManifestAttestation) string {

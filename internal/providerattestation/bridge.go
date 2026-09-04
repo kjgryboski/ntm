@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 )
 
@@ -19,7 +21,11 @@ const (
 	BridgeOperationSign             = "sign"
 	BridgeOperationCredentialGet    = "credential_get"
 	BridgeOperationCredentialStatus = "credential_status"
-	ProviderAttestationPreflight    = "ntm.provider-receipt-attestation-preflight.v1"
+	// ProviderAttestationPreflight is intentionally versioned with the newest
+	// qualification-envelope feature required before a provider dispatch. An
+	// older bridge must reject it so a generic key-readability probe cannot
+	// hide a receipt-schema mismatch until after a paid turn has completed.
+	ProviderAttestationPreflight = "ntm.provider-receipt-attestation-preflight.v2.runtime-sha256"
 )
 
 var ErrBridgePayloadDenied = errors.New("provider attestation bridge payload is not allowlisted")
@@ -64,6 +70,8 @@ func ValidateBridgePayload(payload []byte) error {
 	switch schema {
 	case "ntm.provider-native-run.v2":
 		err = validateBridgeNativeRun(object)
+	case "ntm.provider-grok-acp.v1":
+		err = validateBridgeGrokACP(object)
 	case "ntm.provider-qualification.v1":
 		err = validateBridgeQualification(object)
 	case "ntm.provider-session.v2":
@@ -75,6 +83,25 @@ func ValidateBridgePayload(payload []byte) error {
 	}
 	if err != nil {
 		return ErrBridgePayloadDenied
+	}
+	return nil
+}
+
+// validateBridgeGrokACP admits only the digest-bound signing envelope, never
+// raw ACP output. The receipt digest is recomputed by the caller before both
+// signing and replay verification, so this compact allowlist still binds the
+// exact canonical robot receipt to the profile-selected TPM key.
+func validateBridgeGrokACP(object map[string]json.RawMessage) error {
+	if err := bridgeAllowed(object, []string{"schema_version", "identity_sha256", "binding_sha256", "receipt_sha256"}); err != nil {
+		return err
+	}
+	if schema, _ := bridgeString(object, "schema_version"); schema != "ntm.provider-grok-acp.v1" {
+		return errors.New("Grok ACP receipt schema mismatch")
+	}
+	for _, name := range []string{"identity_sha256", "binding_sha256", "receipt_sha256"} {
+		if !bridgeSHA256(object, name) {
+			return fmt.Errorf("invalid Grok ACP receipt digest %q", name)
+		}
 	}
 	return nil
 }
@@ -350,7 +377,7 @@ func validateBridgeTelemetry(object map[string]json.RawMessage) error {
 
 func validateBridgeQualification(object map[string]json.RawMessage) error {
 	required := []string{"schema_version", "mode", "provider", "transport", "identity_sha256", "policy_sha256", "runtime_version", "started_at", "completed_at", "disposable_repo_sha256", "checks", "passed", "receipt_sha256"}
-	allowed := append(required, "attestation")
+	allowed := append(required, "runtime_sha256", "attestation")
 	if err := bridgeAllowed(object, required, allowed...); err != nil {
 		return err
 	}
@@ -369,6 +396,14 @@ func validateBridgeQualification(object map[string]json.RawMessage) error {
 		if !bridgeSHA256(object, name) {
 			return fmt.Errorf("invalid qualification digest %q", name)
 		}
+	}
+	transport, _ := bridgeString(object, "transport")
+	_, runtimeDigestPresent := object["runtime_sha256"]
+	if runtimeDigestPresent && !bridgeSHA256(object, "runtime_sha256") {
+		return errors.New("qualification runtime digest is invalid")
+	}
+	if (transport == "zai_codex_runtime" || transport == "zai_codex_identity_preflight" || transport == "xai_acp" || transport == "xai_headless_session") && !runtimeDigestPresent {
+		return errors.New("binary-backed qualification is missing its runtime digest")
 	}
 	for _, name := range []string{"started_at", "completed_at"} {
 		if !bridgeTimestamp(object, name) {
@@ -417,7 +452,7 @@ func validateBridgeQualification(object map[string]json.RawMessage) error {
 }
 
 func validateBridgeSession(object map[string]json.RawMessage) error {
-	required := []string{"schema_version", "success", "profile", "transport", "identity_sha256", "policy", "policy_sha256", "config_sha256", "binary_sha256", "cwd_sha256", "worktree_sha256", "dispatched", "admission", "receipt", "telemetry"}
+	required := []string{"schema_version", "success", "profile", "transport", "identity_sha256", "policy", "policy_sha256", "config_sha256", "binary_sha256", "qualification_receipt_sha256", "cwd_sha256", "worktree_sha256", "dispatched", "admission", "receipt", "telemetry"}
 	allowed := append(required, "failure_code", "error_sha256", "attestation")
 	if err := bridgeAllowed(object, required, allowed...); err != nil {
 		return err
@@ -428,7 +463,7 @@ func validateBridgeSession(object map[string]json.RawMessage) error {
 	if transport, _ := bridgeString(object, "transport"); transport != "xai_headless_session" {
 		return errors.New("session transport mismatch")
 	}
-	for _, name := range []string{"identity_sha256", "policy_sha256", "config_sha256", "binary_sha256", "cwd_sha256", "worktree_sha256"} {
+	for _, name := range []string{"identity_sha256", "policy_sha256", "config_sha256", "binary_sha256", "qualification_receipt_sha256", "cwd_sha256", "worktree_sha256"} {
 		if !bridgeSHA256(object, name) {
 			return fmt.Errorf("invalid session digest %q", name)
 		}
@@ -526,9 +561,10 @@ func validateBridgeCodexRun(object map[string]json.RawMessage) error {
 	required := []string{
 		"schema_version", "success", "profile", "transport", "identity_sha256",
 		"config_sha256", "binary_sha256", "broker_command_sha256", "credential_bridge_sha256", "runtime_version", "broker_credential_sha256",
-		"operation_id_sha256", "binding_sha256", "receipt_state", "state", "admission", "receipt",
+		"qualification_receipt_sha256", "operation_id_sha256", "binding_sha256", "receipt_state", "state", "admission", "receipt",
 	}
-	if err := bridgeAllowed(object, required, required...); err != nil {
+	allowed := append(append([]string{}, required...), "provider_error_class", "error_sha256")
+	if err := bridgeAllowed(object, required, allowed...); err != nil {
 		return err
 	}
 	if schema, _ := bridgeString(object, "schema_version"); schema != "ntm.provider-codex-run.v1" {
@@ -539,7 +575,7 @@ func validateBridgeCodexRun(object map[string]json.RawMessage) error {
 	}
 	for _, name := range []string{
 		"identity_sha256", "config_sha256", "binary_sha256", "broker_command_sha256", "credential_bridge_sha256", "broker_credential_sha256",
-		"operation_id_sha256", "binding_sha256",
+		"qualification_receipt_sha256", "operation_id_sha256", "binding_sha256",
 	} {
 		if !bridgeSHA256(object, name) {
 			return fmt.Errorf("invalid Codex run digest %q", name)
@@ -557,6 +593,18 @@ func validateBridgeCodexRun(object map[string]json.RawMessage) error {
 	if err := validateBridgeAdmission(object); err != nil {
 		return err
 	}
+	if _, present := object["provider_error_class"]; present {
+		class, ok := bridgeString(object, "provider_error_class")
+		valid := map[string]bool{"rate_limited": true, "overloaded": true, "long_period_quota": true, "plan_expired": true, "unsupported_model": true, "usage_policy_restricted": true, "insufficient_balance": true, "authentication": true, "identity_mismatch": true, "unknown": true}
+		if !ok || !valid[class] {
+			return errors.New("Codex provider error class is invalid")
+		}
+		if !bridgeSHA256(object, "error_sha256") {
+			return errors.New("Codex provider error digest is invalid")
+		}
+	} else if _, present := object["error_sha256"]; present {
+		return errors.New("Codex provider error digest lacks its class")
+	}
 	return validateBridgeCodexRunReceipt(object)
 }
 
@@ -573,7 +621,7 @@ func validateBridgeCodexRunReceipt(object map[string]json.RawMessage) error {
 		"provider_started", "process_started", "outcome_known", "completion_confirmed", "nonce_verified",
 		"model_verified", "lineage_verified", "zero_residuals", "cancellation", "started_at", "completed_at",
 	}
-	allowed := append(append([]string{}, required...), "parent_session_sha256", "expected_tool_sha256", "expected_file_sha256")
+	allowed := append(append([]string{}, required...), "parent_session_sha256", "expected_tool_sha256", "expected_file_sha256", "provider_http_status", "provider_error_code", "provider_error_class", "runtime_events", "runtime_event_requirements", "runtime_event_contract")
 	if err := bridgeAllowed(receipt, required, allowed...); err != nil {
 		return err
 	}
@@ -656,16 +704,130 @@ func validateBridgeCodexRunReceipt(object map[string]json.RawMessage) error {
 	if !bridgeInteger(receipt, "exit_code") {
 		return errors.New("Codex receipt exit code is invalid")
 	}
+	if rawStatus, present := receipt["provider_http_status"]; present {
+		var status int
+		if !bridgeInteger(receipt, "provider_http_status") || json.Unmarshal(rawStatus, &status) != nil || status < 100 || status > 599 {
+			return errors.New("Codex provider HTTP status is invalid")
+		}
+	}
+	if _, present := receipt["provider_error_code"]; present && !bridgeSafeString(receipt, "provider_error_code", 128) {
+		return errors.New("Codex provider error code is invalid")
+	}
+	if _, present := receipt["provider_error_class"]; present {
+		value, ok := bridgeString(receipt, "provider_error_class")
+		valid := map[string]bool{"rate_limited": true, "overloaded": true, "long_period_quota": true, "plan_expired": true, "unsupported_model": true, "usage_policy_restricted": true, "insufficient_balance": true, "authentication": true, "identity_mismatch": true, "unknown": true}
+		if !ok || !valid[value] || receipt["provider_http_status"] == nil && receipt["provider_error_code"] == nil {
+			return errors.New("Codex provider error classification is invalid")
+		}
+	} else if receipt["provider_http_status"] != nil || receipt["provider_error_code"] != nil {
+		return errors.New("Codex provider error evidence lacks a classification")
+	}
 	if err := validateBridgeCodexUsage(receipt); err != nil {
 		return err
 	}
 	if err := validateBridgeCodexCancellation(receipt); err != nil {
 		return err
 	}
+	if _, eventsPresent := receipt["runtime_events"]; eventsPresent {
+		if _, requirementsPresent := receipt["runtime_event_requirements"]; !requirementsPresent {
+			return errors.New("Codex runtime-event requirements are missing")
+		}
+		if _, contractPresent := receipt["runtime_event_contract"]; !contractPresent {
+			return errors.New("Codex runtime-event contract is missing")
+		}
+		if err := validateBridgeRuntimeEvents(receipt); err != nil {
+			return err
+		}
+	} else if _, requirementsPresent := receipt["runtime_event_requirements"]; requirementsPresent {
+		return errors.New("Codex runtime events are missing")
+	} else if _, contractPresent := receipt["runtime_event_contract"]; contractPresent {
+		return errors.New("Codex runtime events are missing")
+	}
 	for _, name := range []string{"started_at", "completed_at"} {
 		if !bridgeTimestamp(receipt, name) {
 			return fmt.Errorf("invalid Codex receipt timestamp %q", name)
 		}
+	}
+	return nil
+}
+
+func validateBridgeRuntimeEvents(receipt map[string]json.RawMessage) error {
+	var events []json.RawMessage
+	if json.Unmarshal(receipt["runtime_events"], &events) != nil || events == nil || len(events) > 128 {
+		return errors.New("Codex runtime events are invalid")
+	}
+	allowedTypes := map[string]bool{
+		"accepted": true, "model_observed": true, "tool_requested": true, "tool_completed": true,
+		"checkpoint": true, "cancellation_acknowledged": true, "completed": true, "usage": true, "cleanup": true,
+	}
+	for _, raw := range events {
+		event, err := bridgeJSONObject(raw)
+		if err != nil {
+			return errors.New("Codex runtime event is not an object")
+		}
+		if err := bridgeAllowed(event, []string{"type", "session_id"}, "type", "session_id", "model", "tool", "checkpoint_id", "input_tokens", "output_tokens", "residual_processes"); err != nil {
+			return err
+		}
+		typeName, ok := bridgeString(event, "type")
+		if !ok || !allowedTypes[typeName] || !bridgeSHA256(event, "session_id") {
+			return errors.New("Codex runtime event type or session binding is invalid")
+		}
+		if _, ok := event["model"]; ok && (typeName != "model_observed" || !bridgeSafeString(event, "model", 256)) {
+			return errors.New("Codex runtime model event is invalid")
+		}
+		if _, ok := event["tool"]; ok {
+			tool, valid := bridgeString(event, "tool")
+			if !valid || typeName != "tool_requested" && typeName != "tool_completed" || len(tool) != len("tool-000001") || !strings.HasPrefix(tool, "tool-") {
+				return errors.New("Codex runtime tool event is invalid")
+			}
+			for _, digit := range tool[len("tool-"):] {
+				if digit < '0' || digit > '9' {
+					return errors.New("Codex runtime tool event is invalid")
+				}
+			}
+		}
+		for _, name := range []string{"input_tokens", "output_tokens", "residual_processes"} {
+			if _, ok := event[name]; ok && !bridgeNonnegativeInteger(event, name) {
+				return fmt.Errorf("Codex runtime event field %q is invalid", name)
+			}
+		}
+	}
+	requirements, ok := bridgeObject(receipt, "runtime_event_requirements")
+	if !ok || bridgeAllowed(requirements, []string{"tool_lifecycle", "checkpoint", "cancellation_requested"}, "tool_lifecycle", "checkpoint", "cancellation_requested") != nil {
+		return errors.New("Codex runtime-event requirements are invalid")
+	}
+	for _, name := range []string{"tool_lifecycle", "checkpoint", "cancellation_requested"} {
+		if !bridgeBool(requirements, name) {
+			return fmt.Errorf("Codex runtime-event requirement %q is invalid", name)
+		}
+	}
+	contract, ok := bridgeObject(receipt, "runtime_event_contract")
+	if !ok || bridgeAllowed(contract, []string{"required", "observed", "passed", "violations", "receipt_sha256"}, "required", "observed", "passed", "violations", "receipt_sha256") != nil ||
+		!bridgeNonnegativeInteger(contract, "required") || !bridgeNonnegativeInteger(contract, "observed") || !bridgeBool(contract, "passed") || !bridgeSHA256(contract, "receipt_sha256") {
+		return errors.New("Codex runtime-event contract is invalid")
+	}
+	var violations []string
+	if json.Unmarshal(contract["violations"], &violations) != nil || violations == nil || len(violations) > 32 {
+		return errors.New("Codex runtime-event violations are invalid")
+	}
+	for _, violation := range violations {
+		if violation == "" || len(violation) > 256 || strings.IndexFunc(violation, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+			return errors.New("Codex runtime-event violation text is invalid")
+		}
+	}
+	var typedEvents []provider.RuntimeEvent
+	var typedRequirements provider.RuntimeEventRequirements
+	var claimed provider.EventContractReport
+	requestedModel, modelOK := bridgeString(receipt, "requested_model")
+	if !modelOK || json.Unmarshal(receipt["runtime_events"], &typedEvents) != nil ||
+		json.Unmarshal(receipt["runtime_event_requirements"], &typedRequirements) != nil ||
+		json.Unmarshal(receipt["runtime_event_contract"], &claimed) != nil {
+		return errors.New("Codex runtime-event contract cannot be recomputed")
+	}
+	recomputed := provider.ValidateRuntimeEventsForModel(requestedModel, typedEvents, typedRequirements)
+	if recomputed.Required != claimed.Required || recomputed.Observed != claimed.Observed || recomputed.Passed != claimed.Passed ||
+		recomputed.ReceiptSHA256 != claimed.ReceiptSHA256 || !slices.Equal(recomputed.Violations, claimed.Violations) {
+		return errors.New("Codex runtime-event contract does not match its signed events")
 	}
 	return nil
 }

@@ -197,6 +197,36 @@ func TestStoreIsCreateOnlyAndLoadLatestValid(t *testing.T) {
 	}
 }
 
+func TestLoadLatestForTransportSkipsNewerDifferentLane(t *testing.T) {
+	dir := t.TempDir()
+	older := passingReceipt(t, time.Unix(1_800_000_000, 0).UTC())
+	checks := make([]Check, 0, len(codexRequiredChecks))
+	for _, name := range codexRequiredChecks {
+		checks = append(checks, Check{Name: name, Passed: true, Provenance: "live", EvidenceSHA256: testHash("other-" + name)})
+	}
+	newerOtherLane := Receipt{
+		Mode: ModeLive, Provider: "zai", Transport: "zai_codex_runtime",
+		IdentitySHA256: older.IdentitySHA256, PolicySHA256: testHash("codex-policy"), RuntimeVersion: "0.149.0",
+		StartedAt: older.CompletedAt.Add(59 * time.Minute), CompletedAt: older.CompletedAt.Add(time.Hour), DisposableRepoHash: testHash("codex-repo"), Checks: checks,
+	}
+	if err := newerOtherLane.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Store(dir, older); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Store(dir, newerOtherLane); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := LoadLatestForTransport(dir, older.IdentitySHA256, older.Transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ReceiptSHA256 != older.ReceiptSHA256 {
+		t.Fatalf("transport-filtered load = %s, want %s", got.ReceiptSHA256, older.ReceiptSHA256)
+	}
+}
+
 func TestLoadLatestMissingIsNotExist(t *testing.T) {
 	_, _, err := LoadLatest(t.TempDir(), testHash("missing"))
 	if !errors.Is(err, fs.ErrNotExist) {

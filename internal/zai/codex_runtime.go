@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
 	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
@@ -160,48 +161,57 @@ type CodexCancellationReceipt struct {
 // CodexRunReceipt is safe to persist and sign. ResolvedModel is populated only
 // from a versioned structured event field, never from the requested config.
 type CodexRunReceipt struct {
-	AdapterVersion         string     `json:"adapter_version"`
-	Action                 string     `json:"action"`
-	RequestedModel         string     `json:"requested_model"`
-	ResolvedModel          string     `json:"resolved_model"`
-	ModelEvidence          string     `json:"model_evidence"`
-	ConfigSHA256           string     `json:"config_sha256"`
-	BinarySHA256           string     `json:"binary_sha256"`
-	BrokerCommandSHA256    string     `json:"broker_command_sha256"`
-	CredentialBridgeSHA256 string     `json:"credential_bridge_sha256"`
-	PolicySHA256           string     `json:"policy_sha256"`
-	RuntimeVersion         string     `json:"runtime_version"`
-	CWDSHA256              string     `json:"cwd_sha256"`
-	PromptSHA256           string     `json:"prompt_sha256"`
-	SessionIDSHA256        string     `json:"session_id_sha256"`
-	ParentSessionSHA256    string     `json:"parent_session_sha256,omitempty"`
-	NonceSHA256            string     `json:"nonce_sha256"`
-	OutputSHA256           string     `json:"output_sha256"`
-	EventStreamSHA256      string     `json:"event_stream_sha256"`
-	StderrSHA256           string     `json:"stderr_sha256"`
-	ToolEventsSHA256       string     `json:"tool_events_sha256"`
-	ToolEventCount         int        `json:"tool_event_count"`
-	ExpectedToolSHA256     string     `json:"expected_tool_sha256,omitempty"`
-	ExpectedToolObserved   bool       `json:"expected_tool_observed"`
-	ExpectedToolDenied     bool       `json:"expected_tool_denied"`
-	ExpectedFileSHA256     string     `json:"expected_file_sha256,omitempty"`
-	ExpectedFileObserved   bool       `json:"expected_file_observed"`
-	Usage                  CodexUsage `json:"usage"`
-	ExitCode               int        `json:"exit_code"`
-	StopReason             string     `json:"stop_reason"`
-	ProviderStarted        bool       `json:"provider_started"`
-	ProcessStarted         bool       `json:"process_started"`
-	OutcomeKnown           bool       `json:"outcome_known"`
-	CompletionConfirmed    bool       `json:"completion_confirmed"`
-	NonceVerified          bool       `json:"nonce_verified"`
-	ModelVerified          bool       `json:"model_verified"`
-	LineageVerified        bool       `json:"lineage_verified"`
+	AdapterVersion         string `json:"adapter_version"`
+	Action                 string `json:"action"`
+	RequestedModel         string `json:"requested_model"`
+	ResolvedModel          string `json:"resolved_model"`
+	ModelEvidence          string `json:"model_evidence"`
+	ConfigSHA256           string `json:"config_sha256"`
+	BinarySHA256           string `json:"binary_sha256"`
+	BrokerCommandSHA256    string `json:"broker_command_sha256"`
+	CredentialBridgeSHA256 string `json:"credential_bridge_sha256"`
+	PolicySHA256           string `json:"policy_sha256"`
+	RuntimeVersion         string `json:"runtime_version"`
+	CWDSHA256              string `json:"cwd_sha256"`
+	PromptSHA256           string `json:"prompt_sha256"`
+	SessionIDSHA256        string `json:"session_id_sha256"`
+	ParentSessionSHA256    string `json:"parent_session_sha256,omitempty"`
+	NonceSHA256            string `json:"nonce_sha256"`
+	OutputSHA256           string `json:"output_sha256"`
+	EventStreamSHA256      string `json:"event_stream_sha256"`
+	StderrSHA256           string `json:"stderr_sha256"`
+	ToolEventsSHA256       string `json:"tool_events_sha256"`
+	ToolEventCount         int    `json:"tool_event_count"`
+	ExpectedToolSHA256     string `json:"expected_tool_sha256,omitempty"`
+	ExpectedToolObserved   bool   `json:"expected_tool_observed"`
+	ExpectedToolDenied     bool   `json:"expected_tool_denied"`
+	ExpectedFileSHA256     string `json:"expected_file_sha256,omitempty"`
+	ExpectedFileObserved   bool   `json:"expected_file_observed"`
+	// ProviderHTTPStatus and ProviderErrorCode are captured only from
+	// structured terminal error frames. They deliberately exclude provider
+	// prose, which may contain sensitive or unbounded data.
+	ProviderHTTPStatus  int                 `json:"provider_http_status,omitempty"`
+	ProviderErrorCode   string              `json:"provider_error_code,omitempty"`
+	ProviderErrorClass  provider.ErrorClass `json:"provider_error_class,omitempty"`
+	Usage               CodexUsage          `json:"usage"`
+	ExitCode            int                 `json:"exit_code"`
+	StopReason          string              `json:"stop_reason"`
+	ProviderStarted     bool                `json:"provider_started"`
+	ProcessStarted      bool                `json:"process_started"`
+	OutcomeKnown        bool                `json:"outcome_known"`
+	CompletionConfirmed bool                `json:"completion_confirmed"`
+	NonceVerified       bool                `json:"nonce_verified"`
+	ModelVerified       bool                `json:"model_verified"`
+	LineageVerified     bool                `json:"lineage_verified"`
 	// ZeroResiduals is scoped to the continuously observed local process tree;
 	// it is not a claim about provider-side work or an unobserved escaped PID.
-	ZeroResiduals bool                     `json:"zero_residuals"`
-	Cancellation  CodexCancellationReceipt `json:"cancellation"`
-	StartedAt     time.Time                `json:"started_at"`
-	CompletedAt   time.Time                `json:"completed_at"`
+	ZeroResiduals            bool                              `json:"zero_residuals"`
+	Cancellation             CodexCancellationReceipt          `json:"cancellation"`
+	RuntimeEvents            []provider.RuntimeEvent           `json:"runtime_events"`
+	RuntimeEventRequirements provider.RuntimeEventRequirements `json:"runtime_event_requirements"`
+	RuntimeEventContract     provider.EventContractReport      `json:"runtime_event_contract"`
+	StartedAt                time.Time                         `json:"started_at"`
+	CompletedAt              time.Time                         `json:"completed_at"`
 }
 
 func RunCodexStructured(ctx context.Context, spec CodexRunSpec) (CodexRunReceipt, error) {
@@ -541,26 +551,31 @@ func structuredCodexEnvironment(source []string, runtimeHome string, credential 
 }
 
 type codexParsed struct {
-	sessionID        string
-	model            string
-	modelEvidence    string
-	finalText        string
-	toolDigest       string
-	toolCount        int
-	usage            CodexUsage
-	stopReason       string
-	providerStarted  bool
-	outcomeKnown     bool
-	complete         bool
-	nonce            bool
-	lineage          bool
-	turnStarted      bool
-	terminal         bool
-	agentMessageSeen bool
-	expectedToolSeen bool
-	expectedToolDeny bool
-	expectedFileSeen bool
-	itemIDs          map[string]bool
+	sessionID          string
+	model              string
+	modelEvidence      string
+	finalText          string
+	toolDigest         string
+	toolCount          int
+	runtimeToolEvents  []provider.RuntimeEvent
+	usage              CodexUsage
+	stopReason         string
+	providerStarted    bool
+	outcomeKnown       bool
+	complete           bool
+	nonce              bool
+	lineage            bool
+	turnStarted        bool
+	terminal           bool
+	agentMessageSeen   bool
+	expectedToolSeen   bool
+	expectedToolDeny   bool
+	expectedFileSeen   bool
+	providerHTTPStatus int
+	providerErrorCode  string
+	itemIDs            map[string]bool
+	startedToolIDs     map[string]string
+	earlyToolIDs       map[string]string
 }
 
 var codexToolItemTypes = map[string]bool{
@@ -586,7 +601,7 @@ func validCodexTerminalToolStatus(itemType, status string, present bool) bool {
 }
 
 func parseCodexEvents(raw []byte, nonce, parent string, resume bool, expectedCommand ...string) (codexParsed, error) {
-	parsed := codexParsed{toolDigest: digestCodex(nil), itemIDs: map[string]bool{}}
+	parsed := codexParsed{toolDigest: digestCodex(nil), itemIDs: map[string]bool{}, startedToolIDs: map[string]string{}, earlyToolIDs: map[string]string{}}
 	wantCommand, wantFile := "", ""
 	if len(expectedCommand) > 0 {
 		wantCommand = expectedCommand[0]
@@ -645,6 +660,27 @@ func parseCodexEvents(raw []byte, nonce, parent string, resume bool, expectedCom
 				return parsed, errors.New("Codex turn.started ordering is invalid")
 			}
 			parsed.turnStarted = true
+		case "item.started":
+			if !parsed.turnStarted {
+				return parsed, errors.New("Codex item.started preceded turn.started")
+			}
+			item, err := rawJSONObject(event["item"])
+			if err != nil {
+				return parsed, errors.New("Codex item.started has no item object")
+			}
+			itemType, _ := rawJSONString(item["type"])
+			itemID, ok := rawJSONString(item["id"])
+			if !ok || itemID == "" || hasControl(itemID) || parsed.startedToolIDs[itemID] != "" {
+				return parsed, errors.New("Codex item.started has an invalid or duplicate item id")
+			}
+			if codexToolItemTypes[itemType] {
+				toolRef := parsed.earlyToolIDs[itemID]
+				if toolRef == "" {
+					toolRef = fmt.Sprintf("tool-%06d", len(parsed.startedToolIDs)+1)
+				}
+				parsed.startedToolIDs[itemID] = toolRef
+				parsed.runtimeToolEvents = append(parsed.runtimeToolEvents, provider.RuntimeEvent{Type: provider.EventToolRequested, Tool: toolRef})
+			}
 		case "item.completed":
 			if !parsed.turnStarted {
 				return parsed, errors.New("Codex item.completed preceded turn.started")
@@ -721,6 +757,14 @@ func parseCodexEvents(raw []byte, nonce, parent string, resume bool, expectedCom
 				_, _ = toolHasher.Write(line)
 				_, _ = toolHasher.Write([]byte{'\n'})
 				parsed.toolCount++
+				toolRef := parsed.startedToolIDs[itemID]
+				if toolRef == "" {
+					// Keep the observed completion rather than inventing a preceding
+					// request. The shared contract will reject this stream.
+					toolRef = fmt.Sprintf("unmatched-tool-%06d", parsed.toolCount)
+					parsed.earlyToolIDs[itemID] = toolRef
+				}
+				parsed.runtimeToolEvents = append(parsed.runtimeToolEvents, provider.RuntimeEvent{Type: provider.EventToolCompleted, Tool: toolRef})
 			}
 		case "turn.completed":
 			if parsed.complete || !parsed.turnStarted {
@@ -748,6 +792,9 @@ func parseCodexEvents(raw []byte, nonce, parent string, resume bool, expectedCom
 				return parsed, err
 			}
 		case "turn.failed", "error":
+			if err := recordCodexProviderError(&parsed, event); err != nil {
+				return parsed, err
+			}
 			parsed.outcomeKnown = true
 			parsed.terminal = true
 			return parsed, errors.New("Codex reported a structured provider failure")
@@ -776,6 +823,43 @@ func parseCodexEvents(raw []byte, nonce, parent string, resume bool, expectedCom
 		return parsed, errors.New("Codex resume did not preserve the exact session id")
 	}
 	return parsed, nil
+}
+
+// recordCodexProviderError preserves only structured status/code evidence so
+// capacity control can distinguish an entitlement block from a retryable
+// outage. It never derives classifications from provider error prose.
+func recordCodexProviderError(parsed *codexParsed, event map[string]json.RawMessage) error {
+	if parsed == nil {
+		return errors.New("Codex provider error parser is unavailable")
+	}
+	for _, name := range []string{"http_status", "status_code"} {
+		if raw, present := event[name]; present {
+			status, _, err := signedJSONInt(raw)
+			if err != nil || status < 100 || status > 599 {
+				return errors.New("Codex provider error has an invalid HTTP status")
+			}
+			if parsed.providerHTTPStatus != 0 && parsed.providerHTTPStatus != int(status) {
+				return errors.New("Codex provider error has conflicting HTTP statuses")
+			}
+			parsed.providerHTTPStatus = int(status)
+		}
+	}
+	code, present := rawJSONString(event["code"])
+	if !present {
+		if nested, err := rawJSONObjectOptional(event["error"]); err != nil {
+			return errors.New("Codex provider error object is invalid")
+		} else if nested != nil {
+			code, present = rawJSONString(nested["code"])
+		}
+	}
+	if present {
+		code = strings.TrimSpace(code)
+		if code == "" || len(code) > 128 || hasControl(code) {
+			return errors.New("Codex provider error code is invalid")
+		}
+		parsed.providerErrorCode = code
+	}
+	return nil
 }
 
 func codexFileChangeMatches(raw json.RawMessage, expected string) (bool, error) {
@@ -945,12 +1029,28 @@ func applyCodexParsed(receipt *CodexRunReceipt, parsed codexParsed, spec CodexRu
 	receipt.ExpectedToolObserved = parsed.expectedToolSeen
 	receipt.ExpectedToolDenied = parsed.expectedToolDeny
 	receipt.ExpectedFileObserved = parsed.expectedFileSeen
+	receipt.ProviderHTTPStatus = parsed.providerHTTPStatus
+	receipt.ProviderErrorCode = parsed.providerErrorCode
+	if parsed.providerHTTPStatus != 0 || parsed.providerErrorCode != "" {
+		receipt.ProviderErrorClass = provider.ClassifyProviderError(parsed.providerHTTPStatus, parsed.providerErrorCode)
+	}
 	receipt.Usage = parsed.usage
 	receipt.StopReason = parsed.stopReason
 	receipt.ProviderStarted = parsed.providerStarted
 	receipt.OutcomeKnown = parsed.outcomeKnown
 	receipt.CompletionConfirmed = parsed.complete
 	receipt.NonceVerified = parsed.nonce
+	receipt.RuntimeEventRequirements = provider.RuntimeEventRequirements{ToolLifecycle: spec.WorkspaceWrite}
+	receipt.RuntimeEvents = provider.NormalizeTerminalRuntimeObservation(provider.TerminalRuntimeObservation{
+		SessionRef: receipt.SessionIDSHA256, Model: receipt.ResolvedModel,
+		Accepted: receipt.ProviderStarted, ObservedToolEvents: parsed.runtimeToolEvents,
+		Completed:     receipt.CompletionConfirmed,
+		UsageObserved: receipt.CompletionConfirmed && receipt.Usage.InputTokens+receipt.Usage.CachedInputTokens+receipt.Usage.OutputTokens > 0,
+		InputTokens:   receipt.Usage.InputTokens + receipt.Usage.CachedInputTokens, OutputTokens: receipt.Usage.OutputTokens,
+		CleanupObserved:   receipt.ProcessStarted && receipt.Cancellation.ResidualProcessIDs != nil,
+		ResidualProcesses: len(receipt.Cancellation.ResidualProcessIDs),
+	})
+	receipt.RuntimeEventContract = provider.ValidateRuntimeEventsForModel(spec.RequestedModel, receipt.RuntimeEvents, receipt.RuntimeEventRequirements)
 }
 
 func codexCancellationReceipt(ctx context.Context, outcome providerqualification.Outcome) CodexCancellationReceipt {

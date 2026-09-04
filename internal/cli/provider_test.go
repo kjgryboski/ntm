@@ -141,24 +141,38 @@ func TestProviderDoctorReservesFullGoForProviderAuthoritativeLifecycle(t *testin
 	}
 }
 
-func TestProviderDoctorDoesNotRequireZAICodingQualificationForProviderNativeTransport(t *testing.T) {
+func TestProviderDoctorRequiresQualificationForGrokACP(t *testing.T) {
 	profile := providerTestGrokProfile(agent.DefaultGrokAutomationPolicyName)
 	identity, err := profile.Identity()
 	if err != nil {
 		t.Fatal(err)
 	}
 	result, checks := diagnoseQualification(identity, "xai_acp", providerTestHash("policy"), nil, providerCommandOptions{}, providerDoctorDependencies{}, nil)
+	if result.State != "missing" || len(checks) != 1 || checks[0].Status != providerDoctorFail {
+		t.Fatalf("Grok ACP qualification gate=%+v checks=%+v", result, checks)
+	}
+}
+
+func TestProviderDoctorDoesNotRequireCodingQualificationForNoToolZAINative(t *testing.T) {
+	identity, err := provider.NewIdentityWithAuthorization(
+		"zai", "native", "glm-test", "https://api.z.ai/api/paas/v4/chat/completions", "zai-api",
+		provider.CredentialClassAPIKey, provider.BillingClassAPIUsage, provider.EntitlementNativeAPI, providerTestHash("native-config"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, checks := diagnoseQualification(identity, "zai_native_api", providerNativeNoToolsPolicySHA256(), nil, providerCommandOptions{}, providerDoctorDependencies{}, nil)
 	if result.State != "not_required" || len(checks) != 1 || checks[0].Status != providerDoctorPass {
-		t.Fatalf("provider-native qualification gate=%+v checks=%+v", result, checks)
+		t.Fatalf("no-tool Z.ai native qualification gate=%+v checks=%+v", result, checks)
 	}
 }
 
 func TestGrokDoctorModelEvidenceConfirmedRejectsCatalogOnlyEvidence(t *testing.T) {
 	for evidence, want := range map[string]bool{
 		"completion_metadata":                             true,
-		"provider_session_notification_plus_exact_launch": true,
-		"session_config_option_plus_exact_launch":         true,
-		"session_model_state_plus_exact_launch":           true,
+		"provider_session_notification_plus_exact_launch": false,
+		"session_config_option_plus_exact_launch":         false,
+		"session_model_state_plus_exact_launch":           false,
 		"provider_catalog_plus_exact_launch":              false,
 		"":                                                false,
 		"unrecognized":                                    false,
@@ -249,7 +263,8 @@ func providerTestGrokProfile(policy string) config.ProviderProfileConfig {
 	return config.ProviderProfileConfig{
 		Provider: "xai", AccountAlias: "cached", Model: "grok-4.6", Endpoint: "https://api.x.ai/v1",
 		Runtime: "grok", RuntimeVersion: "1.0.13", ConfigSHA256: providerTestHash("grok-config"),
-		Command: "grok", AutomationPolicy: policy, ExactTargetOnly: true,
+		Command: "grok", RuntimeHome: "/tmp/ntm-grok-test-home", AutomationPolicy: policy, ExactTargetOnly: true,
+		CredentialBridgeCommand: "/tmp/ntm-provider-bridge.exe", CredentialBridgeCommandSHA256: providerTestHash("grok-bridge"),
 	}
 }
 
@@ -259,6 +274,7 @@ func providerTestGrokInspection() providerGrokInspection {
 		PermissionsLoaded:              true,
 		PermissionSources:              []string{providerRequirementsPath() + " (system requirements)"},
 		SystemRequirementsLayerPresent: true,
+		ConfigSources:                  []providerGrokConfigSource{{Role: "system-requirements", Path: providerRequirementsPath()}},
 		SHA256:                         providerTestHash("inspect"),
 	}
 }
@@ -301,6 +317,60 @@ func TestParseProviderRuntimeInspectGrokCurrentSchemaRequiresSystemEvidence(t *t
 	if err != nil || !warning.BypassLockWarning {
 		t.Fatalf("unrecognized bypass warning was not retained: inspection=%+v err=%v", warning, err)
 	}
+	unexpected, err := parseProviderRuntimeInspectGrok([]byte(`{
+		"grokVersion":"1.0.13",
+		"permissions":{"loaded":1,"sources":["/etc/grok/requirements.toml (system requirements)"]},
+		"configSources":{"layers":[{"role":"system-requirements","path":"/etc/grok/requirements.toml"}]},
+		"configWarnings":[{"path":"features.unknown_security_control","kind":"unknown-field"}]
+	}`))
+	if err != nil || !unexpected.UnexpectedConfigWarning {
+		t.Fatalf("unexpected config warning was not retained: inspection=%+v err=%v", unexpected, err)
+	}
+}
+
+func TestProviderGrokInspectionIsolationRejectsAmbientExtensionsAndProjectConfig(t *testing.T) {
+	inspection := providerTestGrokInspection()
+	if !providerGrokInspectionIsolated(inspection, "/tmp/ntm-grok-test-home", providerRequirementsPath()) {
+		t.Fatalf("known isolated inspection was rejected: %+v", inspection)
+	}
+	emptyLowerLayers := inspection
+	emptyLowerLayers.ConfigSources = append([]providerGrokConfigSource{
+		{Role: "managed", Path: "/tmp/ntm-grok-test-home/managed_config.toml", Note: "empty"},
+		{Role: "user", Path: "/tmp/ntm-grok-test-home/config.toml", Note: "empty"},
+		{Role: "requirements", Path: "/tmp/ntm-grok-test-home/requirements.toml", Note: "empty"},
+	}, inspection.ConfigSources...)
+	if !providerGrokInspectionIsolated(emptyLowerLayers, "/tmp/ntm-grok-test-home", providerRequirementsPath()) {
+		t.Fatalf("explicitly empty isolated lower layers were rejected: %+v", emptyLowerLayers)
+	}
+
+	for name, mutate := range map[string]func(*providerGrokInspection){
+		"mcp":           func(value *providerGrokInspection) { value.MCPServerCount = 1 },
+		"hook":          func(value *providerGrokInspection) { value.HookCount = 1 },
+		"plugin":        func(value *providerGrokInspection) { value.PluginCount = 1 },
+		"marketplace":   func(value *providerGrokInspection) { value.MarketplaceCount = 1 },
+		"compatibility": func(value *providerGrokInspection) { value.UnsafeCompatibilityEnabled = true },
+		"config warning": func(value *providerGrokInspection) {
+			value.UnexpectedConfigWarning = true
+		},
+		"project config": func(value *providerGrokInspection) {
+			value.ConfigSources = append(value.ConfigSources, providerGrokConfigSource{Role: "project", Path: "/repo/.grok/config.toml"})
+		},
+		"profile user config": func(value *providerGrokInspection) {
+			value.ConfigSources = append(value.ConfigSources, providerGrokConfigSource{Role: "user", Path: "/tmp/ntm-grok-test-home/config.toml"})
+		},
+		"profile managed config": func(value *providerGrokInspection) {
+			value.ConfigSources = append(value.ConfigSources, providerGrokConfigSource{Role: "managed", Path: "/tmp/ntm-grok-test-home/managed_config.toml"})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := inspection
+			candidate.ConfigSources = append([]providerGrokConfigSource(nil), inspection.ConfigSources...)
+			mutate(&candidate)
+			if providerGrokInspectionIsolated(candidate, "/tmp/ntm-grok-test-home", providerRequirementsPath()) {
+				t.Fatalf("unsafe inspection was accepted: %+v", candidate)
+			}
+		})
+	}
 }
 
 func TestProviderPolicyAcceptsInspectWarningOnlyWithIsolatedBehavioralRefusal(t *testing.T) {
@@ -317,7 +387,7 @@ func TestProviderPolicyAcceptsInspectWarningOnlyWithIsolatedBehavioralRefusal(t 
 		readFile:  func(string) ([]byte, error) { return []byte(requirements.Contents), nil },
 		stat:      func(string) (os.FileInfo, error) { return nil, nil },
 		rootOwned: func(os.FileInfo) bool { return true },
-		inspectGrok: func(context.Context, string, string) (providerGrokInspection, error) {
+		inspectGrok: func(context.Context, string, string, string) (providerGrokInspection, error) {
 			inspection := providerTestGrokInspection()
 			inspection.BypassLockWarning = true
 			return inspection, nil
@@ -364,7 +434,7 @@ func providerSessionTestDeps(t *testing.T, profile config.ProviderProfileConfig,
 		readFile:  func(string) ([]byte, error) { return []byte(requirements.Contents), nil },
 		stat:      func(string) (os.FileInfo, error) { return nil, nil },
 		rootOwned: func(os.FileInfo) bool { return true },
-		inspectGrok: func(context.Context, string, string) (providerGrokInspection, error) {
+		inspectGrok: func(context.Context, string, string, string) (providerGrokInspection, error) {
 			return providerTestGrokInspection(), nil
 		},
 		probeGrokBypassLock: func(context.Context, string) (providerGrokBypassProbe, error) {
@@ -374,7 +444,10 @@ func providerSessionTestDeps(t *testing.T, profile config.ProviderProfileConfig,
 		attestationPreflight: func(ctx context.Context) error {
 			return providerSessionAttestationPreflightWithSigner(ctx, signer)
 		},
-		sign:       signer,
+		sign: signer,
+		authorizeOperation: func(providerOperationAuthorization) (string, error) {
+			return providerTestHash("grok-lifecycle-qualification"), nil
+		},
 		hashBinary: func(string) (string, error) { return providerTestHash("grok-binary"), nil },
 		recordTelemetry: func(_ context.Context, observation providertelemetry.Observation) (providertelemetry.Observation, error) {
 			observation.SchemaVersion = providertelemetry.SchemaVersion
@@ -400,7 +473,7 @@ func TestProviderPolicyRequiresPinnedRuntimeDiscoveryOfManagedRequirements(t *te
 		readFile:  func(string) ([]byte, error) { return []byte(requirements.Contents), nil },
 		stat:      func(string) (os.FileInfo, error) { return nil, nil },
 		rootOwned: func(os.FileInfo) bool { return true },
-		inspectGrok: func(context.Context, string, string) (providerGrokInspection, error) {
+		inspectGrok: func(context.Context, string, string, string) (providerGrokInspection, error) {
 			return providerTestGrokInspection(), nil
 		},
 		probeGrokBypassLock: func(context.Context, string) (providerGrokBypassProbe, error) {
@@ -412,7 +485,7 @@ func TestProviderPolicyRequiresPinnedRuntimeDiscoveryOfManagedRequirements(t *te
 		t.Fatalf("runtime-attested policy result=%+v check=%+v", result, check)
 	}
 
-	deps.inspectGrok = func(context.Context, string, string) (providerGrokInspection, error) {
+	deps.inspectGrok = func(context.Context, string, string, string) (providerGrokInspection, error) {
 		inspection := providerTestGrokInspection()
 		inspection.PermissionSources = []string{"/wrong/requirements.toml (system requirements)"}
 		inspection.SHA256 = providerTestHash("wrong")
@@ -447,7 +520,7 @@ func TestGrokACPDispatchRequiresLiveManagedPolicyAndPinnedRuntime(t *testing.T) 
 		readFile:  func(string) ([]byte, error) { return []byte(requirements.Contents), nil },
 		stat:      func(string) (os.FileInfo, error) { return nil, nil },
 		rootOwned: func(os.FileInfo) bool { return true },
-		inspectGrok: func(context.Context, string, string) (providerGrokInspection, error) {
+		inspectGrok: func(context.Context, string, string, string) (providerGrokInspection, error) {
 			return providerTestGrokInspection(), nil
 		},
 		probeGrokBypassLock: func(context.Context, string) (providerGrokBypassProbe, error) {
@@ -459,7 +532,7 @@ func TestGrokACPDispatchRequiresLiveManagedPolicyAndPinnedRuntime(t *testing.T) 
 		t.Fatalf("binary=%q version_calls=%d err=%v", binary, versionCalls, err)
 	}
 
-	deps.inspectGrok = func(context.Context, string, string) (providerGrokInspection, error) {
+	deps.inspectGrok = func(context.Context, string, string, string) (providerGrokInspection, error) {
 		inspection := providerTestGrokInspection()
 		inspection.PermissionsLoaded = false
 		return inspection, nil
@@ -469,7 +542,7 @@ func TestGrokACPDispatchRequiresLiveManagedPolicyAndPinnedRuntime(t *testing.T) 
 		t.Fatalf("runtime policy drift was not rejected after the pinned-version precheck: calls=%d err=%v", versionCalls, err)
 	}
 
-	deps.inspectGrok = func(context.Context, string, string) (providerGrokInspection, error) {
+	deps.inspectGrok = func(context.Context, string, string, string) (providerGrokInspection, error) {
 		return providerTestGrokInspection(), nil
 	}
 	deps.version = func(context.Context, string) (string, error) { return "grok 1.0.130", nil }
@@ -500,7 +573,7 @@ func TestProviderSessionUsesSharedAdmissionAndReturnsOnlyHashedLineage(t *testin
 	runCalls := 0
 	deps.run = func(_ context.Context, _ grok.LifecycleRunner, request grok.SessionRequest) (grok.SessionReceipt, error) {
 		runCalls++
-		if request.ExpectedNonce == "" || !strings.Contains(request.Prompt, request.ExpectedNonce) || request.SessionID != "raw-parent-session" || request.Worktree != request.CWD || request.RuntimeVersion != profile.RuntimeVersion || request.PolicySHA256 == "" || request.ConfigSHA256 == "" || request.BinarySHA256 == "" {
+		if request.ExpectedNonce == "" || !strings.Contains(request.Prompt, request.ExpectedNonce) || request.SessionID != "raw-parent-session" || request.Worktree != request.CWD || request.RuntimeHome != profile.RuntimeHome || request.RuntimeVersion != profile.RuntimeVersion || request.PolicySHA256 == "" || request.ConfigSHA256 == "" || request.BinarySHA256 == "" {
 			t.Fatalf("request=%+v", request)
 		}
 		joinedPolicy := strings.Join(request.PolicyArgs, "\n")
@@ -511,6 +584,8 @@ func TestProviderSessionUsesSharedAdmissionAndReturnsOnlyHashedLineage(t *testin
 			Action: request.Action, Fork: request.Action == grok.SessionFork, LineageBound: true, ProviderAcknowledged: true, CompletionConfirmed: true,
 			ParentSessionSHA256: providerTestHash("parent"), ChildSessionSHA256: providerTestHash("child"), NonceSHA256: providerTestHash("nonce"),
 			CWDSHA256: sha256StringCLI(request.CWD), WorktreeSHA256: sha256StringCLI(request.Worktree), PolicySHA256: request.PolicySHA256, ConfigSHA256: request.ConfigSHA256, BinarySHA256: request.BinarySHA256,
+			Stderr:       grok.StderrDigest{SHA256: sha256StringCLI("")},
+			Cancellation: grok.CancellationReceipt{LocalTermination: "already_exited_verified", ResidualPIDs: []int32{}, ObservedAt: time.Unix(1_800_000_000, 0).UTC()},
 		}, nil
 	}
 	cmd := &cobra.Command{}
@@ -540,13 +615,35 @@ func TestProviderSessionAttestationPreflightBlocksDispatchBeforeAdmission(t *tes
 	}
 }
 
+func TestProviderSessionOperationGateBlocksDispatchBeforeAdmission(t *testing.T) {
+	profile := providerTestGrokProfile(agent.DefaultGrokAutomationPolicyName)
+	admission := &providerSessionAdmissionFake{decision: ratelimit.Decision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	deps := providerSessionTestDeps(t, profile, admission)
+	deps.authorizeOperation = func(request providerOperationAuthorization) (string, error) {
+		if request.Operation != providerOperationLifecycle || request.Transport != "xai_headless_session" {
+			t.Fatalf("unexpected operation authorization request: %+v", request)
+		}
+		return "", errors.New("lifecycle qualification missing")
+	}
+	deps.run = func(context.Context, grok.LifecycleRunner, grok.SessionRequest) (grok.SessionReceipt, error) {
+		t.Fatal("operation gate dispatched Grok")
+		return grok.SessionReceipt{}, nil
+	}
+	err := runProviderSession(&cobra.Command{}, grok.SessionResume, providerSessionOptions{profile: "grok-qualified", sessionID: "parent", prompt: "bounded", cwd: t.TempDir(), timeout: time.Second}, deps)
+	if err == nil || !strings.Contains(err.Error(), "operation gate denied dispatch") || admission.acquires != 0 || admission.releases != 0 {
+		t.Fatalf("err=%v admission=%+v", err, admission)
+	}
+}
+
 func TestProviderSessionOutputSignatureBindsCompletedReceipt(t *testing.T) {
 	output := providerSessionOutput{
 		SchemaVersion: providerSessionSchema, Success: true, Dispatched: true, Profile: "grok-qualified", Transport: "xai_headless_session",
 		IdentitySHA256: providerTestHash("identity"), Policy: agent.DefaultGrokAutomationPolicyName,
-		PolicySHA256: providerTestHash("policy"), ConfigSHA256: providerTestHash("config"), BinarySHA256: providerTestHash("binary"), CWD_SHA256: providerTestHash("cwd"), WorktreeSHA256: providerTestHash("worktree"),
+		PolicySHA256: providerTestHash("policy"), ConfigSHA256: providerTestHash("config"), BinarySHA256: providerTestHash("binary"), QualificationSHA256: providerTestHash("qualification"), CWD_SHA256: providerTestHash("cwd"), WorktreeSHA256: providerTestHash("worktree"),
+		Admission: providerSessionAdmissionEvidence{Allowed: true, NoFailover: true, CapacityControlScope: provider.CapacityControlScopeLocalShared},
 		Telemetry: providerTelemetryEvidence{State: providerTelemetryStateRecorded, ObservationID: "11111111111111111111111111111111", ObservationSHA256: providerTestHash("observation")},
-		Receipt:   grok.SessionReceipt{Action: grok.SessionResume, CompletionConfirmed: true, ProviderAcknowledged: true, LineageBound: true, ParentSessionSHA256: providerTestHash("parent"), ChildSessionSHA256: providerTestHash("child"), NonceSHA256: providerTestHash("nonce"), CWDSHA256: providerTestHash("cwd"), WorktreeSHA256: providerTestHash("worktree"), PolicySHA256: providerTestHash("policy"), ConfigSHA256: providerTestHash("config"), BinarySHA256: providerTestHash("binary")},
+		Receipt: grok.SessionReceipt{Action: grok.SessionResume, CompletionConfirmed: true, ProviderAcknowledged: true, LineageBound: true, ParentSessionSHA256: providerTestHash("parent"), ChildSessionSHA256: providerTestHash("child"), NonceSHA256: providerTestHash("nonce"), CWDSHA256: providerTestHash("cwd"), WorktreeSHA256: providerTestHash("worktree"), PolicySHA256: providerTestHash("policy"), ConfigSHA256: providerTestHash("config"), BinarySHA256: providerTestHash("binary"),
+			Stderr: grok.StderrDigest{SHA256: sha256StringCLI("")}, Cancellation: grok.CancellationReceipt{LocalTermination: "already_exited_verified", ResidualPIDs: []int32{}, ObservedAt: time.Unix(1_800_000_000, 0).UTC()}},
 	}
 	if err := sealProviderSessionOutput(t.Context(), &output, newProviderNativeTestSigner()); err != nil || !validProviderSessionOutput(output) {
 		t.Fatalf("sealed completed receipt valid=%v err=%v output=%+v", validProviderSessionOutput(output), err, output)
@@ -694,6 +791,25 @@ func TestQualificationModelIdentityVerifiedRequiresTerminalServerModelContract(t
 	}
 }
 
+func TestQualificationReceiptModelIdentityVerifiedIsTransportSpecific(t *testing.T) {
+	check := providerqualification.Check{
+		Name: providerqualification.CheckIdentity, Passed: true, Provenance: "live",
+		EvidenceSHA256: providerTestHash("terminal-model"), Detail: "terminal_public_and_resolved_model_verified",
+	}
+	receipt := providerqualification.Receipt{Checks: []providerqualification.Check{check}}
+	if !qualificationReceiptModelIdentityVerified(receipt, "xai_acp") {
+		t.Fatal("exact Grok terminal public/resolved model evidence was rejected")
+	}
+	receipt.Checks[0].Passed = false
+	if qualificationReceiptModelIdentityVerified(receipt, "xai_acp") {
+		t.Fatal("failed Grok model check was reported as verified")
+	}
+	receipt.Checks[0] = check
+	if qualificationReceiptModelIdentityVerified(receipt, "zai_codex_runtime") {
+		t.Fatal("Grok detail was accepted as Codex server-model evidence")
+	}
+}
+
 func TestProviderDoctorRejectsUnsignedQualificationReceipt(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0).UTC()
 	profile := providerTestProfile()
@@ -730,7 +846,7 @@ func providerTestDeps(t *testing.T, now time.Time, receipt providerqualification
 		stat:      func(string) (os.FileInfo, error) { return nil, fs.ErrNotExist },
 		rootOwned: func(os.FileInfo) bool { return false },
 		onlineProbe: func(context.Context, config.ProviderProfileConfig, provider.Identity) (providerDoctorLiveEvidence, error) {
-			return providerDoctorLiveEvidence{ModelVerified: true, AuthVerified: true, SHA256: providerTestHash("live")}, nil
+			return providerDoctorLiveEvidence{ModelVerified: true, AuthVerified: true, RuntimeContractPassed: true, SHA256: providerTestHash("live")}, nil
 		},
 		qualificationStore: func(_, identity string) (providerqualification.Receipt, string, error) {
 			if receipt.IdentitySHA256 == "" || receipt.IdentitySHA256 != identity {
@@ -852,7 +968,7 @@ func TestProviderDoctorNeverDispatchesCodexOnlineProbeOutsideRunLane(t *testing.
 		},
 		onlineProbe: func(context.Context, config.ProviderProfileConfig, provider.Identity) (providerDoctorLiveEvidence, error) {
 			probeCalls++
-			return providerDoctorLiveEvidence{ModelVerified: true, AuthVerified: true}, nil
+			return providerDoctorLiveEvidence{ModelVerified: true, AuthVerified: true, RuntimeContractPassed: true}, nil
 		},
 		qualificationStore: func(string, string) (providerqualification.Receipt, string, error) {
 			return providerqualification.Receipt{}, "", fs.ErrNotExist
@@ -875,7 +991,7 @@ func TestProviderDoctorNeverDispatchesCodexOnlineProbeOutsideRunLane(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if probeCalls != 0 || admission.acquires != 0 || report.Readiness != providerReadinessNoGo || checkStatus(report.Checks, "model_entitlement") != providerDoctorFail {
+	if probeCalls != 0 || admission.acquires != 0 || report.Promotion.Level != providerPromotionNoGo || checkStatus(report.Checks, "model_entitlement") != providerDoctorFail {
 		t.Fatalf("unsafe Codex doctor dispatch: calls=%d admission=%+v report=%+v", probeCalls, admission, report)
 	}
 }
@@ -924,7 +1040,7 @@ func TestProviderDoctorUsesCurrentCodexQualificationForModelEntitlementWithoutDi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if probeCalls != 0 || admission.acquires != 0 || report.Readiness != providerReadinessGoScoped || !report.Qualification.ModelIdentityVerified || checkStatus(report.Checks, "model_entitlement") != providerDoctorPass || checkStatus(report.Checks, "lifecycle_authority") != providerDoctorWarn {
+	if probeCalls != 0 || admission.acquires != 0 || report.Promotion.Level != providerPromotionLifecycleGo || !report.Qualification.ModelIdentityVerified || checkStatus(report.Checks, "model_entitlement") != providerDoctorPass || checkStatus(report.Checks, "lifecycle_authority") != providerDoctorWarn {
 		t.Fatalf("report=%+v probeCalls=%d admission=%+v", report, probeCalls, admission)
 	}
 }
@@ -989,7 +1105,7 @@ func TestProviderDoctorCodexModelEntitlementRejectsReceiptWithoutProviderLiveIde
 	if err != nil {
 		t.Fatal(err)
 	}
-	if probeCalls != 0 || admission.acquires != 0 || report.Readiness != providerReadinessNoGo || report.Qualification.State != "model_identity_unverified" || checkStatus(report.Checks, "model_entitlement") != providerDoctorFail {
+	if probeCalls != 0 || admission.acquires != 0 || report.Promotion.Level != providerPromotionNoGo || report.Qualification.State != "model_identity_unverified" || checkStatus(report.Checks, "model_entitlement") != providerDoctorFail {
 		t.Fatalf("report=%+v probeCalls=%d admission=%+v", report, probeCalls, admission)
 	}
 }
@@ -1061,8 +1177,8 @@ func TestProviderDoctorRequiresLiveProbeAndCurrentQualificationButDoesNotPromote
 	if err != nil {
 		t.Fatalf("buildProviderDoctorReport() error: %v", err)
 	}
-	if report.Readiness != providerReadinessNoGo || report.Qualification.State != "current_pass" || report.Capacity.CircuitState != "closed" || checkStatus(report.Checks, "request_authority") != providerDoctorFail {
-		t.Fatalf("report readiness=%s qualification=%s capacity=%s checks=%#v", report.Readiness, report.Qualification.State, report.Capacity.CircuitState, report.Checks)
+	if report.Promotion.Level != providerPromotionNoGo || report.Qualification.State != "current_pass" || report.Capacity.CircuitState != "closed" || checkStatus(report.Checks, "request_authority") != providerDoctorFail {
+		t.Fatalf("report promotion=%s qualification=%s capacity=%s checks=%#v", report.Promotion.Level, report.Qualification.State, report.Capacity.CircuitState, report.Checks)
 	}
 	for _, marshaled := range []string{string(mustJSON(t, report)), strings.Join(checkSummaries(report.Checks), " ")} {
 		if strings.Contains(marshaled, "present-but-never-serialized") {
@@ -1095,7 +1211,7 @@ func TestProviderDoctorBlocksGrokOnlineProbeUntilManagedPolicyIsAuthoritative(t 
 		rootOwned: func(os.FileInfo) bool { return false },
 		onlineProbe: func(context.Context, config.ProviderProfileConfig, provider.Identity) (providerDoctorLiveEvidence, error) {
 			probeCalls++
-			return providerDoctorLiveEvidence{ModelVerified: true, AuthVerified: true, SHA256: providerTestHash("live")}, nil
+			return providerDoctorLiveEvidence{ModelVerified: true, AuthVerified: true, RuntimeContractPassed: true, SHA256: providerTestHash("live")}, nil
 		},
 		capacityStatus: func() ratelimit.CapacityStatus {
 			return ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared, SharedStorePath: "/redacted/capacity.json"}
@@ -1110,8 +1226,8 @@ func TestProviderDoctorBlocksGrokOnlineProbeUntilManagedPolicyIsAuthoritative(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if probeCalls != 0 || admission.acquires != 0 || report.Readiness != providerReadinessNoGo || checkStatus(report.Checks, "model_entitlement") != providerDoctorFail {
-		t.Fatalf("unsafe Grok probe calls=%d admission=%+v readiness=%s checks=%+v", probeCalls, admission, report.Readiness, report.Checks)
+	if probeCalls != 0 || admission.acquires != 0 || report.Promotion.Level != providerPromotionNoGo || checkStatus(report.Checks, "model_entitlement") != providerDoctorFail {
+		t.Fatalf("unsafe Grok probe calls=%d admission=%+v promotion=%s checks=%+v", probeCalls, admission, report.Promotion.Level, report.Checks)
 	}
 }
 
@@ -1145,7 +1261,7 @@ func TestProviderDoctorCanonicalizesGrokRuntimeBeforeOnlineDispatch(t *testing.T
 			readFile:  func(string) ([]byte, error) { return []byte(requirements.Contents), nil },
 			stat:      func(string) (os.FileInfo, error) { return nil, nil },
 			rootOwned: func(os.FileInfo) bool { return true },
-			inspectGrok: func(_ context.Context, path, _ string) (providerGrokInspection, error) {
+			inspectGrok: func(_ context.Context, path, _, _ string) (providerGrokInspection, error) {
 				if path != "/system/grok-1.0.13" {
 					t.Fatalf("runtime inspection re-entered untrusted path %q", path)
 				}
@@ -1163,7 +1279,10 @@ func TestProviderDoctorCanonicalizesGrokRuntimeBeforeOnlineDispatch(t *testing.T
 			capacitySnapshot: func(provider.Identity) ratelimit.AdmissionSnapshot {
 				return ratelimit.AdmissionSnapshot{IdentityHash: identity.Hash(), Scope: provider.CapacityControlScopeLocalShared, Tokens: 1}
 			},
-			attestationPreflight: func(context.Context) (providerattestation.SignatureMetadata, error) {
+			grokAttestationPreflight: func(_ context.Context, got config.ProviderProfileConfig) (providerattestation.SignatureMetadata, error) {
+				if got != profile {
+					t.Fatal("Grok doctor preflight did not receive the exact resolved profile")
+				}
 				return providerattestation.SignatureMetadata{KeyMetadata: providerattestation.KeyMetadata{Algorithm: providerattestation.AlgorithmEd25519, ProtectionEvidence: providerattestation.ProtectionOSProcessRead}}, nil
 			},
 			admission: admission,
@@ -1181,11 +1300,11 @@ func TestProviderDoctorCanonicalizesGrokRuntimeBeforeOnlineDispatch(t *testing.T
 		if got.Command != "/system/grok-1.0.13" {
 			t.Fatalf("online probe received non-canonical runtime %q", got.Command)
 		}
-		return providerDoctorLiveEvidence{ModelVerified: true, AuthVerified: true, SHA256: providerTestHash("live")}, nil
+		return providerDoctorLiveEvidence{ModelVerified: true, AuthVerified: true, RuntimeContractPassed: true, SHA256: providerTestHash("live")}, nil
 	}
 	cfg := &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{"grok-qualified": profile}}
 	report, err := buildProviderDoctorReport(context.Background(), cfg, providerCommandOptions{profile: "grok-qualified", online: true, timeout: time.Minute, qualificationAge: time.Hour}, deps)
-	if err != nil || onlineCalls != 1 || report.Readiness != providerReadinessGoScoped {
+	if err != nil || onlineCalls != 1 || report.Promotion.Level != providerPromotionObserveOnly {
 		t.Fatalf("canonical doctor report=%+v calls=%d err=%v", report, onlineCalls, err)
 	}
 
@@ -1201,7 +1320,7 @@ func TestProviderDoctorCanonicalizesGrokRuntimeBeforeOnlineDispatch(t *testing.T
 		return providerDoctorLiveEvidence{}, nil
 	}
 	report, err = buildProviderDoctorReport(context.Background(), cfg, providerCommandOptions{profile: "grok-qualified", online: true, timeout: time.Minute, qualificationAge: time.Hour}, blocked)
-	if err != nil || blockedCalls != 0 || blockedAdmission.acquires != 0 || report.Readiness != providerReadinessNoGo || checkStatus(report.Checks, "runtime") != providerDoctorFail {
+	if err != nil || blockedCalls != 0 || blockedAdmission.acquires != 0 || report.Promotion.Level != providerPromotionNoGo || checkStatus(report.Checks, "runtime") != providerDoctorFail {
 		t.Fatalf("untrusted runtime was not blocked: report=%+v calls=%d admission=%+v err=%v", report, blockedCalls, blockedAdmission, err)
 	}
 }
@@ -1220,8 +1339,8 @@ func TestProviderDoctorOnlineProbeUsesExactIdentitySharedAdmission(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Readiness != providerReadinessNoGo || checkStatus(report.Checks, "request_authority") != providerDoctorFail || admission.acquires != 1 || admission.releases != 1 || admission.successes != 1 {
-		t.Fatalf("report=%s admission=%+v", report.Readiness, admission)
+	if report.Promotion.Level != providerPromotionNoGo || checkStatus(report.Checks, "request_authority") != providerDoctorFail || admission.acquires != 1 || admission.releases != 1 || admission.successes != 1 {
+		t.Fatalf("report=%s admission=%+v", report.Promotion.Level, admission)
 	}
 }
 
@@ -1235,8 +1354,8 @@ func TestProviderDoctorOfflineNeverPromotesQualificationToModelEvidence(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Readiness != "NO_GO" || checkStatus(report.Checks, "model_entitlement") != providerDoctorUnavailable {
-		t.Fatalf("offline report readiness=%s model=%s", report.Readiness, checkStatus(report.Checks, "model_entitlement"))
+	if report.Promotion.Level != providerPromotionNoGo || checkStatus(report.Checks, "model_entitlement") != providerDoctorUnavailable {
+		t.Fatalf("offline report promotion=%s model=%s", report.Promotion.Level, checkStatus(report.Checks, "model_entitlement"))
 	}
 }
 
@@ -1253,8 +1372,8 @@ func TestProviderDoctorFailedOnlineProbeIsNoGo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Readiness != "NO_GO" || checkStatus(report.Checks, "model_entitlement") != providerDoctorFail {
-		t.Fatalf("failed probe report readiness=%s model=%s", report.Readiness, checkStatus(report.Checks, "model_entitlement"))
+	if report.Promotion.Level != providerPromotionNoGo || checkStatus(report.Checks, "model_entitlement") != providerDoctorFail {
+		t.Fatalf("failed probe report promotion=%s model=%s", report.Promotion.Level, checkStatus(report.Checks, "model_entitlement"))
 	}
 	if strings.Contains(string(mustJSON(t, report)), "sensitive provider prose") {
 		t.Fatal("doctor serialized raw provider error")
@@ -1271,8 +1390,107 @@ func TestProviderDoctorExpiredReceiptIsNoGo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.Qualification.State != "expired" || report.Readiness != "NO_GO" {
-		t.Fatalf("expired report qualification=%s readiness=%s", report.Qualification.State, report.Readiness)
+	if report.Qualification.State != "expired" || report.Promotion.Level != providerPromotionNoGo {
+		t.Fatalf("expired report qualification=%s promotion=%s", report.Qualification.State, report.Promotion.Level)
+	}
+}
+
+func TestProviderDoctorOperationScopedPromotion(t *testing.T) {
+	passingChecks := []providerDoctorCheck{}
+	for _, id := range []string{"profile", "identity", "runtime", "policy", "auth_presence", "receipt_attestation", "capacity", "model_entitlement"} {
+		passingChecks = append(passingChecks, providerDoctorCheck{ID: id, Status: providerDoctorPass})
+	}
+	allQualificationChecks := map[string]bool{
+		providerqualification.CheckIdentity:       true,
+		providerqualification.CheckWorkspaceEdit:  true,
+		providerqualification.CheckTestCommand:    true,
+		providerqualification.CheckSecretDenied:   true,
+		providerqualification.CheckPushDenied:     true,
+		providerqualification.CheckCrashRecovery:  true,
+		providerqualification.CheckCancellation:   true,
+		providerqualification.CheckResume:         true,
+		providerqualification.CheckProcessCleanup: true,
+	}
+	base := providerDoctorReport{
+		Mode:         "online",
+		Transport:    "zai_codex_runtime",
+		Runtime:      providerDoctorRuntime{Drift: "none"},
+		Capacity:     providerDoctorCapacity{Scope: provider.CapacityControlScopeLocalShared, CircuitState: "closed"},
+		Capabilities: provider.CapabilityMatrix()["zai_codex_runtime"],
+		Policy:       providerDoctorPolicy{Name: provider.DefaultZAICodexAutomationPolicyName},
+		Qualification: providerDoctorQualification{
+			TrustedCurrent: true, ModelIdentityVerified: true, CheckStates: allQualificationChecks,
+		},
+		Checks: passingChecks,
+	}
+
+	clone := func(report providerDoctorReport) providerDoctorReport {
+		copyReport := report
+		copyReport.Qualification.CheckStates = make(map[string]bool, len(report.Qualification.CheckStates))
+		for name, passed := range report.Qualification.CheckStates {
+			copyReport.Qualification.CheckStates[name] = passed
+		}
+		copyReport.Checks = append([]providerDoctorCheck(nil), report.Checks...)
+		return copyReport
+	}
+
+	tests := []struct {
+		name     string
+		mutate   func(*providerDoctorReport)
+		required string
+		level    string
+		admitted bool
+	}{
+		{name: "complete lifecycle evidence", required: providerOperationLifecycle, level: providerPromotionLifecycleGo, admitted: true},
+		{name: "lifecycle failure leaves workspace write admitted", required: providerOperationLifecycle, level: providerPromotionWorkspaceWriteGo, mutate: func(report *providerDoctorReport) {
+			report.Qualification.CheckStates[providerqualification.CheckCancellation] = false
+		}},
+		{name: "edit failure leaves review admitted", required: providerOperationReview, level: providerPromotionReviewGo, admitted: true, mutate: func(report *providerDoctorReport) {
+			report.Qualification.CheckStates[providerqualification.CheckWorkspaceEdit] = false
+		}},
+		{name: "denial failure leaves observe only", required: providerOperationReview, level: providerPromotionObserveOnly, mutate: func(report *providerDoctorReport) {
+			report.Qualification.CheckStates[providerqualification.CheckSecretDenied] = false
+		}},
+		{name: "missing served model is no go", required: providerOperationObserve, level: providerPromotionNoGo, mutate: func(report *providerDoctorReport) {
+			report.Qualification.ModelIdentityVerified = false
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			report := clone(base)
+			if test.mutate != nil {
+				test.mutate(&report)
+			}
+			promotion := providerDoctorPromotionForReport(report, test.required)
+			if promotion.Level != test.level || promotion.RequiredOperationAdmitted != test.admitted {
+				t.Fatalf("promotion=%+v want level=%s admitted=%t", promotion, test.level, test.admitted)
+			}
+		})
+	}
+}
+
+func TestProviderDoctorOperationValidationDefaultsToLifecycle(t *testing.T) {
+	if got := normalizeProviderOperation(""); got != providerOperationLifecycle {
+		t.Fatalf("empty operation normalized to %q", got)
+	}
+	for _, operation := range []string{providerOperationObserve, providerOperationReview, providerOperationWorkspaceWrite, providerOperationLifecycle} {
+		if !validProviderOperation(operation) {
+			t.Fatalf("valid operation %q rejected", operation)
+		}
+	}
+	if validProviderOperation("push") {
+		t.Fatal("unscoped push operation was accepted")
+	}
+}
+
+func TestProviderPolicyManagedReplacementRequiresInstall(t *testing.T) {
+	cmd := newProviderPolicyCmd()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"requirements", "--replace-managed"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--replace-managed requires --install") {
+		t.Fatalf("managed replacement without install error = %v", err)
 	}
 }
 

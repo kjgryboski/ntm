@@ -19,7 +19,7 @@ func TestProviderGrokBypassProbeVectorIsNoNetworkAndCredentialIsolated(t *testin
 		"--ro-bind\x00/etc/grok\x00/etc/grok",
 		"--ro-bind\x00/trusted/grok\x00/grok",
 		"--setenv\x00GROK_HOME\x00/grokhome",
-		"--no-auto-update", "--always-approve", "--sandbox\x00read-only",
+		"--no-auto-update", "--always-approve", "--sandbox\x00strict",
 		"--disable-web-search", "--no-subagents", "--no-memory",
 		"Reply with exactly NTM_POLICY_PROBE and do not call tools.",
 	} {

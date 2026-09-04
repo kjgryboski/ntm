@@ -23,12 +23,19 @@ type FixtureProvenance struct {
 	CapturedAt           time.Time `json:"captured_at"`
 	RuntimeVersion       string    `json:"-"`
 	ProviderIdentityHash string    `json:"provider_identity_hash"`
-	Source               string    `json:"-"`
-	Redacted             bool      `json:"redacted"`
+	// SignedEventModel is the exact model recorded inside a verified offline
+	// protocol fixture. It scopes only the replay contract; it is never live
+	// evidence for the operator-selected provider identity.
+	SignedEventModel     string `json:"signed_event_model,omitempty"`
+	Source               string `json:"-"`
+	Redacted             bool   `json:"redacted"`
+	GoldenSignatureKeyID string `json:"golden_signature_key_id,omitempty"`
+	GoldenPayloadSHA256  string `json:"golden_payload_sha256,omitempty"`
+	GoldenSignatureValid bool   `json:"golden_signature_valid"`
 }
 
 func (f FixtureProvenance) ReceiptHash() string {
-	return hashSafe(strings.Join([]string{f.FixtureID, f.CapturedAt.UTC().Format(time.RFC3339Nano), f.RuntimeVersion, f.ProviderIdentityHash, f.Source, boolString(f.Redacted)}, "\x00"))
+	return hashSafe(strings.Join([]string{f.FixtureID, f.CapturedAt.UTC().Format(time.RFC3339Nano), f.RuntimeVersion, f.ProviderIdentityHash, f.SignedEventModel, f.Source, boolString(f.Redacted), f.GoldenSignatureKeyID, f.GoldenPayloadSHA256, boolString(f.GoldenSignatureValid)}, "\x00"))
 }
 
 type LaunchObservation struct {
@@ -80,6 +87,17 @@ type Runtime interface {
 	ProviderErrors(context.Context) ([]ErrorObservation, error)
 }
 
+// EventRuntime is implemented by adapters that can replay or emit the shared
+// provider-runtime contract. Keeping it optional preserves legacy lifecycle
+// adapters while the robot conformance surface always exercises it.
+type EventRuntime interface {
+	RuntimeEvents(context.Context) ([]RuntimeEvent, error)
+}
+
+type EventRuntimeRequirementSource interface {
+	RuntimeEventRequirements() RuntimeEventRequirements
+}
+
 type CheckResult struct {
 	Name        string `json:"name"`
 	Passed      bool   `json:"passed"`
@@ -95,6 +113,7 @@ type ConformanceReport struct {
 	Checks               []CheckResult         `json:"checks"`
 	Coverage             CoverageReport        `json:"coverage"`
 	Discrepancies        []string              `json:"discrepancies"`
+	EventContract        *EventContractReport  `json:"event_contract,omitempty"`
 }
 
 type CoverageReport struct {
@@ -104,6 +123,9 @@ type CoverageReport struct {
 
 func (r ConformanceReport) Passed() bool {
 	if r.Coverage.Required != conformanceRequiredChecks || r.Coverage.Satisfied != conformanceRequiredChecks || len(r.Checks) != conformanceRequiredChecks || len(r.Discrepancies) != 0 {
+		return false
+	}
+	if r.EventContract != nil && !r.EventContract.Passed {
 		return false
 	}
 	for _, check := range r.Checks {
@@ -129,6 +151,40 @@ func RunConformance(ctx context.Context, runtime Runtime, transport string, iden
 	if runtime == nil || nonce == "" || fixture.FixtureID == "" || !fixture.Redacted || fixture.ProviderIdentityHash != identity.Hash() {
 		report.failAll("invalid runtime, nonce, or redacted fixture provenance")
 		return report
+	}
+	if eventRuntime, ok := runtime.(EventRuntime); ok {
+		events, eventErr := eventRuntime.RuntimeEvents(ctx)
+		if eventErr != nil {
+			contract := EventContractReport{Required: len(baselineRequiredRuntimeEvents), Violations: []string{"event replay failed"}}
+			report.EventContract = &contract
+		} else if len(events) == 0 {
+			contract := EventContractReport{Required: len(baselineRequiredRuntimeEvents), Violations: []string{"transport has no signed offline protocol fixture"}}
+			report.EventContract = &contract
+		} else {
+			if !fixture.GoldenSignatureValid || fixture.GoldenSignatureKeyID == "" || fixture.GoldenPayloadSHA256 == "" {
+				contract := EventContractReport{Required: len(baselineRequiredRuntimeEvents), Violations: []string{"event runtime fixture lacks a verified golden signature"}}
+				report.EventContract = &contract
+			} else {
+				requirements := RuntimeEventRequirements{}
+				if source, ok := runtime.(EventRuntimeRequirementSource); ok {
+					requirements = source.RuntimeEventRequirements()
+				}
+				// A signed offline capture may intentionally use a different model
+				// than the selected local profile. Validate the capture against the
+				// model it actually contains; profile identity remains the separate
+				// launch/admission boundary and receives no live qualification from
+				// this synthetic report.
+				expectedModel := identity.Model()
+				if strings.TrimSpace(fixture.SignedEventModel) != "" {
+					expectedModel = strings.TrimSpace(fixture.SignedEventModel)
+				}
+				contract := ValidateRuntimeEventsForModel(expectedModel, events, requirements)
+				report.EventContract = &contract
+			}
+		}
+	} else {
+		contract := EventContractReport{Required: len(baselineRequiredRuntimeEvents), Violations: []string{"runtime does not implement the shared provider event contract"}}
+		report.EventContract = &contract
 	}
 
 	launch, err := runtime.Launch(ctx, identity)

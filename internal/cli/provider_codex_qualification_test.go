@@ -129,6 +129,7 @@ func TestProviderCodexQualificationProducesTenGateReceiptAndCleansGeneratedRoot(
 			r.SessionIDSHA256 = sha256StringCLI(spec.ParentSession)
 			r.ParentSessionSHA256 = sha256StringCLI(spec.ParentSession)
 		}
+		refreshProviderCodexRuntimeContract(&r, spec)
 		return r, nil
 	})
 	deps.prepare = func(ctx context.Context, token string) (providerCodexQualificationWorkspace, error) {
@@ -170,6 +171,54 @@ func TestProviderCodexQualificationProducesTenGateReceiptAndCleansGeneratedRoot(
 	}
 }
 
+func TestProviderCodexIdentityOnlyRunsExactlyOneSignedReadOnlyPreflight(t *testing.T) {
+	profile := providerCodexProfile(t.TempDir())
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := &codexQualificationAdmissionFake{
+		decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true},
+		status:   ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared},
+	}
+	calls := 0
+	var stored providerqualification.Receipt
+	deps := codexQualificationDepsForTest(profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		calls++
+		if spec.WorkspaceWrite || spec.Resume || spec.ExpectedToolCommand != "" || spec.ExpectedFileChange != "" {
+			t.Fatalf("identity-only preflight received mutating/lifecycle spec: %+v", spec)
+		}
+		return successfulProviderCodexReceipt(spec), nil
+	})
+	deps.prepare = func(context.Context, string) (providerCodexQualificationWorkspace, error) {
+		t.Fatal("identity-only preflight prepared a coding worktree")
+		return providerCodexQualificationWorkspace{}, nil
+	}
+	deps.store = func(string, providerqualification.Receipt) (string, error) {
+		t.Fatal("identity-only preflight stored a coding qualification")
+		return "", nil
+	}
+	deps.storePreflight = func(receipt providerqualification.Receipt) (string, error) {
+		stored = receipt
+		return "/redacted/identity-only.json", nil
+	}
+	cmd := &cobra.Command{}
+	var output bytes.Buffer
+	cmd.SetOut(&output)
+	err = runProviderCodexQualification(cmd, providerQualificationOptions{
+		profile: "zai-codex", live: true, identityOnly: true, timeout: time.Second, suiteTimeout: time.Minute,
+	}, profile, identity, deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 || admission.acquires != 1 || admission.releases != 1 || admission.bindings != 1 || admission.usages != 1 || admission.successes != 1 {
+		t.Fatalf("identity-only dispatch/admission counts: calls=%d admission=%+v", calls, admission)
+	}
+	if !stored.Passed || stored.Transport != "zai_codex_identity_preflight" || stored.Attestation == nil || stored.Validate() != nil || !strings.Contains(output.String(), "11/11") {
+		t.Fatalf("identity-only receipt=%+v output=%q", stored, output.String())
+	}
+}
+
 func TestProviderCodexQualificationRejectsSignerChangeOnFinalReceipt(t *testing.T) {
 	profile := providerCodexProfile(t.TempDir())
 	identity, err := profile.Identity()
@@ -194,6 +243,7 @@ func TestProviderCodexQualificationRejectsSignerChangeOnFinalReceipt(t *testing.
 		if spec.ExpectedToolCommand != "" {
 			receipt.ToolEventCount, receipt.ExpectedToolObserved, receipt.ExpectedToolDenied = 1, true, true
 		}
+		refreshProviderCodexRuntimeContract(&receipt, spec)
 		return receipt, nil
 	})
 	deps.prepare = func(ctx context.Context, token string) (providerCodexQualificationWorkspace, error) {
@@ -240,11 +290,12 @@ func TestProviderCodexQualificationSkipsUnknownOutcomeLifecycleByDefault(t *test
 		}
 		receipt := successfulProviderCodexReceipt(spec)
 		if spec.ExpectedFileChange != "" {
-			receipt.ExpectedFileObserved = true
+			receipt.ToolEventCount, receipt.ExpectedFileObserved = 1, true
 		}
 		if spec.ExpectedToolCommand != "" {
-			receipt.ExpectedToolObserved, receipt.ExpectedToolDenied = true, true
+			receipt.ToolEventCount, receipt.ExpectedToolObserved, receipt.ExpectedToolDenied = 1, true, true
 		}
+		refreshProviderCodexRuntimeContract(&receipt, spec)
 		return receipt, nil
 	})
 	deps.prepare = func(ctx context.Context, token string) (providerCodexQualificationWorkspace, error) {
@@ -409,6 +460,7 @@ func TestProviderCodexQualificationModelGapStopsBeforeWorkspace(t *testing.T) {
 			r.SessionIDSHA256 = sha256StringCLI(spec.ParentSession)
 			r.ParentSessionSHA256 = sha256StringCLI(spec.ParentSession)
 		}
+		refreshProviderCodexRuntimeContract(&r, spec)
 		return r, nil
 	})
 	deps.prepare = func(ctx context.Context, token string) (providerCodexQualificationWorkspace, error) {
@@ -484,6 +536,7 @@ func TestProviderCodexQualificationRejectsPreflightToolActivityBeforeWorkspace(t
 		calls++
 		receipt := successfulProviderCodexReceipt(spec)
 		receipt.ToolEventCount = 1
+		refreshProviderCodexRuntimeContract(&receipt, spec)
 		return receipt, nil
 	})
 	deps.prepare = func(context.Context, string) (providerCodexQualificationWorkspace, error) {
@@ -520,6 +573,7 @@ func TestProviderCodexQualificationRejectsContradictoryPreflightResidualsBeforeW
 		receipt := successfulProviderCodexReceipt(spec)
 		receipt.ZeroResiduals = true
 		receipt.Cancellation.ResidualProcessIDs = []int{4242}
+		refreshProviderCodexRuntimeContract(&receipt, spec)
 		return receipt, nil
 	})
 	deps.prepare = func(context.Context, string) (providerCodexQualificationWorkspace, error) {

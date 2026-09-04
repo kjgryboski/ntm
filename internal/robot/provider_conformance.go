@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
@@ -45,15 +44,27 @@ func GetProviderConformance(ctx context.Context, cfg *config.Config, profileTarg
 		return nil, err
 	}
 
-	fixture := provider.FixtureProvenance{
-		FixtureID:            "builtin-redacted-v1:" + transport,
-		CapturedAt:           time.Now().UTC(),
-		RuntimeVersion:       "ntm-synthetic-v1",
-		ProviderIdentityHash: identity.Hash(),
-		Source:               "compiled synthetic lifecycle fixture",
-		Redacted:             true,
-	}
+	fixture := provider.FixtureProvenance{FixtureID: "builtin-redacted-v1:" + transport, ProviderIdentityHash: identity.Hash(), Source: "compiled synthetic lifecycle fixture", Redacted: true}
 	runtime := syntheticProviderRuntime{identity: identity, transport: transport}
+	if scenario, replayable, replayErr := provider.LoadOfflineScenario(transport); replayErr != nil {
+		return nil, replayErr
+	} else if replayable {
+		fixture.FixtureID, fixture.CapturedAt, fixture.RuntimeVersion = scenario.ID, scenario.CapturedAt, scenario.RuntimeVersion
+		fixture.Source = "embedded redacted " + scenario.WireFamily + " replay fixture"
+		fixture.GoldenSignatureKeyID = scenario.GoldenSignature.KeyID
+		fixture.GoldenPayloadSHA256 = scenario.GoldenSignature.PayloadSHA256
+		fixture.GoldenSignatureValid = true
+		fixture.SignedEventModel, err = scenario.SignedEventModel()
+		if err != nil {
+			return nil, err
+		}
+		events, err := scenario.Normalize()
+		if err != nil {
+			return nil, err
+		}
+		runtime.events = events
+		runtime.requirements = scenario.Requirements
+	}
 	report := provider.RunConformance(ctx, runtime, transport, identity, fixture, "NTM_ACK_0123456789abcdef0123456789abcdef")
 	output := &ProviderConformanceOutput{
 		RobotResponse: NewRobotResponse(report.Passed()),
@@ -92,8 +103,18 @@ func validateConformanceTransportIdentity(transport string, identity provider.Id
 }
 
 type syntheticProviderRuntime struct {
-	identity  provider.Identity
-	transport string
+	identity     provider.Identity
+	transport    string
+	events       []provider.RuntimeEvent
+	requirements provider.RuntimeEventRequirements
+}
+
+func (r syntheticProviderRuntime) RuntimeEvents(context.Context) ([]provider.RuntimeEvent, error) {
+	return append([]provider.RuntimeEvent(nil), r.events...), nil
+}
+
+func (r syntheticProviderRuntime) RuntimeEventRequirements() provider.RuntimeEventRequirements {
+	return r.requirements
 }
 
 func (r syntheticProviderRuntime) Launch(_ context.Context, identity provider.Identity) (provider.LaunchObservation, error) {

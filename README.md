@@ -152,7 +152,7 @@ ntm --robot-spawn=research --spawn-grok=1 --spawn-wait --spawn-assign-work --str
 
 Provider-native automation uses Grok's ACP JSON-RPC transport as the primary
 automation path rather than screen scraping. One-shot runs launch
-`grok --no-auto-update --sandbox=read-only --permission-mode=dontAsk <allow/deny rules> [--model EXACT_MODEL] agent stdio`,
+`grok --no-auto-update --sandbox=strict --permission-mode=dontAsk <allow/deny rules> [--model EXACT_MODEL] agent stdio`,
 apply the named `grok-readonly-ci` policy, and return a nonce-bound receipt
 containing provider session/completion metadata plus redacted hashes and cleanup
 evidence. Exact-identity admission applies a separate, cross-process local shared
@@ -177,11 +177,21 @@ account_alias = "kevin"
 model = "YOUR_EXACT_GROK_MODEL"
 endpoint = "https://api.x.ai/v1"
 runtime = "grok"
+runtime_version = "1.0.13"
 config_sha256 = "YOUR_64_CHARACTER_LOWERCASE_REDACTED_CONFIG_SHA256"
 command = "/usr/local/libexec/ntm/grok-1.0.13"
+runtime_home = "/home/YOU/orch-homes/xai-grok-primary/.grok"
+credential_bridge_command = "/home/YOU/.local/libexec/ntm/bridge-provider/ntm-provider-bridge.exe"
+credential_bridge_command_sha256 = "YOUR_64_CHARACTER_LOWERCASE_BRIDGE_SHA256"
 automation_policy = "grok-readonly-ci"
 exact_target_only = true
 ```
+
+The redacted manifest represented by `config_sha256` must include the pinned
+receipt-bridge digest. Grok doctor, qualification, review/write authorization,
+session lifecycle, and workflow reconciliation all re-hash that exact bridge
+before use; the ambient `NTM_WINDOWS_PROVIDER_BRIDGE` compatibility variable
+cannot establish authority for a Grok profile.
 
 ```bash
 ntm --robot-grok-acp-run --provider-profile=xai-grok-primary --msg='Inspect the repository and report the relevant files and findings.'
@@ -193,7 +203,7 @@ ntm --robot-provider-capabilities
 
 The receipt is successful only when Grok reports structured completion and the
 assistant stream echoes the generated nonce exactly. It records only hashes,
-counts, provider session/model/usage metadata when supplied by ACP, and local
+counts, terminal provider session/model/usage metadata, and local
 exit/cleanup evidence when observable. When the caller cancels an accepted
 prompt, NTM sends the ACP `session/cancel` notification and accepts cancellation
 only when that exact original `session/prompt` response returns
@@ -201,17 +211,22 @@ only when that exact original `session/prompt` response returns
 boundary, not proof that xAI stopped cloud inference. Local process-tree
 termination, residual-PID inspection, and reaping are recorded separately. A
 missing cancellation acknowledgement remains `DISPATCH_UNKNOWN`, not an
-invitation to replay blindly. NTM never serializes the prompt, nonce,
+invitation to replay blindly. Every live ACP receipt also emits the shared
+normalized provider-runtime events and their validation report; absent model,
+usage, cleanup, or requested tool/cancellation evidence remains an explicit
+contract failure rather than a synthesized success. NTM never serializes the prompt, nonce,
 credentials, raw output, or raw tool arguments in the receipt. Automated ACP starts with a minimal environment that
 explicitly removes `XAI_API_KEY` and all proxy variables (proxy URLs may embed
 credentials), then authenticates only with the local Grok CLI's `cached_token`;
 it fails with `GROK_ACP_CACHED_AUTH_UNAVAILABLE` when no cached login is offered.
 An exported API key is never an automated fallback.
 
-Exact Grok model identity is confirmed only by completion metadata or an xAI
-structured notification bound to the returned provider session and the exact
-selected model. A provider model catalog proves availability only, so it is
-retained as transport observation but cannot make a robot operation succeed.
+Exact Grok model identity is confirmed only by terminal completion metadata.
+For pinned Grok 1.0.13, NTM records both `_meta.modelId` (the public selector)
+and the singleton `_meta.usage.modelUsage` key (the resolved backend), and
+requires the reviewed exact `grok-4.6` to `grok-4.6-build` binding. Session-new
+selection state, model-change notifications, and provider catalogs remain
+diagnostic only because they cannot rule out a later provider-side remap.
 
 An identity is **runtime-attested** only for fields the structured provider
 protocol actually returns in the receipt (for example, a Grok ACP session ID,
@@ -222,7 +237,7 @@ them.
 
 Operation IDs are durable and binding-sensitive. The binding covers the exact
 provider identity, logical prompt hash, working-directory hash, canonical
-executable-path hash, and compiled policy digest; the receipt separately hashes the exact
+executable-path hash, runtime-version pin, and compiled policy digest; the receipt separately hashes the exact
 nonce-bound packet. This allows a normal retry with an omitted/generated nonce
 to replay the recorded safe outcome without another provider call. Conflicting reuse returns
 `IDEMPOTENCY_CONFLICT`; an abandoned in-progress operation remains
@@ -230,7 +245,7 @@ outcome-unknown and is never taken over automatically. Use
 `--robot-grok-acp-receipt=OPERATION_ID` to inspect it without dispatch.
 
 Interactive Grok panes remain a compatibility path. Their default launch also
-uses `--no-auto-update`, the `read-only` sandbox, and the `grok-readonly-ci`
+uses `--no-auto-update`, the root-owned `strict` sandbox baseline, and the `grok-readonly-ci`
 allow/deny policy; it does not grant broad approval. Panes participate in readiness waits, exact-pane prompt
 delivery and assignment, interrupt-with-message, restart, and restore-time
 relaunch. For stronger spawn evidence, combine `--spawn-wait` with
@@ -366,8 +381,11 @@ never silently fails over to a different provider identity.
 
 `--robot-provider-conformance` is deliberately synthetic and offline. It is a
 fixture-backed adapter contract check, not live-provider qualification. For an
+embedded signed capture, the event contract is checked against the model
+recorded in that capture, not the model configured in the selected profile;
+the selected profile receives no model evidence from this replay. For an
 opt-in no-write live Grok ACP check, run
-`NTM_LIVE_GROK_ACP=1 NTM_LIVE_GROK_MODEL=grok-4.6 go test -tags=integration ./internal/grok -run '^TestLiveACPReadOnlyRoundTrip$' -count=1 -v`
+`NTM_LIVE_GROK_ACP=1 NTM_LIVE_GROK_MODEL=grok-4.6 NTM_LIVE_GROK_HOME=/absolute/path/to/isolated-grok-home go test -tags=integration ./internal/grok -run '^TestLiveACPReadOnlyRoundTrip$' -count=1 -v`
 only in an authenticated Grok environment you are authorized to use.
 
 #### Provider readiness, policy ownership, and live qualification
@@ -383,28 +401,46 @@ that an opaque provider runtime currently honors every configured field.
 
 Grok has exactly two built-in unattended policies:
 
-- `grok-readonly-ci` is the observe policy: read/search only, read-only
-  sandbox, fail-closed `dontAsk`, and no `Bash(*)` or edits.
+- `grok-readonly-ci` is the observe policy: read/search only, fail-closed
+  `dontAsk`, no MCP server, and no `Bash(*)` or edits. It narrows the shared
+  root-owned strict baseline rather than installing a second system policy.
 - `grok-workspace-write-ci` is the narrowly reviewed edit policy for a
-  disposable linked Git worktree. It uses xAI's `strict` sandbox, permits
-  edits, and denies provider-run shell commands, web tools, pushes,
-  destructive commands, approval bypasses, and credential-path reads. NTM
-  rejects this policy unless the working directory is a linked disposable
-  worktree. Executing model-edited tests is controller-owned and requires a
-  separate OS-isolated verifier; a permission allowlist alone is not a
-  credential or network boundary.
+  disposable linked Git worktree. It uses xAI's `strict` sandbox and permits
+  only four exact `ntm-controlled-workspace` MCP tools for bounded list, read,
+  optimistic-hash write, and fixed-manifest verification. Grok's built-in
+  Edit, Bash, web tools, pushes, destructive commands, approval bypasses, and
+  credential-path reads remain denied. NTM rejects this policy unless the
+  working directory is a linked disposable Go or Rust worktree, and binds the
+  receipt to the current NTM executable, Git revision, and approved verifier
+  IDs. Test execution is controller-owned and network/credential isolated.
 
-The Grok requirements document is a system-owned bypass lock, not a
-per-project setting. An administrator/root process must install it once; the
-installer never overwrites a different existing document and verifies both
-digest and system-authoritative ownership. Every live attestation revalidates
-the requirements file and its full root-owned, non-writable parent path before
-Grok inspects or Bubblewrap binds it:
+The Grok requirements document is one system-owned common baseline and bypass
+lock, not a per-project or per-profile setting. It pins `strict`, `dontAsk`,
+the bypass lock, built-in Edit/Bash denials, credential read/grep/edit denials,
+and only reviewed read/grep/web plus exact NTM workspace-MCP names. Observe
+launches have no MCP server; workspace launches deny web and pass only the
+typed local broker. An administrator/root process installs this one document
+once; the installer never overwrites a different existing document by default
+and verifies both digest and system-authoritative ownership. An explicitly
+confirmed `--replace-managed` migration accepts only an existing root-owned
+NTM-marked document, preserves a digest-named backup, and atomically replaces
+it before re-verifying the result. Every live attestation
+revalidates the requirements file and its full root-owned, non-writable parent
+path before Grok inspects or Bubblewrap binds it:
+
+Grok 1.0.13 rejects the newer documented `features.tool_search` setting, so
+the generated system document does not pretend to attest that switch. NTM
+instead rejects unexpected lower configuration sources and supplies no MCP
+server for observe runs or exactly its own broker descriptor for workspace
+runs. Provider-enforced tool-search disabling remains unavailable until a
+compatible pinned Grok release is separately tested and attested.
 
 ```bash
 ntm provider policy requirements --policy=grok-readonly-ci --install --confirm
-# or, when the reviewed workspace-write envelope is needed:
-ntm provider policy requirements --policy=grok-workspace-write-ci --install --confirm
+# For a reviewed NTM-managed upgrade only:
+ntm provider policy requirements --policy=grok-readonly-ci --install --confirm --replace-managed
+# `--policy=grok-workspace-write-ci` renders the same global document; it is
+# an invocation selector, not an alternative system policy.
 ```
 
 Unattended Grok also requires a canonical system-authoritative executable rather
@@ -439,11 +475,21 @@ The online probe and offline conformance harness are not coding qualification;
 for provider-native no-tool transports, the online probe is instead one of the
 capability-scoped readiness gates.
 
-Doctor reserves `GO` for a transport whose cancellation and cleanup are both
-acknowledged authoritatively by the provider. `GO_SCOPED` means every required
-gate for the declared operation scope passed, but lifecycle control is local or
-unavailable; doctor deliberately exits non-zero so automation cannot mistake
-that narrower result for Claude/Codex-equivalent lifecycle authority.
+Doctor uses an operation-scoped promotion ladder: `NO_GO`, `OBSERVE_ONLY`,
+`REVIEW_GO`, `WORKSPACE_WRITE_GO`, and `LIFECYCLE_GO`. Select the intended
+boundary with `--require-operation=observe|review|workspace-write|lifecycle`;
+the default remains the strict lifecycle requirement. The command exits
+successfully only when that exact operation is admitted. Lower scopes can
+therefore become useful without being mistaken for Claude/Codex-equivalent
+lifecycle authority.
+This is a per-operation admission result, not a global provider badge. A
+missing or stale signed receipt rejects the requested dispatch; it is not
+evidence that any current lane has passed a higher promotion level.
+The same ladder is enforced at production dispatch: Z.ai Codex review/write,
+Grok ACP review/write, and Grok headless lifecycle commands load and verify a
+current signed qualification for the exact identity, transport, policy,
+runtime, operation, and trusted signing key before starting the provider.
+Observe-only ACP remains the narrowly scoped evidence-gathering lane.
 Doctor also remains `NO_GO` whenever the exact or shared subscription admission
 state would reject a new request, including an active lease, transient circuit,
 unknown-usage reservation, or exhausted five-hour/weekly plan window.
@@ -467,6 +513,20 @@ session ID or preserving the prompt. Cancellation and cleanup are authoritative
 only for the locally observed process tree; they are not provider-side
 cancellation acknowledgements. Arbitrary provider output, raw tool arguments,
 credentials, and opaque runtime settings are not authoritative evidence.
+
+Before any headless operation can be considered for promotion, the explicit
+no-write lineage producer can bootstrap its own strict ACP session and prove
+both fork and resume inside a disposable linked worktree:
+
+```bash
+ntm provider qualify --profile=grok-observe --live --grok-headless-lineage
+```
+
+It stores a signed `xai_headless_session` partial receipt and removes its
+isolated login copy, session state, and worktree. Only model identity, native
+fork/resume lineage, and local cleanup may pass; review, write, denial,
+cancellation, and crash gates remain false, so this command alone cannot
+authorize `provider session`.
 
 Grok sessions retain the sandbox recorded when the parent was created, so a
 resume or fork omits only the per-invocation sandbox selector while preserving
@@ -503,6 +563,53 @@ requires the terminal Codex JSONL event to contain an exact
 `turn.completed.server_model` value matching the requested model; configured or
 requested model names are never accepted as provider-resolved evidence. Missing
 identity evidence stops the suite before any workspace mutation.
+
+When a reviewed Codex release finally exposes that provider-resolved field,
+run only one signed preflight first:
+
+```bash
+ntm provider qualify --profile=zai-codex-kevin-v10 --live --identity-only
+```
+
+This performs exactly one read-only, no-tool request and stops; it neither runs
+the coding suite nor promotes workspace or lifecycle operations.
+
+The credential-free protocol laboratory is available through
+`--robot-provider-conformance`. Its embedded ACP and Responses fixtures carry
+verified Ed25519 golden signatures, and the normalized event receipt preserves
+security-relevant ordering. Fault tests cover model absence/conflict/remapping,
+session conflicts, reordered lifecycle/tool events, malformed frames, quota
+classes, crashes, and residual processes. The fixture key is a public offline
+test trust anchor, never a live-provider attestation key.
+
+For Grok workspace ACP, after the managed-policy and inspection gates pass,
+NTM launches its own constrained MCP service as `ntm provider broker stdio`.
+That exact ACP route receives no other MCP descriptor and the broker is not a
+general user shell. This does not govern direct Grok processes started outside
+the qualified NTM path. Subscription routing and the explicit cross-provider plan
+are inspectable without dispatch:
+
+```bash
+ntm provider route plan --profile=zai-codex-kevin-v10 --workload=implementation
+ntm provider route workflow plan --zai-profile=zai-codex-kevin-v10 \
+  --grok-profile=grok-primary --worktree=/exact/disposable/worktree \
+  --zai-operation-id=zai-implementation-42 \
+  --grok-parent-session=EXACT_GROK_PARENT_SESSION \
+  --disposable-worktree
+```
+
+`provider route workflow plan` validates the exact identities and emits a
+proposed order only. It launches neither provider, spends no quota, and does
+not reconcile receipts. Separately qualified Z.ai implementation and signed
+`xai_headless_session` Grok review operations must run explicitly before the
+manual reconciliation gate. Direct one-shot Grok work remains ACP-primary; an
+ACP receipt is not interchangeable with a headless resume receipt.
+
+Routing distinguishes authentication, overload, throttling, five-hour and
+weekly exhaustion, entitlement, unsupported-model, and usage-policy outcomes.
+It never silently switches provider, entitlement, billing class, or model. The
+workflow is Z.ai implementation followed by an independent Grok review and a
+manual signed-receipt reconciliation gate—not automatic failover.
 
 Initialize receipt signing explicitly before any live native request or Grok
 session operation:
@@ -556,9 +663,20 @@ class, API-usage billing class, and `exact_target_only=true`. It is an
 allowlist, not caller authentication. No generic credential, Coding Plan key,
 or arbitrary profile can be requested through the bridge.
 
+For governed Grok ACP and Z.ai/Codex receipt signing, an ambient bridge path is
+never authority. The configured bridge must be an absolute Linux-visible,
+root-owned regular executable whose full parent chain is root-owned and not
+group/world-writable; NTM opens, hashes, and executes that same descriptor.
+Install or migrate this system-owned bridge before attempting a governed run.
+The profile `config_sha256` is recomputed before dispatch. For Z.ai Codex it is
+the CAAM v2-compatible manifest over the pinned bridge metadata and the private
+`.codex/config.toml`, `models.json`, and `zai-codex.json` bytes; edit any one
+only by regenerating the approved profile manifest.
+
 Receipt signing has a fixed bridge allowlist: the attestation preflight and
 canonical receipt schemas `ntm.provider-native-run.v2`,
-`ntm.provider-qualification.v1`, and `ntm.provider-session.v2`. The bridge
+`ntm.provider-qualification.v1`, `ntm.provider-session.v2`, and the compact
+`ntm.provider-grok-acp.v1` receipt-binding envelope. The bridge
 will not sign arbitrary payloads. Non-Windows receipts use an OS-protected,
 process-readable Ed25519 seed; Windows TPM receipts use ECDSA P-256. Neither
 receipt type upgrades local evidence into provider-side cancellation, provider
@@ -626,8 +744,8 @@ because the production test verifier relies on Bubblewrap namespace isolation.
 The native no-tool API lane above remains separate and is not a workaround or
 substitute. **Hard NO-GO:** do not treat either coding lane as ready until
 `ntm provider doctor --profile=PROFILE` reports a current signed pass bound to
-that exact identity, transport, and policy. No live qualification is claimed
-by this document. Test execution is performed by NTM after an exact repository-delta
+that exact identity, transport, and policy. Documentation and offline fixtures
+do not constitute a live qualification. Test execution is performed by NTM after an exact repository-delta
 check, inside a cleared-environment Bubblewrap network/PID/filesystem sandbox,
 not by trusting model-authored output or a provider-run shell command. The
 sandbox starts from an empty root and mounts only system runtime directories,

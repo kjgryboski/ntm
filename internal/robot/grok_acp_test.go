@@ -13,6 +13,7 @@ import (
 	agentpkg "github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
+	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 )
@@ -33,6 +34,7 @@ func TestRunGrokACPOperationBindsNonceAndEmitsSafeReceipt(t *testing.T) {
 		OutputSHA256:            "output-digest",
 		StartedAt:               completedAt.Add(-time.Second),
 		CompletedAt:             completedAt,
+		RuntimeEventContract:    passingGrokRuntimeContract(),
 	}}
 	exitCode := 0
 	evidence := staticGrokACPEvidence{value: GrokACPExecutionEvidence{
@@ -90,21 +92,102 @@ func TestRunGrokACPOperationBindsWorkspacePolicyInDisposableWorktree(t *testing.
 		Success: true, State: grok.StateCompleted, StopReason: "end_turn",
 		CompletionConfirmed: true, AcknowledgementVerified: true,
 		Model: "grok-code", ModelEvidence: "completion_metadata",
+		RuntimeEventContract: passingGrokRuntimeContract(),
 	}}
+	broker, err := grok.NewWorkspaceBrokerDescriptor("/linked/worktree", strings.Repeat("a", 40), []string{"go-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	verified := 0
 	output, err := RunGrokACPOperation(t.Context(), GrokACPOperationOptions{
 		Prompt: "make the bounded edit", CWD: "/linked/worktree", OperationID: "op-workspace",
 		Nonce: testGrokACPNonce, Identity: testGrokACPIdentity(t),
-		AutomationPolicy: agentpkg.GrokWorkspaceWritePolicyName,
+		OperationScope:   GrokACPOperationScopeWorkspaceWrite,
+		AutomationPolicy: agentpkg.GrokWorkspaceWritePolicyName, Broker: broker,
 	}, GrokACPOperationDeps{
 		Engine: engine, Admission: allowingAdmission{}, Ledger: testGrokACPLedger(t),
+		Authorizer:           staticGrokACPAuthorizer{authorization: GrokACPOperationAuthorization{QualificationReceiptSHA256: strings.Repeat("b", 64)}},
 		IsDisposableWorktree: func(context.Context, string) (bool, error) { verified++; return true, nil },
 	})
 	if err != nil || verified != 1 || engine.calls != 1 {
 		t.Fatalf("output=%+v err=%v verified=%d calls=%d", output, err, verified, engine.calls)
 	}
-	if output.ToolDigest != agentpkg.GrokAutomationPolicySHA256(agentpkg.GrokWorkspaceWritePolicyName) || !slices.Equal(engine.request.AutomationPolicyArgs, agentpkg.GrokAutomationACPPolicyArgs(agentpkg.GrokWorkspaceWritePolicyName)) {
+	if output.ToolDigest != agentpkg.GrokAutomationPolicySHA256(agentpkg.GrokWorkspaceWritePolicyName) || !slices.Equal(engine.request.AutomationPolicyArgs, agentpkg.GrokAutomationACPPolicyArgs(agentpkg.GrokWorkspaceWritePolicyName)) || engine.request.Broker == nil {
 		t.Fatalf("workspace policy binding output=%+v request=%+v", output, engine.request)
+	}
+	if output.OperationScope != GrokACPOperationScopeWorkspaceWrite || output.QualificationReceiptSHA256 != strings.Repeat("b", 64) {
+		t.Fatalf("workspace authorization was not bound into receipt: %+v", output)
+	}
+}
+
+func TestRunGrokACPOperationRequiresAuthorizerBeforeClaimAdmissionOrDispatch(t *testing.T) {
+	ledger := testGrokACPLedger(t)
+	engine := &recordingGrokACPEngine{}
+	admission := &recordingAdmission{}
+	output, err := RunGrokACPOperation(t.Context(), GrokACPOperationOptions{
+		Prompt: "review only", CWD: "/repo", OperationID: "op-review-no-authorizer", Nonce: testGrokACPNonce,
+		Identity: testGrokACPIdentity(t), OperationScope: GrokACPOperationScopeReview,
+	}, GrokACPOperationDeps{Engine: engine, Admission: admission, Ledger: ledger})
+	if err == nil || output.State != "operation_authorization_rejected" || output.ErrorCode != ErrCodeDependencyMissing || engine.calls != 0 || admission.successCalls != 0 || admission.resultCalls != 0 {
+		t.Fatalf("non-observe bypass result=%+v err=%v engine=%d admission=%+v", output, err, engine.calls, admission)
+	}
+	if _, receiptErr := GetGrokACPOperationReceipt("op-review-no-authorizer", ledger); receiptErr == nil {
+		t.Fatal("authorization rejection must happen before a durable operation claim")
+	}
+}
+
+func TestRunGrokACPOperationObserveDoesNotUseAuthorizer(t *testing.T) {
+	engine := &recordingGrokACPEngine{result: grok.Result{
+		Success: true, State: grok.StateCompleted, CompletionConfirmed: true, AcknowledgementVerified: true,
+		Model: "grok-code", ModelEvidence: "completion_metadata", StopReason: "end_turn",
+		RuntimeEventContract: passingGrokRuntimeContract(),
+	}}
+	authorizer := &recordingGrokACPAuthorizer{authorization: GrokACPOperationAuthorization{QualificationReceiptSHA256: strings.Repeat("c", 64)}}
+	output, err := RunGrokACPOperation(t.Context(), GrokACPOperationOptions{
+		Prompt: "observe", CWD: "/repo", OperationID: "op-observe-no-authorize", Nonce: testGrokACPNonce, Identity: testGrokACPIdentity(t),
+	}, GrokACPOperationDeps{Engine: engine, Admission: allowingAdmission{}, Ledger: testGrokACPLedger(t), Authorizer: authorizer})
+	if err != nil || output.OperationScope != GrokACPOperationScopeObserve || output.QualificationReceiptSHA256 != "" || authorizer.calls != 0 || engine.calls != 1 {
+		t.Fatalf("observe unexpectedly used promotion authority: output=%+v err=%v authorizer=%+v engine=%d", output, err, authorizer, engine.calls)
+	}
+}
+
+func TestRunGrokACPOperationReplayCannotCrossScopeOrQualification(t *testing.T) {
+	ledger := testGrokACPLedger(t)
+	engine := &recordingGrokACPEngine{result: grok.Result{
+		Success: true, State: grok.StateCompleted, CompletionConfirmed: true, AcknowledgementVerified: true,
+		Model: "grok-code", ModelEvidence: "completion_metadata", StopReason: "end_turn",
+		RuntimeEventContract: passingGrokRuntimeContract(),
+	}}
+	reviewOpts := GrokACPOperationOptions{
+		Prompt: "same task", CWD: "/repo", OperationID: "op-scope-bound", Nonce: testGrokACPNonce,
+		Identity: testGrokACPIdentity(t), OperationScope: GrokACPOperationScopeReview,
+	}
+	firstAuth := staticGrokACPAuthorizer{authorization: GrokACPOperationAuthorization{QualificationReceiptSHA256: strings.Repeat("d", 64)}}
+	if first, err := RunGrokACPOperation(t.Context(), reviewOpts, GrokACPOperationDeps{Engine: engine, Admission: allowingAdmission{}, Ledger: ledger, Authorizer: firstAuth}); err != nil || !first.Success || engine.calls != 1 {
+		t.Fatalf("initial review output=%+v err=%v engine=%d", first, err, engine.calls)
+	}
+
+	changedQualification := staticGrokACPAuthorizer{authorization: GrokACPOperationAuthorization{QualificationReceiptSHA256: strings.Repeat("e", 64)}}
+	qualificationReplay, err := RunGrokACPOperation(t.Context(), reviewOpts, GrokACPOperationDeps{Engine: engine, Admission: allowingAdmission{}, Ledger: ledger, Authorizer: changedQualification})
+	if err == nil || qualificationReplay.ErrorCode != ErrCodeIdempotencyConflict || engine.calls != 1 {
+		t.Fatalf("qualification-crossing replay output=%+v err=%v engine=%d", qualificationReplay, err, engine.calls)
+	}
+
+	broker, brokerErr := grok.NewWorkspaceBrokerDescriptor("/repo", strings.Repeat("a", 40), []string{"go-test"})
+	if brokerErr != nil {
+		t.Fatal(brokerErr)
+	}
+	workspaceOpts := reviewOpts
+	workspaceOpts.OperationScope = GrokACPOperationScopeWorkspaceWrite
+	workspaceOpts.AutomationPolicy = agentpkg.GrokWorkspaceWritePolicyName
+	workspaceOpts.Broker = broker
+	workspaceReplay, err := RunGrokACPOperation(t.Context(), workspaceOpts, GrokACPOperationDeps{
+		Engine: engine, Admission: allowingAdmission{}, Ledger: ledger,
+		Authorizer:           firstAuth,
+		IsDisposableWorktree: func(context.Context, string) (bool, error) { return true, nil },
+	})
+	if err == nil || workspaceReplay.ErrorCode != ErrCodeIdempotencyConflict || engine.calls != 1 {
+		t.Fatalf("scope-crossing replay output=%+v err=%v engine=%d", workspaceReplay, err, engine.calls)
 	}
 }
 
@@ -113,6 +196,7 @@ func TestRunGrokACPOperationRejectsWorkspacePolicyOutsideDisposableWorktree(t *t
 	output, err := RunGrokACPOperation(t.Context(), GrokACPOperationOptions{
 		Prompt: "do not dispatch", CWD: "/primary/checkout", OperationID: "op-primary",
 		Nonce: testGrokACPNonce, Identity: testGrokACPIdentity(t),
+		OperationScope:   GrokACPOperationScopeWorkspaceWrite,
 		AutomationPolicy: agentpkg.GrokWorkspaceWritePolicyName,
 	}, GrokACPOperationDeps{
 		Engine: engine, Admission: allowingAdmission{}, Ledger: testGrokACPLedger(t),
@@ -207,6 +291,7 @@ func TestRunGrokACPOperationThreadsStructuredProviderMetadata(t *testing.T) {
 		NonMessageUpdatesSHA256: "non-message-update-sequence-sha256",
 		ExitCode:                &exitCode,
 		CleanupState:            "reaped_after_termination",
+		RuntimeEventContract:    passingGrokRuntimeContract(),
 	}}
 	output, err := RunGrokACPOperation(t.Context(), GrokACPOperationOptions{
 		Prompt: "hello", CWD: "/repo", Model: "grok-code", OperationID: "op", Nonce: testGrokACPNonce, Identity: testGrokACPIdentity(t),
@@ -216,6 +301,34 @@ func TestRunGrokACPOperationThreadsStructuredProviderMetadata(t *testing.T) {
 	}
 	if output.Model != "grok-code" || output.TokenUsage == nil || output.TokenUsage.Input == nil || *output.TokenUsage.Input != 17 || output.TokenUsage.Output == nil || *output.TokenUsage.Output != 29 || output.TokenUsage.Total != nil || output.ToolEventCount != 2 || output.ToolEventsSHA256 != "event-sequence-sha256" || output.NonMessageUpdateCount != 5 || output.NonMessageUpdatesSHA256 != "non-message-update-sequence-sha256" || output.ExitCode == nil || *output.ExitCode != -1 || output.CleanupState != "reaped_after_termination" {
 		t.Fatalf("structured provider receipt = %+v", output)
+	}
+}
+
+func TestRunGrokACPOperationRejectsFailedRuntimeEventContract(t *testing.T) {
+	admission := &recordingAdmission{}
+	engine := &recordingGrokACPEngine{result: grok.Result{
+		Success:                 true,
+		State:                   grok.StateCompleted,
+		CompletionConfirmed:     true,
+		AcknowledgementVerified: true,
+		StopReason:              "end_turn",
+		Model:                   "grok-code",
+		ModelEvidence:           "completion_metadata",
+		RuntimeEventContract: provider.EventContractReport{
+			Required:   7,
+			Observed:   6,
+			Passed:     false,
+			Violations: []string{"tool request missing terminal completion"},
+		},
+	}}
+	output, err := RunGrokACPOperation(t.Context(), GrokACPOperationOptions{
+		Prompt: "hello", CWD: "/repo", Model: "grok-code", OperationID: "op-contract-failed", Nonce: testGrokACPNonce, Identity: testGrokACPIdentity(t),
+	}, GrokACPOperationDeps{Engine: engine, Admission: admission, Ledger: testGrokACPLedger(t)})
+	if err == nil || output.Success || output.State != grok.StateOutcomeUnknown || output.FailureCode != grok.ErrOutcomeUnknown {
+		t.Fatalf("failed runtime contract output = %+v, err = %v", output, err)
+	}
+	if output.RuntimeEventContract.Passed || len(output.RuntimeEventContract.Violations) != 1 || admission.successCalls != 0 || admission.resultCalls != 0 {
+		t.Fatalf("failed runtime contract evidence/admission = output=%+v admission=%+v", output, admission)
 	}
 }
 
@@ -267,7 +380,7 @@ func TestRunGrokACPOperationRecordsOnlyExactProviderAdmissionEvidence(t *testing
 }
 
 func TestRunGrokACPOperationGeneratesCryptographicIdentity(t *testing.T) {
-	engine := &recordingGrokACPEngine{result: grok.Result{Success: true, State: grok.StateCompleted, CompletionConfirmed: true, AcknowledgementVerified: true, Model: "grok-code", ModelEvidence: "completion_metadata", StopReason: "end_turn"}}
+	engine := &recordingGrokACPEngine{result: grok.Result{Success: true, State: grok.StateCompleted, CompletionConfirmed: true, AcknowledgementVerified: true, Model: "grok-code", ModelEvidence: "completion_metadata", StopReason: "end_turn", RuntimeEventContract: passingGrokRuntimeContract()}}
 	random := bytes.NewReader(bytes.Repeat([]byte{0xAB}, 32))
 	output, err := RunGrokACPOperation(t.Context(), GrokACPOperationOptions{Prompt: "hello", CWD: "/repo", Identity: testGrokACPIdentity(t)}, GrokACPOperationDeps{Engine: engine, Random: random, Admission: allowingAdmission{}, Ledger: testGrokACPLedger(t)})
 	if err != nil {
@@ -315,12 +428,31 @@ func TestRunGrokACPOperationRejectsCatalogOnlyModelEvidence(t *testing.T) {
 	}
 }
 
-func TestGrokModelIdentityEvidenceConfirmedAcceptsTypedSessionModelState(t *testing.T) {
+func TestRunGrokACPOperationRequiresResolvedModelForPinnedRuntime(t *testing.T) {
+	for _, resolved := range []string{"", "other-model"} {
+		t.Run("resolved="+resolved, func(t *testing.T) {
+			engine := &recordingGrokACPEngine{result: grok.Result{
+				Success: true, State: grok.StateCompleted, CompletionConfirmed: true, AcknowledgementVerified: true,
+				Model: "grok-code", ModelEvidence: "completion_metadata", ResolvedModel: resolved,
+				ResolvedModelEvidence: "completion_metadata.usage.model_usage_singleton", StopReason: "end_turn",
+				RuntimeEventContract: passingGrokRuntimeContract(),
+			}}
+			output, err := RunGrokACPOperation(t.Context(), GrokACPOperationOptions{
+				Prompt: "hello", CWD: "/repo", Nonce: testGrokACPNonce, Identity: testGrokACPIdentity(t), RuntimeVersion: "1.0.13",
+			}, GrokACPOperationDeps{Engine: engine, Admission: allowingAdmission{}, Ledger: testGrokACPLedger(t)})
+			if err == nil || output.Success || output.State != "identity_unconfirmed" || output.FailureCode != grok.ErrIdentityMismatch {
+				t.Fatalf("resolved model mismatch output = %+v, err = %v", output, err)
+			}
+		})
+	}
+}
+
+func TestGrokModelIdentityEvidenceConfirmedRequiresTerminalCompletionMetadata(t *testing.T) {
 	for evidence, want := range map[string]bool{
 		"completion_metadata":                             true,
-		"provider_session_notification_plus_exact_launch": true,
-		"session_config_option_plus_exact_launch":         true,
-		"session_model_state_plus_exact_launch":           true,
+		"provider_session_notification_plus_exact_launch": false,
+		"session_config_option_plus_exact_launch":         false,
+		"session_model_state_plus_exact_launch":           false,
 		"provider_catalog_plus_exact_launch":              false,
 		"":                                                false,
 	} {
@@ -355,6 +487,7 @@ func TestRunGrokACPOperationDurablyReplaysWithoutRedispatch(t *testing.T) {
 	engine := &recordingGrokACPEngine{result: grok.Result{
 		Success: true, State: grok.StateCompleted, CompletionConfirmed: true,
 		AcknowledgementVerified: true, Model: "grok-code", ModelEvidence: "completion_metadata", StopReason: "end_turn",
+		RuntimeEventContract: passingGrokRuntimeContract(),
 	}}
 	opts := GrokACPOperationOptions{
 		Prompt: "inspect", CWD: "/repo", OperationID: "op-replay", Nonce: testGrokACPNonce,
@@ -377,12 +510,16 @@ func TestRunGrokACPOperationDurablyReplaysWithoutRedispatch(t *testing.T) {
 func TestApplyStoredGrokACPOutcomeRejectsReceiptBindingMismatch(t *testing.T) {
 	expected := &GrokACPOperationOutput{
 		OperationID: "op-bound", BindingSHA256: sha256String("binding"), ProviderIdentitySHA256: sha256String("identity"),
-		Provider: grokACPProvider, Transport: grokACPTransport, Target: grokACPTarget, ToolDigest: sha256String("policy"),
+		Provider: grokACPProvider, Transport: grokACPTransport, Target: grokACPTarget, ToolDigest: sha256String("policy"), BrokerSHA256: sha256String("broker"),
+		OperationScope: GrokACPOperationScopeReview, QualificationReceiptSHA256: strings.Repeat("a", 64),
 	}
 	for name, mutate := range map[string]func(*GrokACPOperationOutput){
-		"operation": func(value *GrokACPOperationOutput) { value.OperationID = "different" },
-		"identity":  func(value *GrokACPOperationOutput) { value.ProviderIdentitySHA256 = sha256String("different") },
-		"policy":    func(value *GrokACPOperationOutput) { value.ToolDigest = sha256String("different") },
+		"operation":     func(value *GrokACPOperationOutput) { value.OperationID = "different" },
+		"identity":      func(value *GrokACPOperationOutput) { value.ProviderIdentitySHA256 = sha256String("different") },
+		"policy":        func(value *GrokACPOperationOutput) { value.ToolDigest = sha256String("different") },
+		"broker":        func(value *GrokACPOperationOutput) { value.BrokerSHA256 = sha256String("different") },
+		"scope":         func(value *GrokACPOperationOutput) { value.OperationScope = GrokACPOperationScopeWorkspaceWrite },
+		"qualification": func(value *GrokACPOperationOutput) { value.QualificationReceiptSHA256 = strings.Repeat("b", 64) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			recorded := *expected
@@ -394,7 +531,7 @@ func TestApplyStoredGrokACPOutcomeRejectsReceiptBindingMismatch(t *testing.T) {
 			}
 			stored := &state.SendOperation{Status: state.SendOperationCompleted, BindingHash: expected.BindingSHA256, OutcomeJSON: string(data)}
 			copy := *expected
-			if err := applyStoredGrokACPOutcome(&copy, stored); err == nil {
+			if err := applyStoredGrokACPOutcome(&copy, stored, providerattestation.KeyMetadata{}); err == nil {
 				t.Fatalf("mismatched %s receipt was accepted: %+v", name, recorded)
 			}
 		})
@@ -406,6 +543,7 @@ func TestRunGrokACPOperationReplaysWhenNonceIsNormallyGenerated(t *testing.T) {
 	engine := &recordingGrokACPEngine{result: grok.Result{
 		Success: true, State: grok.StateCompleted, CompletionConfirmed: true,
 		AcknowledgementVerified: true, Model: "grok-code", ModelEvidence: "completion_metadata", StopReason: "end_turn",
+		RuntimeEventContract: passingGrokRuntimeContract(),
 	}}
 	random := bytes.NewReader(append(bytes.Repeat([]byte{0x11}, 16), bytes.Repeat([]byte{0x22}, 16)...))
 	opts := GrokACPOperationOptions{
@@ -431,6 +569,7 @@ func TestRunGrokACPOperationRejectsConflictingOperationBinding(t *testing.T) {
 	engine := &recordingGrokACPEngine{result: grok.Result{
 		Success: true, State: grok.StateCompleted, CompletionConfirmed: true,
 		AcknowledgementVerified: true, Model: "grok-code", ModelEvidence: "completion_metadata", StopReason: "end_turn",
+		RuntimeEventContract: passingGrokRuntimeContract(),
 	}}
 	base := GrokACPOperationOptions{Prompt: "first", CWD: "/repo", OperationID: "op-conflict", Nonce: testGrokACPNonce, Identity: testGrokACPIdentity(t)}
 	if _, err := RunGrokACPOperation(t.Context(), base, GrokACPOperationDeps{Engine: engine, Admission: allowingAdmission{}, Ledger: ledger}); err != nil {
@@ -448,7 +587,7 @@ func TestRunGrokACPOperationNeverTakesOverUnknownInProgressClaim(t *testing.T) {
 	identity := testGrokACPIdentity(t)
 	prompt := bindNonceInstruction("inspect", testGrokACPNonce)
 	promptHash := sha256Hex(prompt)
-	binding := grokACPBindingHash(identity, sha256Hex("inspect"), "/repo", "", agentpkg.DefaultGrokAutomationPolicySHA256())
+	binding := grokACPBindingHash(identity, sha256Hex("inspect"), "/repo", "", "", "", agentpkg.DefaultGrokAutomationPolicySHA256(), "", GrokACPOperationScopeObserve, "")
 	if _, claimed, err := claimGrokACPOperation(ledger, "op-unknown", binding, promptHash, int64(len(prompt)), time.Now().UTC().Add(-24*time.Hour)); err != nil || !claimed {
 		t.Fatalf("seed claim: claimed=%v err=%v", claimed, err)
 	}
@@ -599,6 +738,26 @@ type staticGrokACPEvidence struct{ value GrokACPExecutionEvidence }
 
 func (s staticGrokACPEvidence) Evidence(grok.Result) GrokACPExecutionEvidence { return s.value }
 
+type staticGrokACPAuthorizer struct {
+	authorization GrokACPOperationAuthorization
+	err           error
+}
+
+func (s staticGrokACPAuthorizer) AuthorizeGrokACPOperation(context.Context, GrokACPOperationScope, provider.Identity) (GrokACPOperationAuthorization, error) {
+	return s.authorization, s.err
+}
+
+type recordingGrokACPAuthorizer struct {
+	authorization GrokACPOperationAuthorization
+	err           error
+	calls         int
+}
+
+func (r *recordingGrokACPAuthorizer) AuthorizeGrokACPOperation(_ context.Context, _ GrokACPOperationScope, _ provider.Identity) (GrokACPOperationAuthorization, error) {
+	r.calls++
+	return r.authorization, r.err
+}
+
 func mustMarshalGrokACPOperation(t *testing.T, output *GrokACPOperationOutput) []byte {
 	t.Helper()
 	data, err := jsonMarshal(output)
@@ -612,6 +771,10 @@ func mustMarshalGrokACPOperation(t *testing.T, output *GrokACPOperationOutput) [
 func jsonMarshal(value any) ([]byte, error) { return json.Marshal(value) }
 
 func int64ptr(value int64) *int64 { return &value }
+
+func passingGrokRuntimeContract() provider.EventContractReport {
+	return provider.EventContractReport{Required: 7, Observed: 7, Passed: true, Violations: []string{}}
+}
 
 func testGrokACPLedger(t *testing.T) *state.Store {
 	t.Helper()

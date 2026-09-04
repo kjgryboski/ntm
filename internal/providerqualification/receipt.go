@@ -55,6 +55,22 @@ var codexRequiredChecks = []string{
 	"zero_residual_cleanup",
 }
 
+// grokRequiredChecks supports operation-scoped promotion of the native ACP
+// and headless lifecycle lanes. A partial signed receipt may admit review or
+// workspace work only when the exact subset is positive; full Passed still
+// requires every lifecycle gate.
+var grokRequiredChecks = []string{
+	"model_identity",
+	"workspace_edit",
+	"test_execution",
+	"secret_access_denied",
+	"push_denied",
+	"crash_recovery",
+	"cancellation",
+	"session_resumption",
+	"zero_residual_cleanup",
+}
+
 // codexCapacityRecoveryAuthorizationRequiredChecks is an authorization
 // matrix, not a runtime qualification. It is stored in a separate tree and
 // explicitly records the legacy evidence-link limitation before mutation.
@@ -116,13 +132,17 @@ type Check struct {
 // readiness consumers must separately require it rather than treating an
 // unsigned legacy receipt as qualified evidence.
 type Receipt struct {
-	SchemaVersion      string                                 `json:"schema_version"`
-	Mode               string                                 `json:"mode"`
-	Provider           string                                 `json:"provider"`
-	Transport          string                                 `json:"transport"`
-	IdentitySHA256     string                                 `json:"identity_sha256"`
-	PolicySHA256       string                                 `json:"policy_sha256"`
-	RuntimeVersion     string                                 `json:"runtime_version"`
+	SchemaVersion  string `json:"schema_version"`
+	Mode           string `json:"mode"`
+	Provider       string `json:"provider"`
+	Transport      string `json:"transport"`
+	IdentitySHA256 string `json:"identity_sha256"`
+	PolicySHA256   string `json:"policy_sha256"`
+	RuntimeVersion string `json:"runtime_version"`
+	// RuntimeSHA256 binds promotion to the exact executable bytes. It is
+	// optional for legacy and in-process adapters, but binary-backed operation
+	// gates require it and reject older receipts that lack the binding.
+	RuntimeSHA256      string                                 `json:"runtime_sha256,omitempty"`
 	StartedAt          time.Time                              `json:"started_at"`
 	CompletedAt        time.Time                              `json:"completed_at"`
 	DisposableRepoHash string                                 `json:"disposable_repo_sha256"`
@@ -254,6 +274,15 @@ func authoritativeProvenance(provenance string) bool {
 	}
 }
 
+// AuthoritativePassedCheck reports whether one positive check carries the
+// minimum evidence needed for operation-scoped promotion. A partially passing
+// receipt may be valid overall while still containing failed checks, so
+// dispatchers must validate the evidence on every specific positive check they
+// consume rather than relying on the receipt-wide Passed flag.
+func AuthoritativePassedCheck(check Check) bool {
+	return check.Passed && isSHA256(check.EvidenceSHA256) && authoritativeProvenance(check.Provenance)
+}
+
 // CanonicalPayload returns the finalized receipt bytes covered by the public
 // attestation. The signature envelope itself is excluded to avoid recursion;
 // the self-digest remains included.
@@ -290,6 +319,8 @@ func requiredChecksForTransport(transport string) ([]string, error) {
 		return requiredChecks, nil
 	case "zai_codex_runtime":
 		return codexRequiredChecks, nil
+	case "xai_acp", "xai_headless_session":
+		return grokRequiredChecks, nil
 	case "zai_codex_capacity_recovery_authorization":
 		return codexCapacityRecoveryAuthorizationRequiredChecks, nil
 	case "zai_codex_identity_preflight":
@@ -309,6 +340,11 @@ func NativeRequiredChecks() []string { return append([]string(nil), nativeRequir
 // Codex matrix. Keeping this exported prevents the live CLI adapter from
 // re-declaring a potentially incomplete gate list.
 func CodexRequiredChecks() []string { return append([]string(nil), codexRequiredChecks...) }
+
+// GrokRequiredChecks returns the complete native Grok qualification matrix.
+// Observe-only producers intentionally emit every name, leaving unexercised
+// checks false, so a partial receipt can never masquerade as lifecycle proof.
+func GrokRequiredChecks() []string { return append([]string(nil), grokRequiredChecks...) }
 
 // CodexCapacityRecoveryAuthorizationRequiredChecks returns the one-shot
 // legacy authorization matrix. These records are stored separately and never
@@ -336,6 +372,9 @@ func (r Receipt) validateIdentityFields() error {
 		if !isSHA256(value) {
 			return fmt.Errorf("%s SHA-256 is invalid", name)
 		}
+	}
+	if r.RuntimeSHA256 != "" && !isSHA256(r.RuntimeSHA256) {
+		return errors.New("runtime SHA-256 is invalid")
 	}
 	return nil
 }
@@ -408,6 +447,21 @@ func Store(baseDir string, receipt Receipt) (string, error) {
 // or unrelated files are ignored; the bounded directory is never traversed
 // recursively.
 func LoadLatest(baseDir, identitySHA256 string) (Receipt, string, error) {
+	return loadLatest(baseDir, identitySHA256, "")
+}
+
+// LoadLatestForTransport returns the newest valid receipt for one exact
+// identity and transport. This prevents a newer ACP receipt from masking a
+// still-current headless lifecycle receipt (or vice versa) when both lanes
+// intentionally share the same immutable provider identity.
+func LoadLatestForTransport(baseDir, identitySHA256, transport string) (Receipt, string, error) {
+	if strings.TrimSpace(transport) == "" {
+		return Receipt{}, "", errors.New("qualification transport is required")
+	}
+	return loadLatest(baseDir, identitySHA256, strings.TrimSpace(transport))
+}
+
+func loadLatest(baseDir, identitySHA256, transport string) (Receipt, string, error) {
 	if !isSHA256(identitySHA256) {
 		return Receipt{}, "", errors.New("identity SHA-256 is invalid")
 	}
@@ -436,7 +490,7 @@ func LoadLatest(baseDir, identitySHA256 string) (Receipt, string, error) {
 			continue
 		}
 		var receipt Receipt
-		if json.Unmarshal(data, &receipt) != nil || receipt.IdentitySHA256 != identitySHA256 || receipt.Validate() != nil {
+		if json.Unmarshal(data, &receipt) != nil || receipt.IdentitySHA256 != identitySHA256 || (transport != "" && receipt.Transport != transport) || receipt.Validate() != nil {
 			continue
 		}
 		return receipt, path, nil

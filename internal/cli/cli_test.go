@@ -255,6 +255,7 @@ func TestResolveGrokACPProviderProfileFailsClosed(t *testing.T) {
 		Runtime:          "grok",
 		ConfigSHA256:     strings.Repeat("a", 64),
 		Command:          "grok",
+		RuntimeHome:      "/tmp/grok-kevin",
 		AutomationPolicy: agent.DefaultGrokAutomationPolicyName,
 		ExactTargetOnly:  true,
 	}

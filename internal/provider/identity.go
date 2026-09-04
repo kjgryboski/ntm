@@ -83,6 +83,24 @@ func NewIdentity(providerName, accountAlias, model, endpoint, runtime, configSHA
 // provider tuple, including the credential and commercial authorization
 // boundary. The authorization fields contain labels only, never a credential.
 func NewIdentityWithAuthorization(providerName, accountAlias, model, endpoint, runtime, credentialClass, billingClass, entitlement, configSHA256 string) (Identity, error) {
+	return newIdentityWithAuthorization(providerName, accountAlias, model, endpoint, runtime, credentialClass, billingClass, entitlement, configSHA256, "", "")
+}
+
+// NewIdentityWithAuthorizationAndBridge extends the immutable tuple for the
+// CAAM-backed Z.ai Codex lane. The credential bridge is a non-secret authority
+// selector; omitting it would let NTM and CAAM agree on commercial identity
+// while disagreeing about which binary can release the plan credential.
+func NewIdentityWithAuthorizationAndBridge(providerName, accountAlias, model, endpoint, runtime, credentialClass, billingClass, entitlement, bridgePath, bridgeSHA256, configSHA256 string) (Identity, error) {
+	return newIdentityWithAuthorization(providerName, accountAlias, model, endpoint, runtime, credentialClass, billingClass, entitlement, configSHA256, bridgePath, bridgeSHA256)
+}
+
+func newIdentityWithAuthorization(providerName, accountAlias, model, endpoint, runtime, credentialClass, billingClass, entitlement, configSHA256, bridgePath, bridgeSHA256 string) (Identity, error) {
+	// CAAM's v2 Z.ai Codex identity projection preserves the user-visible
+	// endpoint/account spelling after trim (rather than NTM's normalized
+	// storage spelling). Retain that exact preimage only for the bridge-bound
+	// compatibility constructor; ordinary provider identities remain normalized.
+	caamAccountAlias := strings.TrimSpace(accountAlias)
+	caamEndpoint := strings.TrimRight(strings.TrimSpace(endpoint), "/")
 	providerName, err := normalizePart("provider", providerName)
 	if err != nil {
 		return Identity{}, err
@@ -131,7 +149,16 @@ func NewIdentityWithAuthorization(providerName, accountAlias, model, endpoint, r
 		entitlement:     entitlement,
 		configSHA256:    configSHA256,
 	}
-	id.identitySHA256 = hashFields(id.provider, id.accountAlias, id.model, id.endpoint, id.runtime, id.credentialClass, id.billingClass, id.entitlement, id.configSHA256)
+	if bridgePath != "" || bridgeSHA256 != "" {
+		bridgePath = strings.TrimSpace(bridgePath)
+		bridgeSHA256 = strings.ToLower(strings.TrimSpace(bridgeSHA256))
+		if bridgePath == "" || !configSHA256Pattern.MatchString(bridgeSHA256) {
+			return Identity{}, fmt.Errorf("credential bridge identity fields are invalid")
+		}
+		id.identitySHA256 = hashFields(id.provider, caamAccountAlias, id.model, caamEndpoint, id.runtime, id.credentialClass, id.billingClass, id.entitlement, bridgePath, bridgeSHA256, id.configSHA256)
+	} else {
+		id.identitySHA256 = hashFields(id.provider, id.accountAlias, id.model, id.endpoint, id.runtime, id.credentialClass, id.billingClass, id.entitlement, id.configSHA256)
+	}
 	return id, nil
 }
 

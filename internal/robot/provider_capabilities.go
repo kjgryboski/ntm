@@ -34,8 +34,11 @@ type GrokPolicyCapability struct {
 	PermissionMode           string `json:"permission_mode"`
 	SHA256                   string `json:"sha256"`
 	SystemRequirementsSHA256 string `json:"system_requirements_sha256"`
-	AllowRuleCount           int    `json:"allow_rule_count"`
-	DenyRuleCount            int    `json:"deny_rule_count"`
+	// SystemRequirementsScope is "global" because /etc/grok/requirements.toml
+	// is one root-owned baseline shared by both invocation profiles.
+	SystemRequirementsScope string `json:"system_requirements_scope"`
+	AllowRuleCount          int    `json:"allow_rule_count"`
+	DenyRuleCount           int    `json:"deny_rule_count"`
 }
 
 // ProviderConformanceCapability advertises the offline-only conformance
@@ -133,6 +136,7 @@ func grokPolicyCapability(name string) GrokPolicyCapability {
 		PermissionMode:           policy.PermissionMode,
 		SHA256:                   agentpkg.GrokAutomationPolicySHA256(name),
 		SystemRequirementsSHA256: requirements.SHA256,
+		SystemRequirementsScope:  "global",
 		AllowRuleCount:           len(policy.AllowRules),
 		DenyRuleCount:            len(policy.DenyRules),
 	}

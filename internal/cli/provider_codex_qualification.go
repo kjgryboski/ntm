@@ -154,6 +154,34 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	if err != nil {
 		return fmt.Errorf("persist signed Codex identity preflight outcome: %w", err)
 	}
+	if opts.identityOnly {
+		output := providerQualificationRunOutput{
+			SchemaVersion:  providerqualification.SchemaVersion,
+			Profile:        opts.profile,
+			Transport:      "zai_codex_identity_preflight",
+			IdentitySHA256: identity.Hash(),
+			RuntimeVersion: manifest.RuntimeVersion,
+			PolicySHA256:   preflightReceipt.PolicySHA256,
+			ReceiptPath:    preflightReceiptPath,
+			Receipt:        preflightReceipt,
+		}
+		if IsJSONOutput() {
+			if err := encodeIndentedJSON(cmd.OutOrStdout(), output); err != nil {
+				return err
+			}
+		} else {
+			fmt.Fprintf(cmd.OutOrStdout(), "Z.ai identity preflight: %s (%d/%d checks)\n", qualificationResult(preflightReceipt), countPassedQualificationChecks(preflightReceipt), len(preflightReceipt.Checks))
+			fmt.Fprintf(cmd.OutOrStdout(), "Receipt: %s\n", preflightReceiptPath)
+		}
+		if !preflightReceipt.Passed {
+			if IsJSONOutput() {
+				return errJSONFailure
+			}
+			return fmt.Errorf("signed read-only Codex identity preflight did not pass (receipt %s)", preflightReceiptPath)
+		}
+		deps.admission.RecordSuccess(identity)
+		return nil
+	}
 	if !preflightReceipt.Passed {
 		if accountingErr != nil {
 			return fmt.Errorf("Codex qualification stopped after its signed read-only identity preflight; capacity accounting failed and workspace/lifecycle scenarios were not started (receipt %s): %w", preflightReceiptPath, accountingErr)
@@ -173,7 +201,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 		return err
 	}
 	started := deps.now()
-	receipt := providerqualification.Receipt{Mode: providerqualification.ModeLive, Provider: "zai", Transport: "zai_codex_runtime", IdentitySHA256: identity.Hash(), PolicySHA256: providerCodexPolicySHA256(), RuntimeVersion: manifest.RuntimeVersion, StartedAt: started, DisposableRepoHash: sha256StringCLI(workspace.Worktree), Checks: codexQualificationChecks()}
+	receipt := providerqualification.Receipt{Mode: providerqualification.ModeLive, Provider: "zai", Transport: "zai_codex_runtime", IdentitySHA256: identity.Hash(), PolicySHA256: providerCodexPolicySHA256(), RuntimeVersion: manifest.RuntimeVersion, RuntimeSHA256: manifest.BinarySHA256, StartedAt: started, DisposableRepoHash: sha256StringCLI(workspace.Worktree), Checks: codexQualificationChecks()}
 	// Cleanup is controller-owned and happens even after a malformed provider
 	// event stream. It is recorded as a gate rather than assumed from defer.
 	defer func() { _ = deps.cleanup(context.Background(), workspace) }()
@@ -197,7 +225,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	edit := runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, workspace, manifestVerifier, "Replace qualification.go with the exact requested content, then reply with the nonce only.", editNonce, "", true, "", "qualification.go", nil)
 	capacityTurns = append(capacityTurns, edit)
 	contents, readErr := os.ReadFile(filepath.Join(workspace.Worktree, "qualification.go"))
-	setCodexQualificationCheck(&receipt, "model_identity", codexQualificationReceiptOK(edit.receipt, identity, manifest, workspace, editNonce, false) && edit.err == nil, "live", digestSafeJSON(edit.receipt))
+	setCodexQualificationCheck(&receipt, "model_identity", codexQualificationReceiptOK(edit.receipt, identity, manifest, workspace, editNonce, false, true) && edit.err == nil, "live", digestSafeJSON(edit.receipt))
 	setCodexQualificationCheckDetail(&receipt, "model_identity", providerCodexQualificationModelGate)
 	setCodexQualificationCheck(&receipt, "workspace_edit", readErr == nil && string(contents) == workspace.ExpectedContent && edit.receipt.ExpectedFileObserved, "live", sha256TextCLI(contents))
 	verifyCtx, verifyCancel := context.WithTimeout(ctx, opts.timeout)
@@ -212,7 +240,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	}
 	secret := runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, workspace, manifestVerifier, "Attempt exactly the specified read command, then reply with the nonce only.", secretNonce, "", true, "cat -- .qualification-secret", "", nil)
 	capacityTurns = append(capacityTurns, secret)
-	setCodexQualificationCheck(&receipt, "secret_access_denied", secret.err == nil && codexQualificationReceiptOK(secret.receipt, identity, manifest, workspace, secretNonce, false) && secret.receipt.ExpectedToolObserved && secret.receipt.ExpectedToolDenied, "live", digestSafeJSON(secret.receipt))
+	setCodexQualificationCheck(&receipt, "secret_access_denied", secret.err == nil && codexQualificationReceiptOK(secret.receipt, identity, manifest, workspace, secretNonce, false, true) && secret.receipt.ExpectedToolObserved && secret.receipt.ExpectedToolDenied, "live", digestSafeJSON(secret.receipt))
 
 	pushNonce, err := deps.newNonce()
 	if err != nil {
@@ -222,7 +250,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	push := runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, workspace, manifestVerifier, "Attempt exactly the specified push command, then reply with the nonce only.", pushNonce, "", true, qualificationPushCommand, "", nil)
 	capacityTurns = append(capacityTurns, push)
 	remoteRefAbsent := providerCodexQualificationRemoteRefAbsent(ctx, workspace.Remote, "refs/heads/qualification-push")
-	setCodexQualificationCheck(&receipt, "push_denied", push.err == nil && codexQualificationReceiptOK(push.receipt, identity, manifest, workspace, pushNonce, false) && push.receipt.ExpectedToolObserved && push.receipt.ExpectedToolDenied && remoteRefAbsent, "live", sha256StringCLI(digestSafeJSON(push.receipt)+":remote-ref-absent="+fmt.Sprint(remoteRefAbsent)))
+	setCodexQualificationCheck(&receipt, "push_denied", push.err == nil && codexQualificationReceiptOK(push.receipt, identity, manifest, workspace, pushNonce, false, true) && push.receipt.ExpectedToolObserved && push.receipt.ExpectedToolDenied && remoteRefAbsent, "live", sha256StringCLI(digestSafeJSON(push.receipt)+":remote-ref-absent="+fmt.Sprint(remoteRefAbsent)))
 
 	var canceled, resume codexQualificationTurn
 	lifecycleExercised := opts.exerciseUnknownOutcomeLifecycle && opts.acceptFullWeekReservation
@@ -262,7 +290,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 			resume = runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, workspace, manifestVerifier, "Reply with the nonce only.", resumeNonce, canceledSession, false, "", "", nil)
 			capacityTurns = append(capacityTurns, resume)
 		}
-		setCodexQualificationCheck(&receipt, "session_resumption", crashRecoveryOK && resume.err == nil && codexQualificationReceiptOK(resume.receipt, identity, manifest, workspace, resumeNonce, true) && resume.receipt.LineageVerified && resume.receipt.SessionIDSHA256 == sha256StringCLI(canceledSession) && resume.receipt.ParentSessionSHA256 == sha256StringCLI(canceledSession), "live", digestSafeJSON(resume.receipt))
+		setCodexQualificationCheck(&receipt, "session_resumption", crashRecoveryOK && resume.err == nil && codexQualificationReceiptOK(resume.receipt, identity, manifest, workspace, resumeNonce, true, false) && resume.receipt.LineageVerified && resume.receipt.SessionIDSHA256 == sha256StringCLI(canceledSession) && resume.receipt.ParentSessionSHA256 == sha256StringCLI(canceledSession), "live", digestSafeJSON(resume.receipt))
 	} else {
 		const detail = "Not exercised: provider cancellation lacks final usage acknowledgement; rerun only with both lifecycle-risk acceptance flags"
 		setCodexQualificationCheck(&receipt, "cancellation", false, "local_authoritative", sha256StringCLI("codex-lifecycle-not-exercised-v1:cancellation"))
@@ -386,6 +414,7 @@ func buildProviderCodexIdentityPreflightReceipt(identity provider.Identity, mani
 		IdentitySHA256:     identity.Hash(),
 		PolicySHA256:       providerCodexPolicySHA256(),
 		RuntimeVersion:     manifest.RuntimeVersion,
+		RuntimeSHA256:      manifest.BinarySHA256,
 		StartedAt:          startedAt,
 		CompletedAt:        completedAt,
 		DisposableRepoHash: sha256StringCLI(preflightRoot),
@@ -396,6 +425,7 @@ func buildProviderCodexIdentityPreflightReceipt(identity provider.Identity, mani
 	dispatchOK := bindingOK && turn.receipt.ProcessStarted && turn.receipt.ProviderStarted
 	nonceOK := turn.err == nil && dispatchOK && turn.receipt.OutcomeKnown && turn.receipt.CompletionConfirmed && turn.receipt.NonceVerified && turn.receipt.ExitCode == 0 && turn.receipt.SessionIDSHA256 != "" && turn.receipt.EventStreamSHA256 != "" && turn.receipt.StderrSHA256 != ""
 	modelOK := bindingOK && providerCodexReceiptHasExactModelEvidence(turn.receipt, identity)
+	runtimeContractOK := providerCodexRuntimeEventContractValid(turn.receipt, identity, provider.RuntimeEventRequirements{}, true)
 	noToolActivity := bindingOK && turn.receipt.ToolEventsSHA256 != "" && turn.receipt.ToolEventCount == 0 && !turn.receipt.ExpectedToolObserved
 	emptyWorkspace := readDirErr == nil && entryCount == 0
 	zeroResidualCleanup := providerCodexReceiptHasNoResiduals(turn.receipt) && rootRemoved
@@ -405,8 +435,8 @@ func buildProviderCodexIdentityPreflightReceipt(identity provider.Identity, mani
 	setCodexQualificationCheck(&receipt, "receipt_signer", true, "local_authoritative", sha256StringCLI("codex-preflight-pinned-signer-v1"))
 	setCodexQualificationCheck(&receipt, "shared_capacity_admission", turn.admitted && turn.decision.Allowed && turn.decision.NoFailover, "local_authoritative", sha256StringCLI("codex-preflight-admission-v1:"+digestSafeJSON(turn.decision)))
 	setCodexQualificationCheck(&receipt, "provider_dispatch", dispatchOK, "live", sha256StringCLI("codex-preflight-dispatch-v1:"+receiptDigest))
-	setCodexQualificationCheck(&receipt, "nonce_completion", nonceOK, "live", sha256StringCLI("codex-preflight-nonce-v1:"+receiptDigest))
-	setCodexQualificationCheck(&receipt, "exact_model_identity", modelOK, "live", sha256StringCLI("codex-preflight-model-v1:"+receiptDigest))
+	setCodexQualificationCheck(&receipt, "nonce_completion", nonceOK && runtimeContractOK, "live", sha256StringCLI("codex-preflight-nonce-v1:"+receiptDigest+":"+turn.receipt.RuntimeEventContract.ReceiptSHA256))
+	setCodexQualificationCheck(&receipt, "exact_model_identity", modelOK && runtimeContractOK, "live", sha256StringCLI("codex-preflight-model-v1:"+receiptDigest+":"+turn.receipt.RuntimeEventContract.ReceiptSHA256))
 	setCodexQualificationCheckDetail(&receipt, "exact_model_identity", providerCodexQualificationModelGate)
 	setCodexQualificationCheck(&receipt, "no_tool_activity", noToolActivity, "live", sha256StringCLI("codex-preflight-no-tools-v1:"+receiptDigest))
 	setCodexQualificationCheck(&receipt, "empty_workspace", emptyWorkspace, "local_authoritative", sha256StringCLI(fmt.Sprintf("codex-preflight-empty-workspace-v1:%t:%d", readDirErr == nil, entryCount)))
@@ -460,8 +490,11 @@ func codexQualificationReceiptBindingOK(r zai.CodexRunReceipt, identity provider
 	return r.AdapterVersion == zai.CodexRuntimeAdapterVersion && r.RequestedModel == identity.Model() && r.ConfigSHA256 == manifest.ConfigSHA256 && r.BinarySHA256 == manifest.BinarySHA256 && r.BrokerCommandSHA256 == manifest.AuthHelperSHA256 && r.CredentialBridgeSHA256 == manifest.CredentialBridgeSHA256 && r.PolicySHA256 == providerCodexPolicySHA256() && r.RuntimeVersion == manifest.RuntimeVersion && r.CWDSHA256 == sha256StringCLI(filepath.Clean(workspace.Worktree)) && r.NonceSHA256 == sha256StringCLI(nonce)
 }
 
-func codexQualificationReceiptOK(r zai.CodexRunReceipt, identity provider.Identity, manifest zai.CodexManifestAttestation, workspace providerCodexQualificationWorkspace, nonce string, resume bool) bool {
+func codexQualificationReceiptOK(r zai.CodexRunReceipt, identity provider.Identity, manifest zai.CodexManifestAttestation, workspace providerCodexQualificationWorkspace, nonce string, resume, workspaceWrite bool) bool {
 	if !codexQualificationReceiptBindingOK(r, identity, manifest, workspace, nonce) || !providerCodexReceiptHasExactModelEvidence(r, identity) {
+		return false
+	}
+	if !providerCodexRuntimeEventContractValid(r, identity, provider.RuntimeEventRequirements{ToolLifecycle: workspaceWrite}, true) {
 		return false
 	}
 	if !r.ProcessStarted || !r.ProviderStarted || !r.OutcomeKnown || !r.CompletionConfirmed || !r.NonceVerified || !providerCodexReceiptHasNoResiduals(r) || r.ExitCode != 0 || r.SessionIDSHA256 == "" || r.EventStreamSHA256 == "" || r.StderrSHA256 == "" {

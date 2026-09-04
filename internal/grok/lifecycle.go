@@ -50,7 +50,11 @@ type SessionRequest struct {
 	// or delete a worktree as a side effect. An omitted value binds to CWD.
 	Worktree string
 	Binary   string
-	Model    string
+	// RuntimeHome is the exact profile-owned GROK_HOME used for both persisted
+	// session lineage and the isolated process environment.
+	RuntimeHome    string
+	WorkspaceWrite bool
+	Model          string
 	// RuntimeVersion is the exact pinned Grok CLI version that owns the
 	// selectable model alias. It is used only to select an audited, exact
 	// receipt-model binding; an unknown runtime never gets alias expansion.
@@ -107,7 +111,10 @@ var lifecycleReceiptModelBindings = map[string]map[string]string{
 	},
 }
 
-func expectedLifecycleReceiptModel(runtimeVersion, requestedModel string) string {
+// ExpectedResolvedModel returns the exact provider model expected in terminal
+// usage metadata for one pinned Grok CLI version and public model selector.
+// Unknown versions deliberately receive no alias expansion.
+func ExpectedResolvedModel(runtimeVersion, requestedModel string) string {
 	if concrete, ok := lifecycleReceiptModelBindings[runtimeVersion][requestedModel]; ok {
 		return concrete
 	}
@@ -198,7 +205,7 @@ func BuildSessionSpec(req SessionRequest) (StartSpec, SessionReceipt, error) {
 	if err := validateSessionLineageContext(receipt); err != nil {
 		return StartSpec{}, SessionReceipt{}, err
 	}
-	return StartSpec{Binary: req.Binary, Args: args, CWD: req.CWD}, receipt, nil
+	return StartSpec{Binary: req.Binary, Args: args, CWD: req.CWD, RuntimeHome: req.RuntimeHome, WorkspaceWrite: req.WorkspaceWrite}, receipt, nil
 }
 
 func defaultReadOnlyLifecyclePolicyArgs() []string {
@@ -355,7 +362,11 @@ type headlessOSProcess struct {
 
 func (HeadlessOSRunner) Start(_ context.Context, spec StartSpec) (LifecycleProcess, error) {
 	cmd := exec.Command(spec.Binary, spec.Args...)
-	cmd.Dir, cmd.Env = spec.CWD, minimalGrokEnvironment(os.Environ())
+	env, err := IsolatedProcessEnvironment(os.Environ(), spec.RuntimeHome, spec.WorkspaceWrite)
+	if err != nil {
+		return nil, err
+	}
+	cmd.Dir, cmd.Env = spec.CWD, env
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -406,7 +417,7 @@ func executeSession(ctx context.Context, runner LifecycleRunner, req SessionRequ
 		receipt.Cancellation = CancellationReceipt{LocalTermination: "not_started", ObservedAt: time.Now().UTC(), ResidualPIDs: []int32{}}
 		return receipt, &Error{Code: ErrOutcomeUnknown, Err: err}
 	}
-	expectedReceiptModel := expectedLifecycleReceiptModel(req.RuntimeVersion, req.Model)
+	expectedReceiptModel := ExpectedResolvedModel(req.RuntimeVersion, req.Model)
 	receipt.RequestedModel = req.Model
 	receipt.ExpectedReceiptModel = expectedReceiptModel
 	proc, err := runner.Start(ctx, spec)

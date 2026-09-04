@@ -13,7 +13,7 @@ func TestGetProviderConformanceRunsSyntheticHarnessWithoutCoordinationStores(t *
 	cfg := &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{
 		"xai-primary": {
 			Provider: "xai", AccountAlias: "test", Model: "grok-code", Endpoint: "https://api.x.ai/v1",
-			Runtime: "grok", ConfigSHA256: strings.Repeat("a", 64), Command: "grok",
+			Runtime: "grok", ConfigSHA256: strings.Repeat("a", 64), Command: "grok", RuntimeHome: "/tmp/grok-test",
 			AutomationPolicy: agent.DefaultGrokAutomationPolicyName, ExactTargetOnly: true,
 		},
 		"zai-primary": {
@@ -39,17 +39,26 @@ func TestGetProviderConformanceRunsSyntheticHarnessWithoutCoordinationStores(t *
 			CredentialBridgeCommand: "/usr/bin/ntm-provider-bridge", CredentialBridgeCommandSHA256: strings.Repeat("2", 64),
 		},
 	}}
-	for _, test := range []struct{ profile, transport string }{
-		{"xai-primary", "xai_acp"},
-		{"xai-primary", "xai_headless_session"},
-		{"xai-primary", "xai_grok_tui"},
-		{"zai-primary", "zai_claude_runtime"},
-		{"zai-codex", "zai_codex_runtime"},
-		{"zai-native", "zai_native_api"},
+	for _, test := range []struct {
+		profile, transport string
+		fixtureComplete    bool
+	}{
+		{"xai-primary", "xai_acp", true},
+		{"xai-primary", "xai_headless_session", false},
+		{"xai-primary", "xai_grok_tui", false},
+		{"zai-primary", "zai_claude_runtime", false},
+		{"zai-codex", "zai_codex_runtime", true},
+		{"zai-native", "zai_native_api", false},
 	} {
 		out, err := GetProviderConformance(t.Context(), cfg, test.profile, test.transport)
-		if err != nil || !out.Success || !out.Passed || out.Mode != "synthetic_offline" || out.Report.Coverage.Satisfied != 7 {
+		if err != nil || out.Mode != "synthetic_offline" || out.Report.Coverage.Satisfied != 7 || out.Passed != test.fixtureComplete || out.Success != test.fixtureComplete {
 			t.Fatalf("%s output=%+v err=%v", test.transport, out, err)
+		}
+		if test.fixtureComplete && (out.Report.EventContract == nil || !out.Report.EventContract.Passed || out.Report.EventContract.ReceiptSHA256 == "" || !out.Report.Fixture.GoldenSignatureValid || out.Report.Fixture.SignedEventModel == "") {
+			t.Fatalf("%s did not replay the shared event contract: %+v", test.transport, out.Report.EventContract)
+		}
+		if !test.fixtureComplete && (out.Report.EventContract == nil || out.Report.EventContract.Passed || len(out.Report.EventContract.Violations) == 0) {
+			t.Fatalf("%s fabricated offline event-contract coverage: %+v", test.transport, out.Report.EventContract)
 		}
 	}
 }
@@ -58,7 +67,7 @@ func TestGetProviderConformanceRejectsProviderTransportMismatch(t *testing.T) {
 	cfg := &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{
 		"xai-primary": {
 			Provider: "xai", AccountAlias: "test", Model: "grok-code", Endpoint: "https://api.x.ai/v1",
-			Runtime: "grok", ConfigSHA256: strings.Repeat("a", 64), Command: "grok",
+			Runtime: "grok", ConfigSHA256: strings.Repeat("a", 64), Command: "grok", RuntimeHome: "/tmp/grok-test",
 			AutomationPolicy: agent.DefaultGrokAutomationPolicyName, ExactTargetOnly: true,
 		},
 	}}

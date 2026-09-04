@@ -1,0 +1,26 @@
+{
+  "id": "zai-responses-redacted-v2",
+  "transport": "zai_codex_runtime",
+  "wire_family": "responses",
+  "captured_at": "2026-09-03T00:00:00Z",
+  "runtime_version": "zai-codex-responses-redacted-1",
+  "expected_pass": true,
+  "requirements": {"tool_lifecycle":true,"checkpoint":true,"cancellation_requested":true},
+  "events": [
+    {"type":"response.created","session_id":"redacted-response"},
+    {"type":"response.model","session_id":"redacted-response","model":"glm-5.3"},
+    {"type":"response.tool_call","session_id":"redacted-response","tool":"ntm.command_broker"},
+    {"type":"response.tool_result","session_id":"redacted-response","tool":"ntm.command_broker"},
+    {"type":"response.checkpoint","session_id":"redacted-response","checkpoint_id":"checkpoint-redacted"},
+    {"type":"response.cancelled","session_id":"redacted-response"},
+    {"type":"response.completed","session_id":"redacted-response"},
+    {"type":"response.usage","session_id":"redacted-response","input_tokens":12,"output_tokens":8},
+    {"type":"response.cleanup","session_id":"redacted-response","residual_processes":0}
+  ],
+  "golden_signature": {
+    "algorithm": "ed25519",
+    "key_id": "ntm-offline-fixture-ed25519-v1",
+    "payload_sha256": "3df05903c337646d536274a251f0e022fea366f6733435bd300335802d641dc7",
+    "signature": "b3b7a94b87b9a2783015f7ddc4e378aa3d47f400f6ee3125a4fb73ac16b413a60b797816140648beb7e8c6b38c896022d1123288a9ea67b06da34ccd5fda8705"
+  }
+}

@@ -70,6 +70,46 @@ func TestWorkspaceBrokerRejectsProtectedTraversalSymlinkAndStaleWrite(t *testing
 	}
 }
 
+func TestWorkspaceBrokerDeniesCredentialFamiliesAcrossReadWriteAndList(t *testing.T) {
+	broker := testWorkspaceBroker(t)
+	protected := []string{
+		".config/gh/hosts.yml", ".config/gcloud/application_default_credentials.json",
+		"config/gh/hosts.yml", "config/gcloud/credentials.json",
+		".azure/accessTokens.json", ".docker/config.json", ".grok/auth.json",
+		"certs/client.pem", "certs/client.key", "certs/client.p12", "certs/client.pfx",
+		"customer-secret.txt", "service-credentials.json", ".env.production",
+	}
+	for _, relative := range protected {
+		path := filepath.Join(broker.root, filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("prepare %s: %v", relative, err)
+		}
+		if err := os.WriteFile(path, []byte("do-not-expose"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", relative, err)
+		}
+		if _, _, err := broker.ReadFile(t.Context(), relative); err == nil {
+			t.Errorf("protected path %q was readable", relative)
+		}
+		if _, err := broker.WriteFile(t.Context(), relative, verifierHash("do-not-expose"), []byte("changed")); err == nil {
+			t.Errorf("protected path %q was writable", relative)
+		}
+	}
+	allowed := filepath.Join(broker.root, "pkg", "visible.go")
+	if err := os.MkdirAll(filepath.Dir(allowed), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(allowed, []byte("package pkg\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files, _, err := broker.ListFiles(t.Context(), ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0] != "pkg/visible.go" {
+		t.Fatalf("protected paths leaked through listing: %v", files)
+	}
+}
+
 func TestWorkspaceBrokerRejectsTargetChangedBeforeCommit(t *testing.T) {
 	broker := testWorkspaceBroker(t)
 	if err := os.Mkdir(filepath.Join(broker.root, "pkg"), 0o700); err != nil {
