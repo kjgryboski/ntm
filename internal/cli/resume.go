@@ -72,6 +72,8 @@ type ResumeInjectInfo struct {
 }
 
 func newResumeCmd() *cobra.Command {
+	var providerProfile, providerOperationID, providerParent, providerPrompt, providerCWD string
+	var providerTimeout time.Duration
 	var (
 		fromPath string
 		spawn    bool
@@ -100,6 +102,18 @@ Examples:
   ntm resume myproject --dry-run    # Show what would be resumed`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if providerProfile != "" {
+				if len(args) != 0 || strings.TrimSpace(providerParent) == "" {
+					return errors.New("provider resume requires --parent-session and no terminal session argument")
+				}
+				if err := validateProviderControlFlags(cmd, "provider-profile", "operation-id", "parent-session", "prompt", "cwd", "timeout"); err != nil {
+					return err
+				}
+				return dispatchProviderAssignment(cmd, providerAssignmentRequest{Profile: providerProfile, OperationID: providerOperationID, ParentSession: providerParent, Prompt: providerPrompt, CWD: providerCWD, Timeout: providerTimeout})
+			}
+			if providerOperationID != "" || providerParent != "" || providerPrompt != "" || providerCWD != "" || cmd.Flags().Changed("timeout") {
+				return errors.New("structured resume options require --provider-profile")
+			}
 			sessionName := ""
 			if len(args) > 0 {
 				sessionName = args[0]
@@ -112,6 +126,12 @@ Examples:
 	}
 
 	cmd.Flags().StringVar(&fromPath, "from", "", "Specific handoff file to resume from")
+	cmd.Flags().StringVar(&providerProfile, "provider-profile", "", "Resume a supported provider session through its exact qualified adapter")
+	cmd.Flags().StringVar(&providerOperationID, "operation-id", "", "New durable operation ID for the resume turn")
+	cmd.Flags().StringVar(&providerParent, "parent-session", "", "Exact provider session to resume; no automatic restart fallback")
+	cmd.Flags().StringVar(&providerPrompt, "prompt", "", "Assignment for the resumed provider session")
+	cmd.Flags().StringVar(&providerCWD, "cwd", "", "Linked disposable worktree bound to the provider session")
+	cmd.Flags().DurationVar(&providerTimeout, "timeout", 20*time.Minute, "Maximum duration of the provider resume turn")
 	cmd.Flags().BoolVar(&spawn, "spawn", false, "Spawn new agents with handoff context")
 	cmd.Flags().BoolVar(&inject, "inject", false, "Inject context into existing session")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be resumed without executing")

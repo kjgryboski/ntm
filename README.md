@@ -550,6 +550,48 @@ itself. As elsewhere in the local control plane, arbitrary code already running
 under the controller's same OS account is inside the trusted boundary; the
 private inode is not claimed to resist a fully compromised same-user process.
 
+Qualified structured providers can receive the same bounded coding assignment
+through the ordinary controls. `PROFILE` must select an exact Grok ACP or Z.ai
+Codex profile with current workspace qualification; `WORKTREE` must already be
+an isolated linked worktree. These commands launch one assignment and return
+its terminal receipt. They do not create an idle terminal pane.
+
+```bash
+ntm assign --provider-profile PROFILE --operation-id task-1 --auto --repo WORKTREE --prompt "Implement the task and run its tests" --timeout 5m
+ntm send --provider-profile PROFILE --operation-id task-1 --cwd WORKTREE --timeout 5m "Implement the task and run its tests"
+ntm spawn task-1 --provider-profile PROFILE --cwd WORKTREE --prompt "Implement the task and run its tests" --timeout 5m
+ntm status --provider-profile PROFILE --operation-id task-1 --json
+ntm health --provider-profile PROFILE --operation-id task-1 --json
+```
+
+Choose one dispatch command per logical assignment. Reusing an operation ID
+continues to use the adapter's existing replay boundary. Status and health read
+the durable receipt and verify its signer and exact identity. An unfinished row
+is outcome-unknown, not proof of a running or stopped process. Provider, runtime,
+account digest, billing identity, and requested/served model remain separate.
+The status report does not infer capacity release from local process cleanup.
+
+Interrupting the running command requests local cancellation through the same
+adapter. Cancellation from a separate command and automatic crash restart are
+not implemented for these structured assignments. Z.ai's supported session
+resume is reachable through `ntm resume --provider-profile PROFILE
+--operation-id NEW_ID --parent-session SESSION --cwd WORKTREE --prompt TEXT`;
+it still requires lifecycle qualification. Grok ACP workspace resume is
+unsupported and never falls back to a fresh run. These controls do not qualify
+an untested provider, bypass Z.ai capacity admission, or establish Codex/Claude
+comparison evidence.
+
+Grok qualification checks diagnostic storage before dispatch and flushes a
+separate unsigned observation before process cleanup. It retains only reviewed
+method labels, request-ID shape, session-match status, fixed stage/reason labels,
+and counters. Unknown method text, IDs, parameters, and credentials are excluded.
+Reviewed `session/request_permission` requests may select only `reject_once`;
+unbound, malformed, or unsupported requests fail closed. Independently verified
+broker edits, tests, and denials survive an unrelated protocol failure. The
+complete relevant signed subset, including identity and cleanup, is still
+required for admission. `provider baseline` reports passed, failed, untested,
+or unsupported without granting readiness.
+
 Grok sessions retain the sandbox recorded when the parent was created, so a
 resume or fork omits only the per-invocation sandbox selector while preserving
 every compiled allow/deny rule from the root-owned policy. Model identity stays

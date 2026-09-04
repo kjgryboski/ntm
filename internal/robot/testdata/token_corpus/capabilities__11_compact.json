@@ -136,6 +136,19 @@
       "schema_source": "built_in"
     },
     {
+      "name": "grok-acp-receipt",
+      "flag": "--robot-grok-acp-receipt",
+      "category": "state",
+      "summary": "Read one durable nonce-bound Grok ACP outcome by operation ID without contacting the provider or redispatching work.",
+      "output_formats": [
+        "json"
+      ],
+      "default_output_format": "json",
+      "schema_id": "ntm:robot:grok-acp-receipt:v1",
+      "schema_type": "grok_acp_receipt",
+      "schema_source": "built_in"
+    },
+    {
       "name": "health",
       "flag": "--robot-health",
       "category": "state",
@@ -379,6 +392,32 @@
       "default_output_format": "json",
       "schema_id": "ntm:robot:productivity:v1",
       "schema_type": "productivity",
+      "schema_source": "built_in"
+    },
+    {
+      "name": "provider-capabilities",
+      "flag": "--robot-provider-capabilities",
+      "category": "state",
+      "summary": "Report the local provider transport matrix, compiled Grok automation-policy digest, offline conformance-harness availability, and redacted configured-profile qualification states.",
+      "output_formats": [
+        "json"
+      ],
+      "default_output_format": "json",
+      "schema_id": "ntm:robot:provider-capabilities:v1",
+      "schema_type": "provider_capabilities",
+      "schema_source": "built_in"
+    },
+    {
+      "name": "provider-conformance",
+      "flag": "--robot-provider-conformance",
+      "category": "state",
+      "summary": "Run the credential-free synthetic provider lifecycle/error-taxonomy harness for one exact profile and declared transport.",
+      "output_formats": [
+        "json"
+      ],
+      "default_output_format": "json",
+      "schema_id": "ntm:robot:provider-conformance:v1",
+      "schema_type": "provider_conformance",
       "schema_source": "built_in"
     },
     {
@@ -649,6 +688,19 @@
       "default_output_format": "json",
       "schema_id": "ntm:robot:exit-cli:v1",
       "schema_type": "exit_cli",
+      "schema_source": "built_in"
+    },
+    {
+      "name": "grok-acp-run",
+      "flag": "--robot-grok-acp-run",
+      "category": "control",
+      "summary": "Run one Grok ACP operation with the compiled least-privilege policy and emit a nonce-bound, redacted structured receipt.",
+      "output_formats": [
+        "json"
+      ],
+      "default_output_format": "json",
+      "schema_id": "ntm:robot:grok-acp-run:v1",
+      "schema_type": "grok_acp_run",
       "schema_source": "built_in"
     },
     {

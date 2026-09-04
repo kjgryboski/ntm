@@ -130,6 +130,29 @@ type Check struct {
 	FailureReason provider.ProtocolFailureReason `json:"failure_reason,omitempty"`
 }
 
+// EvidenceState interprets only the signed assertion and explicit producer
+// markers. It does not change admission: that still requires every positive
+// authoritative assertion in the operation's subset and a trusted signature.
+func (c Check) EvidenceState() string {
+	if AuthoritativePassedCheck(c) {
+		return "passed"
+	}
+	if c.Passed || !authoritativeProvenance(c.Provenance) || !isSHA256(c.EvidenceSHA256) {
+		return "untested"
+	}
+	if strings.HasPrefix(c.Detail, "unsupported:") {
+		return "unsupported"
+	}
+	if strings.HasPrefix(c.Detail, "untested:") {
+		return "untested"
+	}
+	switch c.Detail {
+	case "not exercised by xai-acp-observe-only producer", "not exercised by xai-acp-workspace-write producer", "not exercised by xai-headless-lineage producer":
+		return "untested"
+	}
+	return "failed"
+}
+
 // Receipt is a self-digested local qualification record. ReceiptSHA256 is
 // calculated over the JSON representation with that field empty. Store is
 // create-only. Attestation, when present, provides public tamper evidence;
@@ -426,16 +449,18 @@ func DefaultCodexIdentityPreflightStoreDir() string {
 // authorize work even if copied into the qualification store. Free-form text
 // is excluded; only fixed check names, closed reasons, and digests survive.
 type DiagnosticObservation struct {
-	SchemaVersion  string            `json:"schema_version"`
-	Trust          string            `json:"trust"`
-	Transport      string            `json:"transport"`
-	IdentitySHA256 string            `json:"identity_sha256"`
-	PolicySHA256   string            `json:"policy_sha256"`
-	RuntimeSHA256  string            `json:"runtime_sha256,omitempty"`
-	ReceiptSHA256  string            `json:"observed_receipt_sha256"`
-	StartedAt      time.Time         `json:"started_at"`
-	CompletedAt    time.Time         `json:"completed_at"`
-	Observations   []DiagnosticCheck `json:"observations"`
+	Phase          string                        `json:"phase,omitempty"`
+	Protocol       *provider.ProtocolObservation `json:"protocol,omitempty"`
+	SchemaVersion  string                        `json:"schema_version"`
+	Trust          string                        `json:"trust"`
+	Transport      string                        `json:"transport"`
+	IdentitySHA256 string                        `json:"identity_sha256"`
+	PolicySHA256   string                        `json:"policy_sha256"`
+	RuntimeSHA256  string                        `json:"runtime_sha256,omitempty"`
+	ReceiptSHA256  string                        `json:"observed_receipt_sha256"`
+	StartedAt      time.Time                     `json:"started_at"`
+	CompletedAt    time.Time                     `json:"completed_at"`
+	Observations   []DiagnosticCheck             `json:"observations"`
 }
 
 type DiagnosticCheck struct {
@@ -487,11 +512,35 @@ func StoreDiagnostics(baseDir string, receipt Receipt) (string, error) {
 			EvidenceSHA256: check.EvidenceSHA256, FailureReason: check.FailureReason,
 		})
 	}
-	dir := filepath.Join(baseDir, receipt.IdentitySHA256)
+	return storeDiagnosticRecord(baseDir, record)
+}
+
+// StoreProtocolDiagnostics accepts an incomplete run, independently of receipt
+// finalization. It is never a signed qualification and cannot grant admission.
+func StoreProtocolDiagnostics(baseDir, identity, policy, runtime string, started, observed time.Time, phase string, observation provider.ProtocolObservation) (string, error) {
+	if !isSHA256(identity) || !isSHA256(policy) || !isSHA256(runtime) || started.IsZero() || observed.Before(started) {
+		return "", errors.New("invalid diagnostic identity or timestamps")
+	}
+	if phase != "before_dispatch" && phase != "before_cleanup" {
+		return "", errors.New("invalid diagnostic phase")
+	}
+	safe := observation.Redacted()
+	return storeDiagnosticRecord(baseDir, DiagnosticObservation{
+		SchemaVersion: "ntm.provider-diagnostic.v1", Trust: "unsigned_diagnostic_only", Transport: "xai_acp",
+		IdentitySHA256: identity, PolicySHA256: policy, RuntimeSHA256: runtime,
+		StartedAt: started, CompletedAt: observed, Phase: phase, Protocol: &safe,
+	})
+}
+
+func storeDiagnosticRecord(baseDir string, record DiagnosticObservation) (string, error) {
+	if strings.TrimSpace(baseDir) == "" {
+		baseDir = filepath.Join(filepath.Dir(DefaultStoreDir()), "provider-diagnostics")
+	}
+	dir := filepath.Join(baseDir, record.IdentitySHA256)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("create diagnostic store: %w", err)
 	}
-	f, err := os.CreateTemp(dir, receipt.CompletedAt.UTC().Format("20060102T150405.000000000Z")+"-*.json")
+	f, err := os.CreateTemp(dir, record.CompletedAt.UTC().Format("20060102T150405.000000000Z")+"-*.json")
 	if err != nil {
 		return "", fmt.Errorf("create diagnostic observation: %w", err)
 	}

@@ -66,7 +66,7 @@ func TestProviderBaselineSurfaceDoesNotGrandfatherPrimaryProviders(t *testing.T)
 			t.Fatalf("missing common baseline for %s", name)
 		}
 	}
-	if strings.Contains(out.String(), "\tproven") {
+	if strings.Contains(out.String(), "\tpassed") {
 		t.Fatal("unbound provider granted evidence")
 	}
 }
@@ -84,12 +84,12 @@ func TestProviderBaselineSeparatesCapabilitySupportFromLiveEvidence(t *testing.T
 	for _, check := range lane.Checks {
 		states[check.Operation] = check.State
 	}
-	if states["workspace_edit"] != "proven" || states["assignment"] != "untested" || states["resume"] != "untested" {
+	if states["workspace_edit"] != "passed" || states["assignment"] != "untested" || states["resume"] != "untested" {
 		t.Fatalf("overstated evidence: %v", states)
 	}
 	report.Qualification.TrustedCurrent = false
 	for _, check := range providerBaselineForReport(report).Checks {
-		if check.State == "proven" {
+		if check.State == "passed" {
 			t.Fatal("unsigned evidence promoted")
 		}
 	}

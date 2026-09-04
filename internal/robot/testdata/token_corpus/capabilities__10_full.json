@@ -473,6 +473,38 @@
       ]
     },
     {
+      "name": "grok-acp-receipt",
+      "flag": "--robot-grok-acp-receipt",
+      "category": "state",
+      "summary": "Read one durable nonce-bound Grok ACP outcome by operation ID without contacting the provider or redispatching work.",
+      "description": "Read one durable nonce-bound Grok ACP outcome by operation ID without contacting the provider or redispatching work.",
+      "output_formats": [
+        "json"
+      ],
+      "default_output_format": "json",
+      "schema_id": "ntm:robot:grok-acp-receipt:v1",
+      "schema_type": "grok_acp_receipt",
+      "schema_source": "built_in",
+      "parameters": [
+        {
+          "name": "operation-id",
+          "flag": "--robot-grok-acp-receipt",
+          "type": "string",
+          "required": true,
+          "description": "Operation ID returned by --robot-grok-acp-run"
+        }
+      ],
+      "examples": [
+        "ntm --robot-grok-acp-receipt=grok-acp-0123456789abcdef0123456789abcdef"
+      ],
+      "transports": [
+        {
+          "type": "cli",
+          "endpoint": "ntm --robot-grok-acp-receipt"
+        }
+      ]
+    },
+    {
       "name": "health",
       "flag": "--robot-health",
       "category": "state",
@@ -1381,6 +1413,68 @@
         {
           "type": "cli",
           "endpoint": "ntm --robot-productivity"
+        }
+      ]
+    },
+    {
+      "name": "provider-capabilities",
+      "flag": "--robot-provider-capabilities",
+      "category": "state",
+      "summary": "Report the local provider transport matrix, compiled Grok automation-policy digest, offline conformance-harness availability, and redacted configured-profile qualification states.",
+      "description": "Report the local provider transport matrix, compiled Grok automation-policy digest, offline conformance-harness availability, and redacted configured-profile qualification states. Performs no provider or network calls.",
+      "output_formats": [
+        "json"
+      ],
+      "default_output_format": "json",
+      "schema_id": "ntm:robot:provider-capabilities:v1",
+      "schema_type": "provider_capabilities",
+      "schema_source": "built_in",
+      "examples": [
+        "ntm --robot-provider-capabilities"
+      ],
+      "transports": [
+        {
+          "type": "cli",
+          "endpoint": "ntm --robot-provider-capabilities"
+        }
+      ]
+    },
+    {
+      "name": "provider-conformance",
+      "flag": "--robot-provider-conformance",
+      "category": "state",
+      "summary": "Run the credential-free synthetic provider lifecycle/error-taxonomy harness for one exact profile and declared transport.",
+      "description": "Run the credential-free synthetic provider lifecycle/error-taxonomy harness for one exact profile and declared transport. This validates NTM's contract only; it does not qualify a live account or model.",
+      "output_formats": [
+        "json"
+      ],
+      "default_output_format": "json",
+      "schema_id": "ntm:robot:provider-conformance:v1",
+      "schema_type": "provider_conformance",
+      "schema_source": "built_in",
+      "parameters": [
+        {
+          "name": "provider-profile",
+          "flag": "--provider-profile",
+          "type": "string",
+          "required": true,
+          "description": "Exact configured provider profile"
+        },
+        {
+          "name": "provider-transport",
+          "flag": "--provider-transport",
+          "type": "string",
+          "required": true,
+          "description": "xai_acp, xai_grok_tui, zai_codex_runtime, zai_claude_runtime, or zai_native_api"
+        }
+      ],
+      "examples": [
+        "ntm --robot-provider-conformance --provider-profile=xai-primary --provider-transport=xai_acp"
+      ],
+      "transports": [
+        {
+          "type": "cli",
+          "endpoint": "ntm --robot-provider-conformance"
         }
       ]
     },
@@ -2610,6 +2704,95 @@
       ]
     },
     {
+      "name": "grok-acp-run",
+      "flag": "--robot-grok-acp-run",
+      "category": "control",
+      "summary": "Run one Grok ACP operation with the compiled least-privilege policy and emit a nonce-bound, redacted structured receipt.",
+      "description": "Run one Grok ACP operation with the compiled least-privilege policy and emit a nonce-bound, redacted structured receipt. This bypasses tmux and always disables auto-update.",
+      "output_formats": [
+        "json"
+      ],
+      "default_output_format": "json",
+      "schema_id": "ntm:robot:grok-acp-run:v1",
+      "schema_type": "grok_acp_run",
+      "schema_source": "built_in",
+      "parameters": [
+        {
+          "name": "msg",
+          "flag": "--msg",
+          "type": "string",
+          "required": true,
+          "description": "Prompt content (or use --msg-file)"
+        },
+        {
+          "name": "msg-file",
+          "flag": "--msg-file",
+          "type": "string",
+          "required": false,
+          "description": "Read prompt content from a file, or stdin with '-'"
+        },
+        {
+          "name": "provider-profile",
+          "flag": "--provider-profile",
+          "type": "string",
+          "required": true,
+          "description": "Exact xAI/Grok [provider_profiles] target; broad runtime targets are rejected"
+        },
+        {
+          "name": "provider-model",
+          "flag": "--provider-model",
+          "type": "string",
+          "required": false,
+          "description": "Optional exact model assertion; it cannot override the selected profile and the receipt reports a model only when provider metadata confirms it"
+        },
+        {
+          "name": "nonce",
+          "flag": "--nonce",
+          "type": "string",
+          "required": false,
+          "description": "Acknowledgement nonce; generated cryptographically when omitted and never emitted in plaintext"
+        },
+        {
+          "name": "op-id",
+          "flag": "--op-id",
+          "type": "string",
+          "required": false,
+          "description": "Caller operation identifier bound into the receipt"
+        },
+        {
+          "name": "cwd",
+          "flag": "--cwd",
+          "type": "string",
+          "required": false,
+          "description": "Existing working directory for the ACP session"
+        },
+        {
+          "name": "timeout",
+          "flag": "--timeout",
+          "type": "duration",
+          "required": false,
+          "default": "5m",
+          "description": "Maximum operation duration"
+        },
+        {
+          "name": "grok-binary",
+          "flag": "--grok-binary",
+          "type": "string",
+          "required": false,
+          "description": "Optional exact executable assertion; it cannot override the profile-bound Grok executable"
+        }
+      ],
+      "examples": [
+        "ntm --robot-grok-acp-run --provider-profile=xai-grok-primary --msg-file=prompt.txt --op-id=review-42 --timeout=5m"
+      ],
+      "transports": [
+        {
+          "type": "cli",
+          "endpoint": "ntm --robot-grok-acp-run"
+        }
+      ]
+    },
+    {
       "name": "interrupt",
       "flag": "--robot-interrupt",
       "category": "control",
@@ -3593,6 +3776,20 @@
           "description": "Grok Build agents: count[:model[:effort]]"
         },
         {
+          "name": "spawn-zai",
+          "flag": "--spawn-zai",
+          "type": "string",
+          "required": false,
+          "description": "Z.ai agents: count only; requires one exact provider profile"
+        },
+        {
+          "name": "provider-profile",
+          "flag": "--provider-profile",
+          "type": "string",
+          "required": false,
+          "description": "Exact probe-qualified [provider_profiles] target required by --spawn-zai"
+        },
+        {
           "name": "spawn-preset",
           "flag": "--spawn-preset",
           "type": "string",
@@ -3662,6 +3859,7 @@
         "ntm --robot-spawn=myproject --spawn-cc=2 --spawn-cod=1 --spawn-wait --timeout=30s",
         "ntm --robot-spawn=myproject --spawn-cod=8:gpt-5.3-codex:high",
         "ntm --robot-spawn=myproject --spawn-grok=1",
+        "ntm --robot-spawn=myproject --spawn-zai=1 --provider-profile=zai-reviewed-profile",
         "ntm --robot-spawn=myproject --spawn-preset=standard",
         "ntm --robot-spawn=myproject --spawn-label=frontend --spawn-cc=3",
         "ntm --robot-spawn=myproject --spawn-assign-work --strategy=dependency-aware"
@@ -7389,6 +7587,40 @@
       ]
     },
     {
+      "name": "grok-acp-receipt",
+      "flag": "--robot-grok-acp-receipt",
+      "category": "state",
+      "summary": "Read one durable nonce-bound Grok ACP outcome by operation ID without contacting the provider or redispatching work.",
+      "description": "Read one durable nonce-bound Grok ACP outcome by operation ID without contacting the provider or redispatching work.",
+      "output_formats": [
+        "json"
+      ],
+      "default_output_format": "json",
+      "schema_id": "ntm:robot:grok-acp-receipt:v1",
+      "schema_type": "grok_acp_receipt",
+      "schema_source": "built_in",
+      "paginated": false,
+      "paginated_reason": "bounded: one durable ACP operation receipt; tool events are digests and residual PIDs cover one local process tree",
+      "parameters": [
+        {
+          "name": "operation-id",
+          "flag": "--robot-grok-acp-receipt",
+          "type": "string",
+          "required": true,
+          "description": "Operation ID returned by --robot-grok-acp-run"
+        }
+      ],
+      "examples": [
+        "ntm --robot-grok-acp-receipt=grok-acp-0123456789abcdef0123456789abcdef"
+      ],
+      "transports": [
+        {
+          "type": "cli",
+          "endpoint": "ntm --robot-grok-acp-receipt"
+        }
+      ]
+    },
+    {
       "name": "health",
       "flag": "--robot-health",
       "category": "state",
@@ -8419,6 +8651,72 @@
         {
           "type": "cli",
           "endpoint": "ntm --robot-productivity"
+        }
+      ]
+    },
+    {
+      "name": "provider-capabilities",
+      "flag": "--robot-provider-capabilities",
+      "category": "state",
+      "summary": "Report the local provider transport matrix, compiled Grok automation-policy digest, offline conformance-harness availability, and redacted configured-profile qualification states.",
+      "description": "Report the local provider transport matrix, compiled Grok automation-policy digest, offline conformance-harness availability, and redacted configured-profile qualification states. Performs no provider or network calls.",
+      "output_formats": [
+        "json"
+      ],
+      "default_output_format": "json",
+      "schema_id": "ntm:robot:provider-capabilities:v1",
+      "schema_type": "provider_capabilities",
+      "schema_source": "built_in",
+      "paginated": false,
+      "paginated_reason": "bounded: fixed transport matrix plus configured provider profiles",
+      "examples": [
+        "ntm --robot-provider-capabilities"
+      ],
+      "transports": [
+        {
+          "type": "cli",
+          "endpoint": "ntm --robot-provider-capabilities"
+        }
+      ]
+    },
+    {
+      "name": "provider-conformance",
+      "flag": "--robot-provider-conformance",
+      "category": "state",
+      "summary": "Run the credential-free synthetic provider lifecycle/error-taxonomy harness for one exact profile and declared transport.",
+      "description": "Run the credential-free synthetic provider lifecycle/error-taxonomy harness for one exact profile and declared transport. This validates NTM's contract only; it does not qualify a live account or model.",
+      "output_formats": [
+        "json"
+      ],
+      "default_output_format": "json",
+      "schema_id": "ntm:robot:provider-conformance:v1",
+      "schema_type": "provider_conformance",
+      "schema_source": "built_in",
+      "paginated": false,
+      "paginated_reason": "bounded: exactly seven lifecycle checks and a fixed discrepancy set",
+      "parameters": [
+        {
+          "name": "provider-profile",
+          "flag": "--provider-profile",
+          "type": "string",
+          "required": true,
+          "description": "Exact configured provider profile"
+        },
+        {
+          "name": "provider-transport",
+          "flag": "--provider-transport",
+          "type": "string",
+          "required": true,
+          "description": "xai_acp, xai_grok_tui, zai_codex_runtime, zai_claude_runtime, or zai_native_api"
+        }
+      ],
+      "examples": [
+        "ntm --robot-provider-conformance --provider-profile=xai-primary --provider-transport=xai_acp"
+      ],
+      "transports": [
+        {
+          "type": "cli",
+          "endpoint": "ntm --robot-provider-conformance"
         }
       ]
     },
@@ -9843,6 +10141,97 @@
       ]
     },
     {
+      "name": "grok-acp-run",
+      "flag": "--robot-grok-acp-run",
+      "category": "control",
+      "summary": "Run one Grok ACP operation with the compiled least-privilege policy and emit a nonce-bound, redacted structured receipt.",
+      "description": "Run one Grok ACP operation with the compiled least-privilege policy and emit a nonce-bound, redacted structured receipt. This bypasses tmux and always disables auto-update.",
+      "output_formats": [
+        "json"
+      ],
+      "default_output_format": "json",
+      "schema_id": "ntm:robot:grok-acp-run:v1",
+      "schema_type": "grok_acp_run",
+      "schema_source": "built_in",
+      "paginated": false,
+      "paginated_reason": "bounded: one ACP operation result; tool events are digests and residual PIDs cover one local process tree",
+      "parameters": [
+        {
+          "name": "msg",
+          "flag": "--msg",
+          "type": "string",
+          "required": true,
+          "description": "Prompt content (or use --msg-file)"
+        },
+        {
+          "name": "msg-file",
+          "flag": "--msg-file",
+          "type": "string",
+          "required": false,
+          "description": "Read prompt content from a file, or stdin with '-'"
+        },
+        {
+          "name": "provider-profile",
+          "flag": "--provider-profile",
+          "type": "string",
+          "required": true,
+          "description": "Exact xAI/Grok [provider_profiles] target; broad runtime targets are rejected"
+        },
+        {
+          "name": "provider-model",
+          "flag": "--provider-model",
+          "type": "string",
+          "required": false,
+          "description": "Optional exact model assertion; it cannot override the selected profile and the receipt reports a model only when provider metadata confirms it"
+        },
+        {
+          "name": "nonce",
+          "flag": "--nonce",
+          "type": "string",
+          "required": false,
+          "description": "Acknowledgement nonce; generated cryptographically when omitted and never emitted in plaintext"
+        },
+        {
+          "name": "op-id",
+          "flag": "--op-id",
+          "type": "string",
+          "required": false,
+          "description": "Caller operation identifier bound into the receipt"
+        },
+        {
+          "name": "cwd",
+          "flag": "--cwd",
+          "type": "string",
+          "required": false,
+          "description": "Existing working directory for the ACP session"
+        },
+        {
+          "name": "timeout",
+          "flag": "--timeout",
+          "type": "duration",
+          "required": false,
+          "default": "5m",
+          "description": "Maximum operation duration"
+        },
+        {
+          "name": "grok-binary",
+          "flag": "--grok-binary",
+          "type": "string",
+          "required": false,
+          "description": "Optional exact executable assertion; it cannot override the profile-bound Grok executable"
+        }
+      ],
+      "examples": [
+        "ntm --robot-grok-acp-run --provider-profile=xai-grok-primary --msg-file=prompt.txt --op-id=review-42 --timeout=5m"
+      ],
+      "transports": [
+        {
+          "type": "cli",
+          "endpoint": "ntm --robot-grok-acp-run"
+        }
+      ]
+    },
+    {
       "name": "interrupt",
       "flag": "--robot-interrupt",
       "category": "control",
@@ -10852,6 +11241,20 @@
           "description": "Grok Build agents: count[:model[:effort]]"
         },
         {
+          "name": "spawn-zai",
+          "flag": "--spawn-zai",
+          "type": "string",
+          "required": false,
+          "description": "Z.ai agents: count only; requires one exact provider profile"
+        },
+        {
+          "name": "provider-profile",
+          "flag": "--provider-profile",
+          "type": "string",
+          "required": false,
+          "description": "Exact probe-qualified [provider_profiles] target required by --spawn-zai"
+        },
+        {
           "name": "spawn-preset",
           "flag": "--spawn-preset",
           "type": "string",
@@ -10921,6 +11324,7 @@
         "ntm --robot-spawn=myproject --spawn-cc=2 --spawn-cod=1 --spawn-wait --timeout=30s",
         "ntm --robot-spawn=myproject --spawn-cod=8:gpt-5.3-codex:high",
         "ntm --robot-spawn=myproject --spawn-grok=1",
+        "ntm --robot-spawn=myproject --spawn-zai=1 --provider-profile=zai-reviewed-profile",
         "ntm --robot-spawn=myproject --spawn-preset=standard",
         "ntm --robot-spawn=myproject --spawn-label=frontend --spawn-cc=3",
         "ntm --robot-spawn=myproject --spawn-assign-work --strategy=dependency-aware"

@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"github.com/spf13/cobra"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +19,158 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/zai"
 )
+
+func TestAssignmentAndSendShareExactProviderDispatch(t *testing.T) {
+	previous := dispatchProviderAssignment
+	t.Cleanup(func() { dispatchProviderAssignment = previous })
+	for _, surface := range []string{"assign", "send"} {
+		for _, profile := range []string{"grok-workspace-write", "zai-codex-kevin-v21"} {
+			t.Run(surface+"/"+profile, func(t *testing.T) {
+				calls := 0
+				dispatchProviderAssignment = func(_ *cobra.Command, got providerAssignmentRequest) error {
+					calls++
+					if got.Profile != profile || got.OperationID != "same-task" || got.Prompt != "edit and test" || got.CWD != "/isolated" || got.Timeout != time.Minute {
+						t.Fatalf("assignment changed: %+v", got)
+					}
+					return nil
+				}
+				var cmd *cobra.Command
+				args := []string{"--provider-profile", profile, "--operation-id", "same-task", "--timeout", "1m"}
+				if surface == "assign" {
+					cmd = newAssignCmd()
+					args = append(args, "--auto", "--prompt", "edit and test", "--repo", "/isolated")
+				} else {
+					cmd = newSendCmd()
+					args = append(args, "--cwd", "/isolated", "edit and test")
+				}
+				cmd.SetOut(&bytes.Buffer{})
+				cmd.SetErr(&bytes.Buffer{})
+				cmd.SetArgs(args)
+				if err := cmd.Execute(); err != nil || calls != 1 {
+					t.Fatalf("calls=%d err=%v", calls, err)
+				}
+			})
+		}
+	}
+}
+
+func TestProviderControlsRejectMixedTargetsBeforeDispatch(t *testing.T) {
+	previous := dispatchProviderAssignment
+	t.Cleanup(func() { dispatchProviderAssignment = previous })
+	dispatchProviderAssignment = func(*cobra.Command, providerAssignmentRequest) error {
+		t.Fatal("mixed targeting reached provider")
+		return nil
+	}
+	for _, tc := range []struct {
+		cmd  func() *cobra.Command
+		args []string
+	}{
+		{newAssignCmd, []string{"--provider-profile", "exact", "--auto", "--beads", "unrelated"}},
+		{newAssignCmd, []string{"--provider-profile", "exact", "--prompt", "work"}},
+		{newSendCmd, []string{"--provider-profile", "exact", "--cc", "work"}},
+		{newSendCmd, []string{"--provider-profile", "exact", "session", "work"}},
+		{newSendCmd, []string{"--operation-id", "orphan", "session", "work"}},
+	} {
+		cmd := tc.cmd()
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs(tc.args)
+		if err := cmd.Execute(); err == nil {
+			t.Fatalf("accepted ambiguous targeting: %v", tc.args)
+		}
+	}
+}
+
+func TestStatusAndHealthShareProviderReceiptInspection(t *testing.T) {
+	previous := inspectProviderAssignment
+	t.Cleanup(func() { inspectProviderAssignment = previous })
+	for _, makeCommand := range []func() *cobra.Command{newStatusCmd, newHealthCmd} {
+		calls := 0
+		inspectProviderAssignment = func(_ *cobra.Command, profile, operation string) error {
+			calls++
+			if profile != "zai-codex" || operation != "same-task" {
+				t.Fatal("inspection changed provider binding")
+			}
+			return nil
+		}
+		cmd := makeCommand()
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs([]string{"--provider-profile", "zai-codex", "--operation-id", "same-task"})
+		if err := cmd.Execute(); err != nil || calls != 1 {
+			t.Fatalf("inspection calls=%d err=%v", calls, err)
+		}
+	}
+}
+
+func TestProviderSpawnAndResumeUseBoundedAssignmentDispatcher(t *testing.T) {
+	previous := dispatchProviderAssignment
+	t.Cleanup(func() { dispatchProviderAssignment = previous })
+	for _, resume := range []bool{false, true} {
+		calls := 0
+		dispatchProviderAssignment = func(_ *cobra.Command, request providerAssignmentRequest) error {
+			calls++
+			if request.Profile != "zai-codex" || request.OperationID != "new-turn" || request.Prompt != "work" || request.CWD != "/isolated" || request.Timeout != time.Minute {
+				t.Fatalf("request=%+v", request)
+			}
+			if (request.ParentSession != "") != resume || (resume && request.ParentSession != "parent") {
+				t.Fatal("resume lineage lost or invented")
+			}
+			return nil
+		}
+		args := []string{"--provider-profile", "zai-codex", "--prompt", "work", "--cwd", "/isolated", "--timeout", "1m"}
+		var cmd *cobra.Command
+		if resume {
+			cmd = newResumeCmd()
+			args = append(args, "--operation-id", "new-turn", "--parent-session", "parent")
+		} else {
+			cmd = newSpawnCmd()
+			args = append(args, "new-turn")
+		}
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err != nil || calls != 1 {
+			t.Fatalf("resume=%v calls=%d err=%v", resume, calls, err)
+		}
+	}
+}
+
+func TestProviderStatusRequiresSignedExactOperation(t *testing.T) {
+	root := t.TempDir()
+	profile := providerCodexProfile(root)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := &providerNativeLedgerFake{}
+	admission := &providerCodexSubscriptionAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
+	deps := providerCodexTestDeps(profile, admission, ledger)
+	deps.run = func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		return successfulProviderCodexReceipt(spec), nil
+	}
+	cmd := &cobra.Command{}
+	cmd.SetOut(&bytes.Buffer{})
+	if err := runProviderCodex(cmd, providerCodexRunOptions{profile: "zai-codex", prompt: "status fixture", cwd: root, operationID: "status-proof", live: true, timeout: time.Minute}, deps); err != nil {
+		t.Fatal(err)
+	}
+	row := ledger.ops[providerCodexOperationScope+"\x00status-proof"]
+	var receipt providerCodexRunOutput
+	if row == nil || json.Unmarshal([]byte(row.OutcomeJSON), &receipt) != nil {
+		t.Fatal("missing signed fixture")
+	}
+	trusted := receipt.Attestation.KeyMetadata
+	if !validProviderCodexStatusReceipt(receipt, row, "zai-codex", identity, trusted) {
+		t.Fatal("valid exact receipt rejected")
+	}
+	if validProviderCodexStatusReceipt(receipt, row, "other-account", identity, trusted) {
+		t.Fatal("another profile accepted")
+	}
+	receipt.Receipt.ResolvedModel = "forged-model"
+	if validProviderCodexStatusReceipt(receipt, row, "zai-codex", identity, trusted) {
+		t.Fatal("tampered served model accepted")
+	}
+}
 
 func providerRouteTestDeps(t *testing.T, snapshot ratelimit.SubscriptionCapacitySnapshot) providerRouteDependencies {
 	t.Helper()

@@ -15,6 +15,21 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
 
 ### Security
 
+- **Grok failure diagnostics are saved before process cleanup.** Qualification
+  checks storage before dispatch, then persists allowlisted method labels,
+  request-ID shape, session matching, stage/reason, and counters without payloads.
+  Reviewed permission requests can select only `reject_once`; malformed or
+  unbound requests remain denied. Callback failures cannot prevent cleanup.
+- **Workspace evidence is evaluated independently.** Verified broker edit,
+  test, and denial results survive a later protocol failure. The full signed
+  operation subset still gates admission; baseline distinguishes passed,
+  failed, untested, and unsupported outcomes.
+- **Ordinary provider controls use the existing structured adapters.** Exact
+  profile selection on assign, send, and one-shot spawn preserves qualification,
+  identity, replay, and capacity boundaries. Status/health verify durable
+  completion receipts; supported Z.ai resume still requires lifecycle evidence.
+  Cross-command cancellation and automatic crash restart remain unavailable.
+
 - **Z.ai Codex admission now shares CAAM's v2 manifest contract.** NTM
   recomputes the versioned identity/file digest and strictly validates the
   endpoint, account, model, credential id, bridge path/digest, policy, and

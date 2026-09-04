@@ -170,17 +170,18 @@ type providerDoctorRuntime struct {
 }
 
 type providerDoctorQualification struct {
-	State                 string          `json:"state"`
-	Passed                bool            `json:"passed"`
-	TrustedCurrent        bool            `json:"trusted_current"`
-	ModelIdentityVerified bool            `json:"model_identity_verified"`
-	PolicySHA256          string          `json:"policy_sha256,omitempty"`
-	CompletedAt           time.Time       `json:"completed_at,omitempty"`
-	AgeSeconds            int64           `json:"age_seconds,omitempty"`
-	ReceiptSHA256         string          `json:"receipt_sha256,omitempty"`
-	ChecksPassed          int             `json:"checks_passed"`
-	ChecksTotal           int             `json:"checks_total"`
-	CheckStates           map[string]bool `json:"check_states,omitempty"`
+	State                 string            `json:"state"`
+	Passed                bool              `json:"passed"`
+	TrustedCurrent        bool              `json:"trusted_current"`
+	ModelIdentityVerified bool              `json:"model_identity_verified"`
+	PolicySHA256          string            `json:"policy_sha256,omitempty"`
+	CompletedAt           time.Time         `json:"completed_at,omitempty"`
+	AgeSeconds            int64             `json:"age_seconds,omitempty"`
+	ReceiptSHA256         string            `json:"receipt_sha256,omitempty"`
+	ChecksPassed          int               `json:"checks_passed"`
+	ChecksTotal           int               `json:"checks_total"`
+	CheckStates           map[string]bool   `json:"check_states,omitempty"`
+	CheckOutcomes         map[string]string `json:"check_outcomes,omitempty"`
 }
 
 type providerDoctorOperationScope struct {
@@ -892,7 +893,7 @@ func newProviderBaselineCmd() *cobra.Command {
 					Schema string                 `json:"schema_version"`
 					Note   string                 `json:"note"`
 					Lanes  []providerBaselineLane `json:"lanes"`
-				}{"ntm.provider-baseline.v1", "Offline inventory only. Unproven means a signed check is negative or lacks evidence; it does not assert whether the scenario was attempted. Untested means no trusted current evidence is available. No readiness is granted.", lanes})
+				}{"ntm.provider-baseline.v1", "Offline inventory only. Passed and failed describe signed assertions; explicit unexercised scenarios or missing current evidence are untested. Unsupported describes the adapter contract. No readiness is granted.", lanes})
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), "PROVIDER\tPROFILE\tOPERATION\tEVIDENCE_STATE")
 			for _, lane := range lanes {
@@ -945,13 +946,26 @@ func providerBaselineForReport(report providerDoctorReport) providerBaselineLane
 				}
 			}
 			if present {
-				check.State = "unproven"
+				check.State = "passed"
 				check.EvidenceSHA256 = report.Qualification.ReceiptSHA256
-				if qualificationChecksPassed(report.Qualification, scenario.checks...) {
-					check.State = "proven"
+				for _, name := range scenario.checks {
+					state := report.Qualification.CheckOutcomes[name]
+					if state == "" {
+						state = "untested"
+						if report.Qualification.CheckStates[name] {
+							state = "passed"
+						}
+					}
+					if state == "failed" {
+						check.State = "failed"
+						break
+					}
+					if state != "passed" {
+						check.State = state
+					}
 				}
-				if scenario.name == "model_identity" && !report.Qualification.ModelIdentityVerified {
-					check.State = "unproven"
+				if scenario.name == "model_identity" && !report.Qualification.ModelIdentityVerified && check.State == "passed" {
+					check.State = "failed"
 				}
 			}
 		}
@@ -1508,8 +1522,10 @@ func diagnoseQualification(identity provider.Identity, transport, policySHA stri
 	markTrustedCurrent := func() {
 		result.TrustedCurrent = true
 		result.CheckStates = make(map[string]bool, len(receipt.Checks))
+		result.CheckOutcomes = make(map[string]string, len(receipt.Checks))
 		for _, check := range receipt.Checks {
 			result.CheckStates[check.Name] = providerqualification.AuthoritativePassedCheck(check)
+			result.CheckOutcomes[check.Name] = check.EvidenceState()
 		}
 		result.ModelIdentityVerified = qualificationReceiptModelIdentityVerified(receipt, transport)
 	}

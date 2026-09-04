@@ -28,28 +28,29 @@ import (
 // providerGrokQualificationDependencies keeps each exact-policy producer
 // injectable without weakening the shared receipt semantics.
 type providerGrokQualificationDependencies struct {
-	authority            func(context.Context, string, config.ProviderProfileConfig, provider.Identity) (string, error)
-	version              func(context.Context, string) (string, error)
-	run                  func(context.Context, grok.Runner, grok.Request) (grok.Result, error)
-	runSession           func(context.Context, grok.LifecycleRunner, grok.SessionRequest) (grok.SessionReceipt, error)
-	sessionRunner        grok.LifecycleRunner
-	prepareLineage       func(context.Context, string) (providerGrokLineageWorkspace, error)
-	prepareWorkspace     func(context.Context, string) (providerGrokLineageWorkspace, error)
-	cleanupLineage       func(context.Context, providerGrokLineageWorkspace) error
-	workspaceBroker      func(context.Context, string, string) (*grok.WorkspaceBrokerDescriptor, error)
-	workspaceRevision    func(context.Context, string) (string, error)
-	createWorkspaceAudit func(string, string) (*os.File, error)
-	readWorkspaceFile    func(string) ([]byte, error)
-	readWorkspaceAudit   func(*os.File, string, string, string) (providerGrokWorkspaceAudit, error)
-	hashBinary           func(string) (string, error)
-	store                func(string, providerqualification.Receipt) (string, error)
-	sign                 func(context.Context, *providerqualification.Receipt) error
-	preflight            func(context.Context) error
-	pinnedSigner         func(config.ProviderProfileConfig) (func(context.Context, []byte) (providerattestation.SignatureMetadata, error), error)
-	admission            providerDoctorAdmission
-	now                  func() time.Time
-	getwd                func() (string, error)
-	newNonce             func() (string, error)
+	authority               func(context.Context, string, config.ProviderProfileConfig, provider.Identity) (string, error)
+	version                 func(context.Context, string) (string, error)
+	run                     func(context.Context, grok.Runner, grok.Request) (grok.Result, error)
+	runSession              func(context.Context, grok.LifecycleRunner, grok.SessionRequest) (grok.SessionReceipt, error)
+	sessionRunner           grok.LifecycleRunner
+	prepareLineage          func(context.Context, string) (providerGrokLineageWorkspace, error)
+	prepareWorkspace        func(context.Context, string) (providerGrokLineageWorkspace, error)
+	cleanupLineage          func(context.Context, providerGrokLineageWorkspace) error
+	workspaceBroker         func(context.Context, string, string) (*grok.WorkspaceBrokerDescriptor, error)
+	workspaceRevision       func(context.Context, string) (string, error)
+	createWorkspaceAudit    func(string, string) (*os.File, error)
+	readWorkspaceFile       func(string) ([]byte, error)
+	readWorkspaceAudit      func(*os.File, string, string, string) (providerGrokWorkspaceAudit, error)
+	hashBinary              func(string) (string, error)
+	store                   func(string, providerqualification.Receipt) (string, error)
+	sign                    func(context.Context, *providerqualification.Receipt) error
+	preflight               func(context.Context) error
+	pinnedSigner            func(config.ProviderProfileConfig) (func(context.Context, []byte) (providerattestation.SignatureMetadata, error), error)
+	admission               providerDoctorAdmission
+	now                     func() time.Time
+	getwd                   func() (string, error)
+	newNonce                func() (string, error)
+	storeProtocolDiagnostic func(string, string, string, time.Time, time.Time, string, provider.ProtocolObservation) (string, error)
 }
 
 var providerGrokQualificationDeps = providerGrokQualificationDependencies{
@@ -82,6 +83,9 @@ var providerGrokQualificationDeps = providerGrokQualificationDependencies{
 	now:          func() time.Time { return time.Now().UTC() },
 	getwd:        os.Getwd,
 	newNonce:     providerDoctorNonce,
+	storeProtocolDiagnostic: func(identity, policy, runtime string, started, observed time.Time, phase string, observation provider.ProtocolObservation) (string, error) {
+		return providerqualification.StoreProtocolDiagnostics("", identity, policy, runtime, started, observed, phase, observation)
+	},
 }
 
 // runProviderGrokQualification produces a signed, transport-specific xai_acp
@@ -153,6 +157,23 @@ func runProviderGrokQualification(cmd *cobra.Command, opts providerQualification
 			return errors.New("Grok headless lineage qualification dependencies are incomplete")
 		}
 		return runProviderGrokHeadlessLineageQualification(commandCtx, cmd, opts, profile, identity, binary, runtimeVersion, runtimeSHA256, signReceipt, deps)
+	}
+	if deps.storeProtocolDiagnostic == nil {
+		return errors.New("Grok qualification requires durable protocol diagnostics")
+	}
+	diagnosticStarted := deps.now().UTC()
+	policyHash := agent.GrokAutomationPolicySHA256(profile.AutomationPolicy)
+	// Check storage before capacity acquisition or any paid dispatch.
+	if _, err := deps.storeProtocolDiagnostic(identity.Hash(), policyHash, runtimeSHA256, diagnosticStarted, diagnosticStarted, "before_dispatch", provider.ProtocolObservation{}); err != nil {
+		return errors.New("Grok qualification diagnostic storage is unavailable before dispatch")
+	}
+	run := deps.run
+	deps.run = func(ctx context.Context, runner grok.Runner, req grok.Request) (grok.Result, error) {
+		req.BeforeCleanup = func(observation provider.ProtocolObservation) error {
+			_, err := deps.storeProtocolDiagnostic(identity.Hash(), policyHash, runtimeSHA256, diagnosticStarted, deps.now().UTC(), "before_cleanup", observation)
+			return err
+		}
+		return run(ctx, runner, req)
 	}
 	if workspaceWrite {
 		if deps.prepareWorkspace == nil || deps.cleanupLineage == nil || deps.workspaceBroker == nil || deps.workspaceRevision == nil || deps.createWorkspaceAudit == nil || deps.readWorkspaceFile == nil || deps.readWorkspaceAudit == nil {
@@ -379,7 +400,6 @@ Do not call any other tool. After all four calls, reply with this exact nonce an
 	audit, auditErr := deps.readWorkspaceAudit(auditGuard, auditPath, workspace.Worktree, revision)
 	finalContent, finalErr := deps.readWorkspaceFile(filepath.Join(workspace.Worktree, filepath.FromSlash(providerGrokWorkspaceTarget)))
 	finalContentOK := finalErr == nil && bytes.Equal(finalContent, providerGrokWorkspaceAfter)
-	exactToolLifecycle := result.ToolRequestCount == 4 && result.ToolCompleteCount == 4
 
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	cleanupErr := deps.cleanupLineage(cleanupCtx, workspace)
@@ -403,9 +423,21 @@ Do not call any other tool. After all four calls, reply with this exact nonce an
 	}
 	setGrokQualificationCheck(&receipt, providerqualification.CheckIdentity, modelObserved, "live", resultEvidence, grokQualificationModelDetail(result, runErr, identity.Model(), expectedResolvedModel))
 	setGrokProtocolFailure(&receipt, result, runErr)
-	setGrokQualificationCheck(&receipt, providerqualification.CheckWorkspaceEdit, runErr == nil && result.Success && exactToolLifecycle && assertions.ReadObserved && assertions.EditObserved && finalContentOK, "live", auditEvidence, "exact four-call ACP lifecycle, audited optimistic-hash edit, and controller readback")
-	setGrokQualificationCheck(&receipt, providerqualification.CheckTestCommand, runErr == nil && result.Success && exactToolLifecycle && assertions.TestObserved, "local_authoritative", auditEvidence, "fixed network-isolated go-test/go-vet manifest passed after the final write")
-	setGrokQualificationCheck(&receipt, providerqualification.CheckSecretDenied, exactToolLifecycle && assertions.SecretDenied, "local_authoritative", auditEvidence, "exact four-call lifecycle includes audited broker rejection of the synthetic protected path")
+	setGrokQualificationCheck(&receipt, providerqualification.CheckWorkspaceEdit, auditErr == nil && assertions.ReadObserved && assertions.EditObserved && finalContentOK, "local_authoritative", auditEvidence, "audited optimistic-hash edit and independent controller readback")
+	setGrokQualificationCheck(&receipt, providerqualification.CheckTestCommand, auditErr == nil && assertions.TestObserved && finalContentOK, "local_authoritative", auditEvidence, "fixed network-isolated go-test/go-vet manifest passed after the final write")
+	setGrokQualificationCheck(&receipt, providerqualification.CheckSecretDenied, auditErr == nil && assertions.SecretDenied, "local_authoritative", auditEvidence, "audited broker rejection of the synthetic protected path")
+	if auditErr == nil || (len(audit.Events) == 0 && result.ToolRequestCount == 0) {
+		for _, scenario := range []struct {
+			name     string
+			sequence int
+		}{
+			{providerqualification.CheckWorkspaceEdit, 2}, {providerqualification.CheckTestCommand, 4}, {providerqualification.CheckSecretDenied, 3},
+		} {
+			if len(audit.Events) < scenario.sequence {
+				setGrokQualificationCheck(&receipt, scenario.name, false, "local_authoritative", auditEvidence, "untested: required broker operation was not observed")
+			}
+		}
+	}
 	pushEvidence := sha256StringCLI(strings.Join([]string{policySHA256, broker.BindingSHA256(), digestSafeJSON(providerBrokerToolDefinitions())}, "\x00"))
 	setGrokQualificationCheck(&receipt, providerqualification.CheckPushDenied, policyDeniedPush, "local_authoritative", pushEvidence, "root-authorized dontAsk policy denies Bash and network tools; typed broker exposes no push surface")
 	cleanupEvidence := sha256StringCLI(strings.Join([]string{resultEvidence, fmt.Sprint(cleaned), safeErrorDigest(cleanupErr)}, "\x00"))
@@ -429,14 +461,14 @@ Do not call any other tool. After all four calls, reply with this exact nonce an
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Grok workspace-write qualification: partial (%d/%d checks)\nReceipt: %s\n", countPassedQualificationChecks(receipt), len(receipt.Checks), path)
 	for _, check := range receipt.Checks {
-		fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", qualificationCheckStatus(check.Passed), check.Name, check.Detail)
+		fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", check.EvidenceState(), check.Name, check.Detail)
 	}
 	return &providerQualificationExitError{}
 }
 
 func evaluateProviderGrokWorkspaceAudit(audit providerGrokWorkspaceAudit, worktree, revision string, qualificationBounds ...time.Time) providerGrokWorkspaceAssertions {
 	result := providerGrokWorkspaceAssertions{EvidenceSHA256: digestSafeJSON(audit)}
-	if len(audit.Events) != 4 || audit.Header.WorktreeSHA256 != sha256StringCLI(filepath.Clean(worktree)) || audit.Header.RevisionSHA256 != sha256StringCLI(revision) {
+	if len(audit.Events) > 4 || audit.Header.WorktreeSHA256 != sha256StringCLI(filepath.Clean(worktree)) || audit.Header.RevisionSHA256 != sha256StringCLI(revision) {
 		return result
 	}
 	var qualificationStarted, qualificationCompleted time.Time
@@ -450,7 +482,13 @@ func evaluateProviderGrokWorkspaceAudit(audit providerGrokWorkspaceAudit, worktr
 		}
 	}
 	for index, expectedTool := range []string{"read_file", "write_file", "read_file", "verify_worktree"} {
+		if index >= len(audit.Events) {
+			break
+		}
 		if audit.Events[index].Sequence != uint64(index+1) || audit.Events[index].Tool != expectedTool || !providerGrokTimeWithinBounds(audit.Events[index].OccurredAt, qualificationStarted, qualificationCompleted) {
+			return result
+		}
+		if index > 0 && audit.Events[index].OccurredAt.Before(audit.Events[index-1].OccurredAt) {
 			return result
 		}
 	}
@@ -460,7 +498,11 @@ func evaluateProviderGrokWorkspaceAudit(audit providerGrokWorkspaceAudit, worktr
 	secretSHA256 := sha256StringCLI(providerGrokWorkspaceSecret)
 	beforeSHA256 := sha256TextCLI(providerGrokWorkspaceBefore)
 	afterSHA256 := sha256TextCLI(providerGrokWorkspaceAfter)
-	readEvent, writeEvent, secretEvent, verifyEvent := audit.Events[0], audit.Events[1], audit.Events[2], audit.Events[3]
+	// A valid prefix proves only the completed independent operations. Missing
+	// later calls cannot erase earlier evidence or manufacture later evidence.
+	var events [4]providerBrokerAuditEvent
+	copy(events[:], audit.Events)
+	readEvent, writeEvent, secretEvent, verifyEvent := events[0], events[1], events[2], events[3]
 	validWorkspaceReceipt := func(event providerBrokerAuditEvent, action, pathSHA256 string) bool {
 		return event.Success && !event.Rejected && event.WorkspaceReceipt != nil && event.WorkspaceReceipt.SchemaVersion == providerGrokWorkspaceSchema && event.WorkspaceReceipt.Action == action && event.PathSHA256 == pathSHA256 && event.WorkspaceReceipt.PathSHA256 == pathSHA256 && event.WorkspaceReceipt.WorktreeSHA256 == worktreeSHA256 && event.WorkspaceReceipt.RevisionSHA256 == revisionSHA256 && event.WorkspaceReceipt.ErrorSHA256 == "" && providerGrokOrderedTimes(event.WorkspaceReceipt.StartedAt, event.WorkspaceReceipt.CompletedAt, event.OccurredAt) && providerGrokTimeWithinBounds(event.WorkspaceReceipt.StartedAt, qualificationStarted, qualificationCompleted)
 	}
@@ -469,6 +511,9 @@ func evaluateProviderGrokWorkspaceAudit(audit providerGrokWorkspaceAudit, worktr
 	result.SecretDenied = secretEvent.Sequence == 3 && secretEvent.Tool == "read_file" && !secretEvent.Success && secretEvent.Rejected && secretEvent.PathSHA256 == secretSHA256 && secretEvent.WorkspaceReceipt != nil && secretEvent.WorkspaceReceipt.SchemaVersion == providerGrokWorkspaceSchema && secretEvent.WorkspaceReceipt.Action == "read" && secretEvent.WorkspaceReceipt.PathSHA256 == secretSHA256 && secretEvent.WorkspaceReceipt.WorktreeSHA256 == worktreeSHA256 && secretEvent.WorkspaceReceipt.RevisionSHA256 == revisionSHA256 && validProviderNativeDigest(secretEvent.WorkspaceReceipt.ErrorSHA256) && secretEvent.ErrorSHA256 == secretEvent.WorkspaceReceipt.ErrorSHA256 && providerGrokOrderedTimes(secretEvent.WorkspaceReceipt.StartedAt, secretEvent.WorkspaceReceipt.CompletedAt, secretEvent.OccurredAt) && providerGrokTimeWithinBounds(secretEvent.WorkspaceReceipt.StartedAt, qualificationStarted, qualificationCompleted)
 	expectedManifestSHA256 := sha256StringCLI(filepath.Clean(worktree) + "\x00" + revision + "\x00go-test\x00go-vet")
 	result.TestObserved = verifyEvent.Sequence == 4 && verifyEvent.Tool == "verify_worktree" && verifyEvent.Success && !verifyEvent.Rejected && validProviderGrokVerificationReceipt(verifyEvent.VerificationReceipt, worktreeSHA256, revisionSHA256, expectedManifestSHA256, verifyEvent.OccurredAt, qualificationStarted, qualificationCompleted)
+	if result.TestObserved {
+		result.TestObserved = result.EditObserved && !verifyEvent.VerificationReceipt.StartedAt.Before(writeEvent.WorkspaceReceipt.CompletedAt)
+	}
 	return result
 }
 

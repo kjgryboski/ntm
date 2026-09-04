@@ -321,3 +321,59 @@ func TestLoadLatestMissingIsNotExist(t *testing.T) {
 		t.Fatalf("LoadLatest() error = %v, want fs.ErrNotExist", err)
 	}
 }
+
+func TestProtocolDiagnosticsRedactBeforePersistenceAndCannotQualify(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	const canary = "PRIVATE_PAYLOAD"
+	path, err := StoreProtocolDiagnostics(dir, testHash("identity"), testHash("policy"), testHash("runtime"), now, now, "before_cleanup", provider.ProtocolObservation{
+		Method: canary, RequestIDKind: canary, SessionMatch: canary, Stage: canary, Reason: provider.ProtocolFailureReason(canary), ToolRequests: 3, ToolCompletions: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), canary) {
+		t.Fatal("diagnostic persisted provider text")
+	}
+	var record DiagnosticObservation
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Protocol == nil || record.Protocol.Method != "unknown" || record.Protocol.ToolRequests != 3 || record.Protocol.ToolCompletions != 2 || record.Phase != "before_cleanup" {
+		t.Fatalf("record=%+v", record)
+	}
+	var receipt Receipt
+	if err := json.Unmarshal(data, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Validate() == nil {
+		t.Fatal("unsigned checkpoint granted qualification")
+	}
+	if _, _, err := LoadLatest(dir, testHash("identity")); err == nil {
+		t.Fatal("diagnostic loaded as qualification")
+	}
+	if _, err := StoreProtocolDiagnostics(dir, "../escape", testHash("policy"), testHash("runtime"), now, now, "before_cleanup", provider.ProtocolObservation{}); err == nil {
+		t.Fatal("unbound identity accepted")
+	}
+}
+
+func TestCheckEvidenceStateKeepsUnexercisedSeparateFromFailure(t *testing.T) {
+	for _, tc := range []struct {
+		passed       bool
+		detail, want string
+	}{
+		{true, "observed", "passed"}, {false, "attempted and rejected", "failed"},
+		{false, "not exercised by xai-acp-workspace-write producer", "untested"},
+		{false, "untested: required broker operation was not observed", "untested"},
+		{false, "unsupported: no resume contract", "unsupported"},
+	} {
+		check := Check{Passed: tc.passed, Detail: tc.detail, Provenance: "local_authoritative", EvidenceSHA256: testHash("evidence")}
+		if got := check.EvidenceState(); got != tc.want {
+			t.Fatalf("%+v = %s", tc, got)
+		}
+	}
+}

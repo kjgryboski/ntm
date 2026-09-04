@@ -98,6 +98,7 @@ func init() {
 }
 
 func newHealthCmd() *cobra.Command {
+	var providerProfile, providerOperationID string
 	cmd := &cobra.Command{
 		Use:   "health [session]",
 		Short: "Check health status of agents in a session",
@@ -120,10 +121,26 @@ Examples:
   ntm health myproject --auto-restart-stuck     # Detect and restart stuck agents
   ntm health myproject --auto-restart-stuck --threshold 10m --dry-run`,
 		Args: cobra.MaximumNArgs(1),
-		RunE: runHealth,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if providerProfile != "" {
+				if len(args) != 0 {
+					return errors.New("provider health does not accept a terminal session")
+				}
+				if err := validateProviderControlFlags(cmd, "provider-profile", "operation-id"); err != nil {
+					return err
+				}
+				return inspectProviderAssignment(cmd, providerProfile, providerOperationID)
+			}
+			if providerOperationID != "" {
+				return errors.New("--operation-id requires --provider-profile")
+			}
+			return runHealth(cmd, args)
+		},
 	}
 
 	cmd.Flags().BoolVarP(&healthWatch, "watch", "w", false, "Auto-refresh health display")
+	cmd.Flags().StringVar(&providerProfile, "provider-profile", "", "Inspect structured provider assignment health")
+	cmd.Flags().StringVar(&providerOperationID, "operation-id", "", "Exact structured provider operation ID")
 	cmd.Flags().IntVarP(&healthInterval, "interval", "i", 5, "Refresh interval in seconds (with --watch)")
 	cmd.Flags().BoolVarP(&healthVerbose, "verbose", "v", false, "Show full error details")
 	cmd.Flags().StringVar(&healthPane, "pane", "", "Filter to pane selector: N (single-window), W.P, or %pane-id")

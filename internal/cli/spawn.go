@@ -1613,6 +1613,8 @@ type RecoveryCMRule struct {
 }
 
 func newSpawnCmd() *cobra.Command {
+	var providerProfile, providerCWD string
+	var providerTimeout time.Duration
 	var noUserPane bool
 	var recipeName string
 	var templateName string
@@ -1796,6 +1798,15 @@ Examples:
   ntm spawn myproject --local=2 --local-fallback --local-fallback-provider=cod`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if providerProfile != "" {
+				if err := validateProviderControlFlags(cmd, "provider-profile", "cwd", "timeout", "prompt"); err != nil {
+					return err
+				}
+				return dispatchProviderAssignment(cmd, providerAssignmentRequest{Profile: providerProfile, OperationID: args[0], Prompt: prompt, CWD: providerCWD, Timeout: providerTimeout})
+			}
+			if providerCWD != "" || cmd.Flags().Changed("timeout") {
+				return errors.New("--cwd and --timeout require --provider-profile")
+			}
 			sessionName := args[0]
 
 			// Reject project names containing "--" (reserved separator) (bd-1933u)
@@ -2120,6 +2131,9 @@ Examples:
 	cmd.Flags().IntVar(&contextLimit, "cass-context-limit", 0, "Max past sessions to include")
 	cmd.Flags().IntVar(&contextDays, "cass-context-days", 0, "Look back N days")
 	cmd.Flags().StringVar(&prompt, "prompt", "", "Prompt to initialize agents with")
+	cmd.Flags().StringVar(&providerProfile, "provider-profile", "", "Launch one bounded coding assignment through an exact qualified provider; positional name becomes its durable operation ID")
+	cmd.Flags().StringVar(&providerCWD, "cwd", "", "Linked disposable worktree for a structured provider assignment")
+	cmd.Flags().DurationVar(&providerTimeout, "timeout", 20*time.Minute, "Maximum duration of a structured provider assignment")
 	cmd.Flags().StringVar(&initPrompt, "init-prompt", "", "Prompt to send after agents are ready (used with --assign)")
 	cmd.Flags().BoolVar(&initPromptWithAgentName, "with-agent-name", false, "Prepend a `You are agent <name>` preamble to --init-prompt for each pane so agents know their deterministic identity. See ntm#138.")
 	cmd.Flags().BoolVar(&noHooks, "no-hooks", false, "Disable command hooks")

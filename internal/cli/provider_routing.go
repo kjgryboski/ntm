@@ -6,22 +6,269 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
+	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/zai"
 )
 
 const providerRoutingSchema = "ntm.provider-routing.v1"
+
+type providerAssignmentRequest struct {
+	Profile, OperationID, Prompt, CWD string
+	ParentSession                     string
+	Timeout                           time.Duration
+}
+
+// Existing assignment and send controls share this selection boundary. The
+// selected execution adapter continues to own admission, durable operation
+// identity, completion, and capacity reconciliation. There is no fallback.
+var dispatchProviderAssignment = runProviderAssignment
+
+type providerAssignmentStatus struct {
+	Schema                  string `json:"schema_version"`
+	Profile                 string `json:"profile"`
+	Provider                string `json:"provider"`
+	Runtime                 string `json:"runtime"`
+	AccountSHA256           string `json:"account_sha256"`
+	IdentitySHA256          string `json:"identity_sha256"`
+	BillingClass            string `json:"billing_class"`
+	RequestedModel          string `json:"requested_model"`
+	ServedModel             string `json:"served_model,omitempty"`
+	State                   string `json:"state"`
+	IdentityBindingVerified bool   `json:"identity_binding_verified"`
+	CompletionConfirmed     bool   `json:"completion_confirmed"`
+	LocalCleanupVerified    bool   `json:"local_cleanup_verified"`
+	RemoteTermination       string `json:"remote_generation_termination"`
+}
+
+var inspectProviderAssignment = runProviderAssignmentStatus
+
+func runProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID string) error {
+	if strings.TrimSpace(profileName) == "" || !validProviderNativeOperationID(operationID) {
+		return errors.New("provider status requires an exact profile and operation ID")
+	}
+	loaded := loadSelectedConfigOrDefault()
+	if loaded == nil {
+		return errors.New("provider status requires loaded configuration")
+	}
+	profile, err := loaded.ProviderProfile(profileName)
+	if err != nil {
+		return err
+	}
+	identity, err := profile.Identity()
+	if err != nil {
+		return err
+	}
+	scope := ""
+	switch {
+	case identity.Provider() == "xai" && identity.Runtime() == "grok":
+		scope = "provider:xai-acp"
+	case identity.Provider() == "zai" && identity.Runtime() == "codex":
+		scope = providerCodexOperationScope
+	default:
+		return errors.New("selected provider has no structured assignment status adapter")
+	}
+	ledger, closeLedger, err := openProviderNativeLedger()
+	if err != nil {
+		return err
+	}
+	defer closeLedger()
+	row, err := ledger.GetSendOperation(operationID, scope)
+	if err != nil {
+		return err
+	}
+	if row == nil {
+		return errors.New("provider assignment was not found")
+	}
+	out := providerAssignmentStatus{Schema: "ntm.provider-assignment-status.v1", Profile: profileName, Provider: identity.Provider(), Runtime: identity.Runtime(), AccountSHA256: sha256StringCLI(identity.AccountAlias()), IdentitySHA256: identity.Hash(), BillingClass: identity.BillingClass(), RequestedModel: identity.Model(), State: "outcome_unknown", RemoteTermination: "unverified"}
+	if row.Status == state.SendOperationCompleted {
+		sign, err := providerProfilePinnedSigner(profile)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(providerCommandContext(cmd), 10*time.Second)
+		defer cancel()
+		trusted, err := preflightProviderReceiptSignerMetadataFor(ctx, sign, identity.Provider() == "xai")
+		if err != nil {
+			return err
+		}
+		if identity.Provider() == "xai" {
+			receipt, err := robot.GetGrokACPOperationReceipt(operationID, ledger)
+			if err != nil {
+				return err
+			}
+			if receipt.Attestation == nil || receipt.Attestation.KeyMetadata != trusted.KeyMetadata || receipt.ProviderIdentitySHA256 != identity.Hash() {
+				return errors.New("provider assignment identity or signer differs from selected profile")
+			}
+			out.State, out.ServedModel = receipt.State, receipt.ResolvedModel
+			out.CompletionConfirmed = receipt.CompletionConfirmed && receipt.AcknowledgementVerified
+			out.LocalCleanupVerified = receipt.Cleanup.Reaped && receipt.Cleanup.ResidualPIDs != nil && len(receipt.Cleanup.ResidualPIDs) == 0 && !receipt.Cleanup.ObservedAt.IsZero()
+		} else {
+			var receipt providerCodexRunOutput
+			if json.Unmarshal([]byte(row.OutcomeJSON), &receipt) != nil || !validProviderCodexStatusReceipt(receipt, row, profileName, identity, trusted.KeyMetadata) {
+				return errors.New("provider assignment identity, signature, or operation binding is invalid")
+			}
+			out.State, out.ServedModel = receipt.State, receipt.Receipt.ResolvedModel
+			out.CompletionConfirmed = receipt.Receipt.CompletionConfirmed && receipt.Receipt.NonceVerified
+			out.LocalCleanupVerified = providerCodexReceiptHasNoResiduals(receipt.Receipt)
+		}
+		out.IdentityBindingVerified = true
+	}
+	if IsJSONOutput() {
+		return encodeIndentedJSON(cmd.OutOrStdout(), out)
+	}
+	_, err = fmt.Fprintf(cmd.OutOrStdout(), "Provider: %s; runtime: %s; billing: %s\nRequested model: %s; served model: %s\nState: %s; verified identity: %t; completion: %t; local cleanup: %t\nRemote generation termination: unverified\n", out.Provider, out.Runtime, out.BillingClass, out.RequestedModel, out.ServedModel, out.State, out.IdentityBindingVerified, out.CompletionConfirmed, out.LocalCleanupVerified)
+	return err
+}
+
+func validProviderCodexStatusReceipt(receipt providerCodexRunOutput, row *state.SendOperation, profile string, identity provider.Identity, trusted providerattestation.KeyMetadata) bool {
+	if row == nil || receipt.SchemaVersion != providerCodexRunSchema || receipt.Transport != "zai_codex_runtime" || receipt.IdentitySHA256 != identity.Hash() || receipt.Profile != profile || receipt.BindingSHA256 != row.BindingHash || receipt.OperationIDSHA256 != sha256StringCLI(row.OperationID) || receipt.Attestation == nil || receipt.Attestation.KeyMetadata != trusted {
+		return false
+	}
+	payload, err := canonicalProviderCodexOutput(receipt)
+	return err == nil && providerattestation.ValidateBridgePayload(payload) == nil && providerattestation.Verify(payload, *receipt.Attestation) == nil
+}
+
+func validateProviderControlFlags(cmd *cobra.Command, allowed ...string) error {
+	accept := map[string]bool{"json": true, "config": true, "help": true}
+	for _, name := range allowed {
+		accept[name] = true
+	}
+	var invalid error
+	cmd.Flags().Visit(func(flag *pflag.Flag) {
+		if !accept[flag.Name] && invalid == nil {
+			invalid = fmt.Errorf("--%s cannot be combined with structured provider assignment", flag.Name)
+		}
+	})
+	return invalid
+}
+
+func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest) error {
+	if strings.TrimSpace(request.Profile) == "" || strings.TrimSpace(request.OperationID) == "" || strings.TrimSpace(request.Prompt) == "" || strings.TrimSpace(request.CWD) == "" || request.Timeout <= 0 {
+		return errors.New("provider assignment requires exact profile, operation ID, prompt, worktree, and positive timeout")
+	}
+	loaded := loadSelectedConfigOrDefault()
+	if loaded == nil {
+		return errors.New("provider assignment requires loaded configuration")
+	}
+	profile, err := loaded.ProviderProfile(request.Profile)
+	if err != nil {
+		return err
+	}
+	identity, err := profile.Identity()
+	if err != nil {
+		return err
+	}
+	previousContext := cmd.Context()
+	ctx, stop := signal.NotifyContext(providerCommandContext(cmd), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	cmd.SetContext(ctx)
+	defer cmd.SetContext(previousContext)
+	switch {
+	case identity.Provider() == "zai" && identity.Runtime() == "codex":
+		return runProviderCodex(cmd, providerCodexRunOptions{profile: request.Profile, operationID: request.OperationID, prompt: request.Prompt, cwd: request.CWD, parentSession: request.ParentSession, timeout: request.Timeout, live: true, workspaceWrite: true, workloadClass: providerCodexWorkloadImplementation}, providerCodexRunDeps)
+	case identity.Provider() == "xai" && identity.Runtime() == "grok":
+		if request.ParentSession != "" {
+			return errors.New("Grok ACP workspace resume is unsupported; its one-shot assignment cannot be silently restarted")
+		}
+		resolved, err := resolveGrokACPProviderProfile(loaded, request.Profile, "", "")
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(providerCommandContext(cmd), request.Timeout)
+		defer cancel()
+		opts, authorizer, err := prepareGrokACPDispatch(ctx, request.CWD, resolved, providerOperationWorkspaceWrite)
+		if err != nil {
+			return err
+		}
+		opts.Prompt, opts.OperationID = request.Prompt, request.OperationID
+		output, runErr := robot.ExecuteGrokACPOperationAuthorized(ctx, opts, authorizer)
+		if output == nil {
+			return errors.New("Grok assignment returned no receipt")
+		}
+		if IsJSONOutput() {
+			if err := encodeIndentedJSON(cmd.OutOrStdout(), output); err != nil {
+				return err
+			}
+			if runErr != nil {
+				return errJSONFailure
+			}
+		} else {
+			fmt.Fprintf(cmd.OutOrStdout(), "Provider: %s; runtime: %s; requested model: %s\nOperation: %s; state: %s; completion confirmed: %t\n", identity.Provider(), identity.Runtime(), identity.Model(), output.OperationID, output.State, output.CompletionConfirmed)
+		}
+		return runErr
+	default:
+		return errors.New("selected provider has no qualified structured assignment adapter")
+	}
+}
+
+// prepareGrokACPDispatch is the single managed authority boundary shared by
+// robot ACP and ordinary assignment/send. Execution remains in the robot adapter.
+func prepareGrokACPDispatch(ctx context.Context, cwd string, resolved grokACPProfileResolution, operation string) (robot.GrokACPOperationOptions, robot.GrokACPOperationAuthorizer, error) {
+	var opts robot.GrokACPOperationOptions
+	operation = normalizeProviderOperation(operation)
+	if operation == providerOperationLifecycle || !validProviderOperation(operation) {
+		return opts, nil, errors.New("direct Grok ACP requires observe, review, or workspace-write scope")
+	}
+	if (resolved.AutomationPolicy == agent.GrokWorkspaceWritePolicyName) != (operation == providerOperationWorkspaceWrite) {
+		return opts, nil, errors.New("Grok operation scope does not match the exact compiled automation policy")
+	}
+	absolute, err := filepath.Abs(cwd)
+	if err != nil {
+		return opts, nil, err
+	}
+	info, err := os.Stat(absolute)
+	if err != nil || !info.IsDir() {
+		return opts, nil, errors.New("Grok dispatch requires an existing worktree directory")
+	}
+	binary, err := verifyGrokACPDispatchAuthority(ctx, absolute, resolved.Profile, resolved.Identity, providerDoctorDeps)
+	if err != nil {
+		return opts, nil, err
+	}
+	signPayload, err := providerGrokPinnedSigner(resolved.Profile)
+	if err != nil {
+		return opts, nil, err
+	}
+	preflight, err := preflightProviderGrokReceiptSignerMetadata(ctx, signPayload)
+	if err != nil {
+		return opts, nil, err
+	}
+	var authorizer robot.GrokACPOperationAuthorizer
+	if operation != providerOperationObserve {
+		runtimeHash, err := hashProviderSessionExecutable(binary)
+		if err != nil || !validProviderNativeDigest(runtimeHash) {
+			return opts, nil, errors.New("Grok runtime digest is unavailable")
+		}
+		authorizer = robot.GrokACPOperationAuthorizerFunc(func(_ context.Context, scope robot.GrokACPOperationScope, identity provider.Identity) (robot.GrokACPOperationAuthorization, error) {
+			if identity.Hash() != resolved.Identity.Hash() || string(scope) != operation {
+				return robot.GrokACPOperationAuthorization{}, errors.New("Grok dispatch changed identity or operation scope")
+			}
+			digest, err := authorizeProviderOperation(providerOperationAuthorization{Identity: identity, Transport: "xai_acp", PolicySHA256: agent.GrokAutomationPolicySHA256(resolved.AutomationPolicy), RuntimeVersion: resolved.Profile.RuntimeVersion, RuntimeSHA256: runtimeHash, Operation: operation, MaxQualificationAge: 24 * time.Hour, TrustedSigner: preflight.KeyMetadata})
+			return robot.GrokACPOperationAuthorization{QualificationReceiptSHA256: digest}, err
+		})
+	}
+	broker, err := providerWorkspaceBrokerForPolicy(ctx, absolute, resolved.AutomationPolicy)
+	if err != nil {
+		return opts, nil, err
+	}
+	opts = robot.GrokACPOperationOptions{CWD: absolute, Binary: binary, RuntimeHome: resolved.Profile.RuntimeHome, Model: resolved.Model, RuntimeVersion: resolved.Profile.RuntimeVersion, Identity: resolved.Identity, OperationScope: robot.GrokACPOperationScope(operation), AutomationPolicy: resolved.AutomationPolicy, Broker: broker, ReceiptSigner: signPayload, TrustedSigner: preflight.KeyMetadata}
+	return opts, authorizer, nil
+}
 
 const (
 	providerRouteOutcomeAdmitted            = "admitted"

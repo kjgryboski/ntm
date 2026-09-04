@@ -35,7 +35,11 @@ func grokQualificationDepsForTest(t *testing.T, profile config.ProviderProfileCo
 	var request grok.Request
 	calls := 0
 	now := time.Date(2026, time.September, 3, 12, 0, 0, 0, time.UTC)
+	diagnosticDir := t.TempDir()
 	deps := providerGrokQualificationDependencies{
+		storeProtocolDiagnostic: func(identity, policy, runtime string, started, observed time.Time, phase string, observation provider.ProtocolObservation) (string, error) {
+			return providerqualification.StoreProtocolDiagnostics(diagnosticDir, identity, policy, runtime, started, observed, phase, observation)
+		},
 		authority: func(context.Context, string, config.ProviderProfileConfig, provider.Identity) (string, error) {
 			return "/usr/local/bin/grok", nil
 		},
@@ -46,6 +50,11 @@ func grokQualificationDepsForTest(t *testing.T, profile config.ProviderProfileCo
 		run: func(_ context.Context, _ grok.Runner, got grok.Request) (grok.Result, error) {
 			calls++
 			request = got
+			if got.BeforeCleanup != nil {
+				if err := got.BeforeCleanup(result.ProtocolObservation); err != nil {
+					return result, err
+				}
+			}
 			return result, nil
 		},
 		store: func(_ string, receipt providerqualification.Receipt) (string, error) {
@@ -194,70 +203,94 @@ func TestProviderGrokQualificationProducesHonestObserveOnlyNoGoReceipt(t *testin
 }
 
 func TestProviderGrokWorkspaceQualificationProducesOperationScopedReceipt(t *testing.T) {
-	profile := providerTestGrokProfile(agent.GrokWorkspaceWritePolicyName)
-	identity, err := profile.Identity()
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := grok.Result{
-		Success: true, AcknowledgementVerified: true, Authenticated: true,
-		Model: identity.Model(), ModelEvidence: "completion_metadata",
-		ResolvedModel: grok.ExpectedResolvedModel(profile.RuntimeVersion, identity.Model()), ResolvedModelEvidence: "completion_metadata.usage.model_usage_singleton",
-		ToolRequestCount: 4, ToolCompleteCount: 4,
-		RuntimeEventContract: provider.EventContractReport{Passed: true},
-		Cleanup:              grok.ProcessCleanupReceipt{ObservedAt: time.Now().UTC(), Reaped: true, ResidualPIDs: []int32{}, LocalTermination: "observed_tree_terminated_verified"},
-	}
-	deps, admission, stored, request, calls := grokQualificationDepsForTest(t, profile, result)
-	root := filepath.Join(t.TempDir(), "not-created-qualification-root")
-	workspace := providerGrokLineageWorkspace{Root: root, Primary: filepath.Join(root, "primary"), Worktree: filepath.Join(root, "linked"), RuntimeHome: filepath.Join(root, "grok-home")}
-	revision := strings.Repeat("a", 40)
-	deps.prepareWorkspace = func(context.Context, string) (providerGrokLineageWorkspace, error) { return workspace, nil }
-	deps.cleanupLineage = func(context.Context, providerGrokLineageWorkspace) error { return nil }
-	deps.workspaceRevision = func(context.Context, string) (string, error) { return revision, nil }
-	deps.workspaceBroker = func(_ context.Context, worktree, auditFile string) (*grok.WorkspaceBrokerDescriptor, error) {
-		return grok.NewWorkspaceBrokerDescriptorWithAudit(worktree, revision, []string{"go-test", "go-vet"}, auditFile)
-	}
-	deps.createWorkspaceAudit = func(string, string) (*os.File, error) {
-		return os.CreateTemp(t.TempDir(), "grok-audit-guard-")
-	}
-	deps.readWorkspaceFile = func(string) ([]byte, error) { return append([]byte(nil), providerGrokWorkspaceAfter...), nil }
-	deps.readWorkspaceAudit = func(*os.File, string, string, string) (providerGrokWorkspaceAudit, error) {
-		return providerGrokWorkspaceAuditForTest(workspace.Worktree, revision), nil
-	}
-	cmd := &cobra.Command{}
-	cmd.SetContext(context.Background())
-	var output bytes.Buffer
-	cmd.SetOut(&output)
-	err = runProviderGrokQualification(cmd, providerQualificationOptions{profile: "grok-workspace", live: true, timeout: time.Second, suiteTimeout: time.Second}, profile, identity, deps)
-	var exit *providerQualificationExitError
-	if !errors.As(err, &exit) {
-		t.Fatalf("err=%v, want partial qualification exit", err)
-	}
-	if *calls != 1 || admission.acquires != 1 || admission.releases != 1 || admission.successes != 1 {
-		t.Fatalf("calls=%d admission=%+v", *calls, admission)
-	}
-	if request.Broker == nil || request.Broker.BindingSHA256() == "" || request.CWD != workspace.Worktree || request.ExpectedNonce == "" || !strings.Contains(request.Prompt, providerGrokWorkspaceSecret) || !strings.Contains(request.Prompt, providerGrokWorkspaceTarget) {
-		t.Fatalf("workspace request was incomplete: %+v", *request)
-	}
-	if stored.Passed || stored.Transport != "xai_acp" || stored.PolicySHA256 != agent.GrokAutomationPolicySHA256(agent.GrokWorkspaceWritePolicyName) || stored.Validate() != nil {
-		t.Fatalf("receipt=%+v validate=%v", *stored, stored.Validate())
-	}
-	passed := make(map[string]bool, len(stored.Checks))
-	for _, check := range stored.Checks {
-		passed[check.Name] = check.Passed
-	}
-	for _, name := range []string{providerqualification.CheckIdentity, providerqualification.CheckWorkspaceEdit, providerqualification.CheckTestCommand, providerqualification.CheckSecretDenied, providerqualification.CheckPushDenied, providerqualification.CheckProcessCleanup} {
-		if !passed[name] {
-			t.Fatalf("workspace receipt omitted proven check %q: %+v", name, stored.Checks)
-		}
-	}
-	for _, name := range []string{providerqualification.CheckCrashRecovery, providerqualification.CheckCancellation, providerqualification.CheckResume} {
-		if passed[name] {
-			t.Fatalf("workspace receipt fabricated unexercised check %q", name)
-		}
-	}
-	if strings.Contains(output.String(), providerGrokWorkspaceSecret) || strings.Contains(output.String(), providerGrokWorkspaceTarget) {
-		t.Fatal("workspace qualification output leaked fixture paths")
+	for _, protocolFailure := range []bool{false, true} {
+		t.Run(fmt.Sprint(protocolFailure), func(t *testing.T) {
+			profile := providerTestGrokProfile(agent.GrokWorkspaceWritePolicyName)
+			identity, err := profile.Identity()
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := grok.Result{
+				Success: true, AcknowledgementVerified: true, Authenticated: true,
+				Model: identity.Model(), ModelEvidence: "completion_metadata",
+				ResolvedModel: grok.ExpectedResolvedModel(profile.RuntimeVersion, identity.Model()), ResolvedModelEvidence: "completion_metadata.usage.model_usage_singleton",
+				ToolRequestCount: 4, ToolCompleteCount: 4,
+				RuntimeEventContract: provider.EventContractReport{Passed: true},
+				Cleanup:              grok.ProcessCleanupReceipt{ObservedAt: time.Now().UTC(), Reaped: true, ResidualPIDs: []int32{}, LocalTermination: "observed_tree_terminated_verified"},
+			}
+			deps, admission, stored, request, calls := grokQualificationDepsForTest(t, profile, result)
+			if protocolFailure {
+				run := deps.run
+				deps.run = func(ctx context.Context, runner grok.Runner, req grok.Request) (grok.Result, error) {
+					got, _ := run(ctx, runner, req)
+					got.Success = false
+					got.ProtocolFailureReason = provider.ProtocolUnexpectedRequest
+					got.ToolRequestCount, got.ToolCompleteCount = 0, 0
+					return got, errors.New("protocol failed after independently audited workspace operations")
+				}
+			}
+			root := filepath.Join(t.TempDir(), "not-created-qualification-root")
+			workspace := providerGrokLineageWorkspace{Root: root, Primary: filepath.Join(root, "primary"), Worktree: filepath.Join(root, "linked"), RuntimeHome: filepath.Join(root, "grok-home")}
+			revision := strings.Repeat("a", 40)
+			deps.prepareWorkspace = func(context.Context, string) (providerGrokLineageWorkspace, error) { return workspace, nil }
+			deps.cleanupLineage = func(context.Context, providerGrokLineageWorkspace) error { return nil }
+			deps.workspaceRevision = func(context.Context, string) (string, error) { return revision, nil }
+			deps.workspaceBroker = func(_ context.Context, worktree, auditFile string) (*grok.WorkspaceBrokerDescriptor, error) {
+				return grok.NewWorkspaceBrokerDescriptorWithAudit(worktree, revision, []string{"go-test", "go-vet"}, auditFile)
+			}
+			deps.createWorkspaceAudit = func(string, string) (*os.File, error) {
+				return os.CreateTemp(t.TempDir(), "grok-audit-guard-")
+			}
+			deps.readWorkspaceFile = func(string) ([]byte, error) { return append([]byte(nil), providerGrokWorkspaceAfter...), nil }
+			deps.readWorkspaceAudit = func(*os.File, string, string, string) (providerGrokWorkspaceAudit, error) {
+				return providerGrokWorkspaceAuditForTest(workspace.Worktree, revision), nil
+			}
+			cmd := &cobra.Command{}
+			cmd.SetContext(context.Background())
+			var output bytes.Buffer
+			cmd.SetOut(&output)
+			err = runProviderGrokQualification(cmd, providerQualificationOptions{profile: "grok-workspace", live: true, timeout: time.Second, suiteTimeout: time.Second}, profile, identity, deps)
+			var exit *providerQualificationExitError
+			if !errors.As(err, &exit) {
+				t.Fatalf("err=%v, want partial qualification exit", err)
+			}
+			wantSuccesses := 1
+			if protocolFailure {
+				wantSuccesses = 0
+			}
+			if *calls != 1 || admission.acquires != 1 || admission.releases != 1 || admission.successes != wantSuccesses {
+				t.Fatalf("calls=%d admission=%+v", *calls, admission)
+			}
+			if request.Broker == nil || request.Broker.BindingSHA256() == "" || request.CWD != workspace.Worktree || request.ExpectedNonce == "" || !strings.Contains(request.Prompt, providerGrokWorkspaceSecret) || !strings.Contains(request.Prompt, providerGrokWorkspaceTarget) {
+				t.Fatalf("workspace request was incomplete: %+v", *request)
+			}
+			if stored.Passed || stored.Transport != "xai_acp" || stored.PolicySHA256 != agent.GrokAutomationPolicySHA256(agent.GrokWorkspaceWritePolicyName) || stored.Validate() != nil {
+				t.Fatalf("receipt=%+v validate=%v", *stored, stored.Validate())
+			}
+			passed := make(map[string]bool, len(stored.Checks))
+			for _, check := range stored.Checks {
+				passed[check.Name] = check.Passed
+			}
+			for _, name := range []string{providerqualification.CheckIdentity, providerqualification.CheckWorkspaceEdit, providerqualification.CheckTestCommand, providerqualification.CheckSecretDenied, providerqualification.CheckPushDenied, providerqualification.CheckProcessCleanup} {
+				if name == providerqualification.CheckIdentity && protocolFailure {
+					if passed[name] {
+						t.Fatal("protocol failure promoted identity")
+					}
+					continue
+				}
+				if !passed[name] {
+					t.Fatalf("workspace receipt omitted proven check %q: %+v", name, stored.Checks)
+				}
+			}
+			for _, name := range []string{providerqualification.CheckCrashRecovery, providerqualification.CheckCancellation, providerqualification.CheckResume} {
+				if passed[name] {
+					t.Fatalf("workspace receipt fabricated unexercised check %q", name)
+				}
+			}
+			if strings.Contains(output.String(), providerGrokWorkspaceSecret) || strings.Contains(output.String(), providerGrokWorkspaceTarget) {
+				t.Fatal("workspace qualification output leaked fixture paths")
+			}
+		})
 	}
 }
 
@@ -307,6 +340,33 @@ func TestProviderGrokWorkspaceAuditRejectsReorderedEvidence(t *testing.T) {
 	assertions := evaluateProviderGrokWorkspaceAudit(audit, "/tmp/linked", strings.Repeat("a", 40))
 	if assertions.ReadObserved || assertions.EditObserved || assertions.SecretDenied || assertions.TestObserved {
 		t.Fatalf("reordered audit was accepted: %+v", assertions)
+	}
+}
+
+func TestProviderGrokWorkspaceAuditPreservesVerifiedPrefix(t *testing.T) {
+	for count := 0; count <= 4; count++ {
+		audit := providerGrokWorkspaceAuditForTest("/workspace", "revision")
+		audit.Events = audit.Events[:count]
+		got := evaluateProviderGrokWorkspaceAudit(audit, "/workspace", "revision")
+		if got.ReadObserved != (count >= 1) || got.EditObserved != (count >= 2) || got.SecretDenied != (count >= 3) || got.TestObserved != (count >= 4) {
+			t.Fatalf("prefix=%d assertions=%+v", count, got)
+		}
+	}
+}
+
+func TestGrokQualificationDiagnosticStorageFailurePreventsPaidDispatch(t *testing.T) {
+	profile := providerTestGrokProfile(agent.DefaultGrokAutomationPolicyName)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps, admission, _, _, calls := grokQualificationDepsForTest(t, profile, grok.Result{})
+	deps.storeProtocolDiagnostic = func(string, string, string, time.Time, time.Time, string, provider.ProtocolObservation) (string, error) {
+		return "", errors.New("private storage failure")
+	}
+	err = runProviderGrokQualification(&cobra.Command{}, providerQualificationOptions{live: true, timeout: time.Second, suiteTimeout: time.Second}, profile, identity, deps)
+	if err == nil || *calls != 0 || admission.acquires != 0 || strings.Contains(err.Error(), "private") {
+		t.Fatalf("calls=%d admission=%+v err=%v", *calls, admission, err)
 	}
 }
 

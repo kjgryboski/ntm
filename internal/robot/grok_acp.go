@@ -602,11 +602,29 @@ func PrintGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions) er
 // scopes. RunGrokACPOperation still owns the enforcement boundary; this helper
 // only carries the CLI's exact signed-qualification verifier into that layer.
 func PrintGrokACPOperationAuthorized(ctx context.Context, opts GrokACPOperationOptions, authorizer GrokACPOperationAuthorizer) error {
-	output, _ := RunGrokACPOperation(ctx, opts, GrokACPOperationDeps{Ledger: currentProjectionStore(), Authorizer: authorizer})
+	output, _ := ExecuteGrokACPOperationAuthorized(ctx, opts, authorizer)
 	if output == nil {
 		return EncodeErrorJSON(errors.New("Grok ACP produced no receipt"), ErrCodeInternalError, "Inspect local Grok installation", "robot-grok-acp-run")
 	}
 	return encodeTerminalRobotOutput(output, output.RobotResponse, "Grok ACP operation failed")
+}
+
+// ExecuteGrokACPOperationAuthorized exposes the same durable production
+// dispatcher to ordinary controls without coupling them to stdout formatting.
+func ExecuteGrokACPOperationAuthorized(ctx context.Context, opts GrokACPOperationOptions, authorizer GrokACPOperationAuthorizer) (*GrokACPOperationOutput, error) {
+	store := currentProjectionStore()
+	if store == nil {
+		var err error
+		store, err = state.Open("")
+		if err != nil {
+			return nil, err
+		}
+		defer store.Close()
+		if err := store.Migrate(); err != nil {
+			return nil, err
+		}
+	}
+	return RunGrokACPOperation(ctx, opts, GrokACPOperationDeps{Ledger: store, Authorizer: authorizer})
 }
 
 func sealGrokACPOperationOutput(ctx context.Context, output *GrokACPOperationOutput, sign func(context.Context, []byte) (providerattestation.SignatureMetadata, error), trusted providerattestation.KeyMetadata) error {

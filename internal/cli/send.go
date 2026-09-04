@@ -613,6 +613,8 @@ func permuteBatchPrompts(prompts []BatchPrompt, perm []int) []BatchPrompt {
 }
 
 func newSendCmd() *cobra.Command {
+	var providerProfile, providerOperationID, providerCWD string
+	var providerTimeout time.Duration
 	var targets SendTargets
 	var targetAll, includeUser, skipFirst, clearInput bool
 	var paneSelector string
@@ -725,6 +727,18 @@ func newSendCmd() *cobra.Command {
 		  ntm send myproject --smart --route=sticky "auth"      # Prefer same agent for related tasks`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if providerProfile == "" && (providerOperationID != "" || providerCWD != "" || cmd.Flags().Changed("timeout")) {
+				return errors.New("--operation-id, --cwd, and --timeout require --provider-profile")
+			}
+			if providerProfile != "" {
+				if len(args) != 1 {
+					return errors.New("structured provider send requires one prompt argument and no terminal session argument")
+				}
+				if err := validateProviderControlFlags(cmd, "provider-profile", "operation-id", "cwd", "timeout"); err != nil {
+					return err
+				}
+				return dispatchProviderAssignment(cmd, providerAssignmentRequest{Profile: providerProfile, OperationID: providerOperationID, Prompt: args[0], CWD: providerCWD, Timeout: providerTimeout})
+			}
 			failureSession := ""
 			if projectFilter == "" && len(args) > 0 {
 				failureSession = args[0]
@@ -921,6 +935,10 @@ func newSendCmd() *cobra.Command {
 	}
 
 	// Use custom flag values that support --cc or --cc=variant syntax
+	cmd.Flags().StringVar(&providerProfile, "provider-profile", "", "Send one coding assignment through an exact qualified provider profile; omit the terminal session argument")
+	cmd.Flags().StringVar(&providerOperationID, "operation-id", "", "Durable operation ID for structured provider assignment")
+	cmd.Flags().StringVar(&providerCWD, "cwd", "", "Linked disposable worktree for structured provider assignment")
+	cmd.Flags().DurationVar(&providerTimeout, "timeout", 20*time.Minute, "Maximum duration of a structured provider assignment")
 	// NoOptDefVal must be set explicitly for pflag to honor IsBoolFlag() on custom Var types
 	cmd.Flags().Var(newSendTargetValue(AgentTypeClaude, &targets), "cc", "send to Claude agents (optional :variant filter)")
 	cmd.Flags().Lookup("cc").NoOptDefVal = "true"

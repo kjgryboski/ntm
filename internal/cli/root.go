@@ -2150,71 +2150,13 @@ Shell Integration:
 			}
 			runCtx, cancel := context.WithTimeout(cmd.Context(), timeout)
 			defer cancel()
-			verifiedBinary, err := verifyGrokACPDispatchAuthority(runCtx, cwd, resolvedProfile.Profile, resolvedProfile.Identity, providerDoctorDeps)
+			opts, grokOperationAuthorizer, err := prepareGrokACPDispatch(runCtx, cwd, resolvedProfile, robotGrokACPOperation)
 			if err != nil {
-				failRobotCommand(err, robot.ErrCodeDependencyMissing, "Install and verify the exact root-owned Grok managed policy and pinned runtime before dispatch", "robot-grok-acp-run")
+				failRobotCommand(err, robot.ErrCodeDependencyMissing, "Verify the exact profile, managed policy, runtime, signer, scope, and disposable worktree", "robot-grok-acp-run")
 				return
 			}
-			resolvedProfile.Binary = verifiedBinary
-			operation := normalizeProviderOperation(robotGrokACPOperation)
-			if operation == providerOperationLifecycle || !validProviderOperation(operation) {
-				failRobotCommand(errors.New("direct Grok ACP requires observe, review, or workspace-write operation scope"), robot.ErrCodeInvalidFlag, "Use --provider-operation=observe|review|workspace-write; lifecycle work uses a separately qualified provider session", "robot-grok-acp-run")
-				return
-			}
-			workspacePolicy := resolvedProfile.AutomationPolicy == agent.GrokWorkspaceWritePolicyName
-			if workspacePolicy != (operation == providerOperationWorkspaceWrite) {
-				failRobotCommand(errors.New("Grok operation scope does not match the exact compiled automation policy"), robot.ErrCodeInvalidFlag, "Use the workspace-write scope only with grok-workspace-write-ci; use observe/review with grok-readonly-ci", "robot-grok-acp-run")
-				return
-			}
-			signPayload, signerErr := providerGrokPinnedSigner(resolvedProfile.Profile)
-			if signerErr != nil {
-				failRobotCommand(signerErr, robot.ErrCodeDependencyMissing, "Install the exact profile-pinned OS-protected receipt signing bridge before Grok ACP dispatch", "robot-grok-acp-run")
-				return
-			}
-			signerPreflight, signerErr := preflightProviderReceiptSignerMetadata(runCtx, signPayload)
-			if signerErr != nil {
-				failRobotCommand(signerErr, robot.ErrCodeDependencyMissing, "Initialize the OS-protected receipt signer before Grok ACP dispatch", "robot-grok-acp-run")
-				return
-			}
-			var grokOperationAuthorizer robot.GrokACPOperationAuthorizer
-			if operation != providerOperationObserve {
-				runtimeSHA256, hashErr := hashProviderSessionExecutable(resolvedProfile.Binary)
-				if hashErr != nil || !validProviderNativeDigest(runtimeSHA256) {
-					failRobotCommand(errors.New("verified Grok runtime could not be bound to an exact executable digest"), robot.ErrCodeDependencyMissing, "Reinstall and verify the exact root-owned Grok runtime", "robot-grok-acp-run")
-					return
-				}
-				grokOperationAuthorizer = robot.GrokACPOperationAuthorizerFunc(func(_ context.Context, scope robot.GrokACPOperationScope, identity provider.Identity) (robot.GrokACPOperationAuthorization, error) {
-					if identity.Hash() != resolvedProfile.Identity.Hash() || string(scope) != operation {
-						return robot.GrokACPOperationAuthorization{}, errors.New("Grok ACP authorization request changed exact identity or operation scope")
-					}
-					receiptSHA256, gateErr := authorizeProviderOperation(providerOperationAuthorization{
-						Identity: identity, Transport: "xai_acp", PolicySHA256: agent.GrokAutomationPolicySHA256(resolvedProfile.AutomationPolicy), RuntimeVersion: resolvedProfile.Profile.RuntimeVersion, RuntimeSHA256: runtimeSHA256,
-						Operation: operation, MaxQualificationAge: 24 * time.Hour, TrustedSigner: signerPreflight.KeyMetadata,
-					})
-					return robot.GrokACPOperationAuthorization{QualificationReceiptSHA256: receiptSHA256}, gateErr
-				})
-			}
-			broker, err := providerWorkspaceBrokerForPolicy(runCtx, cwd, resolvedProfile.AutomationPolicy)
-			if err != nil {
-				failRobotCommand(err, robot.ErrCodeDependencyMissing, "Use a linked disposable Go or Rust worktree with NTM's fixed verification manifest", "robot-grok-acp-run")
-				return
-			}
-			if err := robot.PrintGrokACPOperationAuthorized(runCtx, robot.GrokACPOperationOptions{
-				Prompt:           msg,
-				CWD:              cwd,
-				Binary:           resolvedProfile.Binary,
-				RuntimeHome:      resolvedProfile.Profile.RuntimeHome,
-				Model:            resolvedProfile.Model,
-				RuntimeVersion:   resolvedProfile.Profile.RuntimeVersion,
-				OperationID:      strings.TrimSpace(robotSendOpID),
-				Nonce:            strings.TrimSpace(robotGrokACPNonce),
-				Identity:         resolvedProfile.Identity,
-				OperationScope:   robot.GrokACPOperationScope(operation),
-				AutomationPolicy: resolvedProfile.AutomationPolicy,
-				Broker:           broker,
-				ReceiptSigner:    signPayload,
-				TrustedSigner:    signerPreflight.KeyMetadata,
-			}, grokOperationAuthorizer); err != nil {
+			opts.Prompt, opts.OperationID, opts.Nonce = msg, strings.TrimSpace(robotSendOpID), strings.TrimSpace(robotGrokACPNonce)
+			if err := robot.PrintGrokACPOperationAuthorized(runCtx, opts, grokOperationAuthorizer); err != nil {
 				recordRobotProcessExit(err)
 			}
 			return

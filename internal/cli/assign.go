@@ -283,6 +283,7 @@ func assignRoleEligibleAgents(agents []assignAgentInfo, projectDir, template str
 }
 
 func newAssignCmd() *cobra.Command {
+	var providerProfile, providerOperationID string
 	cmd := &cobra.Command{
 		Use:   "assign [session]",
 		Short: "Intelligently assign work to agents based on BV triage",
@@ -372,11 +373,27 @@ Examples:
   ntm assign myproject --retry bd-123          # Retry failed bead bd-123
   ntm assign myproject --retry-failed          # Retry all failed assignments`,
 		Args: cobra.MaximumNArgs(1),
-		RunE: runAssign,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if providerProfile == "" && providerOperationID != "" {
+				return errors.New("--operation-id requires --provider-profile")
+			}
+			if providerProfile == "" {
+				return runAssign(cmd, args)
+			}
+			if len(args) != 0 || !assignAuto || assignDryRun {
+				return errors.New("structured provider assignment requires --auto, --prompt, --repo, and no terminal session argument")
+			}
+			if err := validateProviderControlFlags(cmd, "provider-profile", "operation-id", "auto", "prompt", "repo", "timeout"); err != nil {
+				return err
+			}
+			return dispatchProviderAssignment(cmd, providerAssignmentRequest{Profile: providerProfile, OperationID: providerOperationID, Prompt: assignPrompt, CWD: assignRepoPath, Timeout: assignTimeout})
+		},
 	}
 
 	// Core flags
 	cmd.Flags().BoolVar(&assignAuto, "auto", false, "Execute assignments without confirmation")
+	cmd.Flags().StringVar(&providerProfile, "provider-profile", "", "Assign directly through an exact qualified provider profile; use --auto --prompt --repo without a terminal session")
+	cmd.Flags().StringVar(&providerOperationID, "operation-id", "", "Durable operation ID for structured provider assignment")
 	cmd.Flags().StringVar(&assignStrategy, "strategy", "balanced", "Assignment strategy: balanced, speed, quality, dependency, round-robin")
 	cmd.Flags().StringVar(&assignBeads, "beads", "", "Comma-separated list of specific bead IDs to assign")
 	cmd.Flags().IntVar(&assignLimit, "limit", 0, "Maximum number of assignments (0 = unlimited)")

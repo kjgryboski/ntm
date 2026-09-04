@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 	"slices"
@@ -979,6 +980,105 @@ func TestACPForeignStandardSessionUpdateCannotContributeEvidence(t *testing.T) {
 		if protocolReason(err, ErrProtocol) != provider.ProtocolSessionMismatch || updates.chunks != 0 {
 			t.Fatalf("postResponse=%v: foreign session accepted or misclassified: %v", postResponse, err)
 		}
+	}
+}
+
+func TestProtocolObservationIsSavedBeforeCleanupEvenWhenSinkFails(t *testing.T) {
+	for _, sinkFailure := range []string{"", "error", "panic"} {
+		t.Run(sinkFailure, func(t *testing.T) {
+			transcript := `{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}` + "\n" +
+				`{"jsonrpc":"2.0","id":2,"result":{}}` + "\n" +
+				`{"jsonrpc":"2.0","id":3,"result":{"sessionId":"private-session"}}` + "\n" +
+				`{"jsonrpc":"2.0","id":"private-request","method":"terminal/create","params":{"sessionId":"private-session","payload":"private-payload"}}` + "\n"
+			proc := newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))
+			called := false
+			result, err := Run(t.Context(), &fakeRunner{proc: proc}, Request{Prompt: "hello", CWD: "/repo", BeforeCleanup: func(o provider.ProtocolObservation) error {
+				called = true
+				if proc.closed || proc.killCalls != 0 || proc.waitCalls != 0 {
+					t.Fatal("diagnostic ran after cleanup")
+				}
+				if o.Method != "terminal/create" || o.RequestIDKind != "present" || o.SessionMatch != "match" || o.Stage != "prompt_response" || o.Reason != provider.ProtocolUnexpectedRequest {
+					t.Fatalf("observation = %+v", o)
+				}
+				if strings.Contains(string(mustJSON(t, o)), "private") {
+					t.Fatal("diagnostic leaked payload or identifiers")
+				}
+				if sinkFailure == "panic" {
+					panic("private sink panic")
+				}
+				if sinkFailure == "error" {
+					return errors.New("private sink error")
+				}
+				return nil
+			}})
+			if !called || err == nil || result.Success || proc.waitCalls != 1 || !proc.closed {
+				t.Fatalf("cleanup/result: called=%v wait=%d closed=%v result=%+v err=%v", called, proc.waitCalls, proc.closed, result, err)
+			}
+			if strings.Contains(err.Error(), "private") {
+				t.Fatal("sink error leaked private text")
+			}
+		})
+	}
+}
+
+func TestProtocolObservationShapesAndCountersSurviveFailure(t *testing.T) {
+	for _, tc := range []struct{ id, session, wantID, wantSession string }{
+		{"", `{}`, "absent", "absent"},
+		{`null`, `{"sessionId":"active"}`, "null", "match"},
+		{`"private"`, `{"sessionId":"foreign"}`, "present", "mismatch"},
+		{`42`, `{"sessionId":null}`, "present", "malformed"},
+	} {
+		updates := newUpdateAccumulator(io.Discard, "", "")
+		updates.providerSessionID = "active"
+		updates.toolRequestCount, updates.toolCompleteCount = 2, 1
+		_, _, _ = consumeResponseEvent(rpcEvent{message: rpcMessage{Method: "session/update", ID: json.RawMessage(tc.id), Params: json.RawMessage(tc.session)}}, 4, &updates)
+		if updates.protocolObservation.RequestIDKind != tc.wantID || updates.protocolObservation.SessionMatch != tc.wantSession || updates.toolRequestCount != 2 || updates.toolCompleteCount != 1 {
+			t.Fatalf("observation=%+v", updates.protocolObservation)
+		}
+	}
+}
+
+func TestRunDeniesReviewedPermissionRequestAndContinues(t *testing.T) {
+	permission := `{"jsonrpc":"2.0","id":"permission-1","method":"session/request_permission","params":{"sessionId":"active","toolCall":{"toolCallId":"private-tool"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"deny","name":"Reject","kind":"reject_once"}]}}`
+	transcript := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
+		`{"jsonrpc":"2.0","id":2,"result":{}}`,
+		`{"jsonrpc":"2.0","id":3,"result":{"sessionId":"active"}}`, permission,
+		`{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}`,
+	}, "\n") + "\n"
+	proc := newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))
+	result, err := Run(t.Context(), &fakeRunner{proc: proc}, Request{Prompt: "hello", CWD: "/repo"})
+	if err != nil || !result.Success || result.ProtocolObservation.PermissionDenials != 1 {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	if !strings.Contains(proc.stdin.String(), `"outcome":{"optionId":"deny","outcome":"selected"}`) {
+		t.Fatal("did not send reject_once")
+	}
+	if strings.Contains(string(mustJSON(t, result.ProtocolObservation)), "private") {
+		t.Fatal("permission details leaked")
+	}
+}
+
+func TestPermissionDenialRejectsUnboundOrUnsafeRequests(t *testing.T) {
+	for _, tc := range []struct{ id, session, kind string }{
+		{"null", "active", "reject_once"}, {"1", "foreign", "reject_once"},
+		{"1", "active", "allow_once"}, {"true", "active", "reject_once"},
+	} {
+		var wire bytes.Buffer
+		err := denyACPPermission(t.Context(), &wire, "active", rpcMessage{ID: json.RawMessage(tc.id), Params: json.RawMessage(fmt.Sprintf(`{"sessionId":%q,"toolCall":{"toolCallId":"tool"},"options":[{"optionId":"choice","kind":%q,"name":"choice"}]}`, tc.session, tc.kind))})
+		if err == nil || wire.Len() != 0 {
+			t.Fatalf("unsafe request %+v produced response %s", tc, wire.String())
+		}
+	}
+}
+
+func TestPendingPermissionReceivesCancelledOutcome(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	var wire bytes.Buffer
+	err := denyACPPermission(ctx, &wire, "active", rpcMessage{ID: json.RawMessage(`1`), Params: json.RawMessage(`{"sessionId":"active","toolCall":{"toolCallId":"tool"},"options":[{"optionId":"allow","kind":"allow_once","name":"Allow"}]}`)})
+	if err != nil || !strings.Contains(wire.String(), `"outcome":{"outcome":"cancelled"}`) || strings.Contains(wire.String(), "optionId") {
+		t.Fatalf("err=%v response=%s", err, wire.String())
 	}
 }
 

@@ -237,6 +237,10 @@ type Request struct {
 	// cancellation tests. A callback panic is contained and cannot interrupt an
 	// accepted provider operation.
 	AfterPromptWritten func()
+	// BeforeCleanup persists a redacted observation before stdin closure and
+	// process reaping. Failure is reported after mandatory cleanup; a callback
+	// cannot suppress cleanup or turn an unsuccessful run into success.
+	BeforeCleanup func(provider.ProtocolObservation) error
 }
 
 // WorkspaceBrokerDescriptor describes the sole local NTM MCP service an ACP
@@ -434,6 +438,7 @@ type Result struct {
 	// stderr, RPC payloads, prompts, paths, or credentials.
 	FailureStage          string                         `json:"failure_stage,omitempty"`
 	ProtocolFailureReason provider.ProtocolFailureReason `json:"protocol_failure_reason,omitempty"`
+	ProtocolObservation   provider.ProtocolObservation   `json:"protocol_observation"`
 	// ProviderRPCErrorCode retains only a JSON-RPC integer code. Provider
 	// messages and non-integer vendor payloads remain excluded from receipts.
 	ProviderRPCErrorCode    *int64 `json:"provider_rpc_error_code,omitempty"`
@@ -630,6 +635,26 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	// reply: this is a one-shot adapter, not a daemon owner. This local cleanup
 	// is deliberately recorded separately from any ACP cancellation receipt.
 	defer func() {
+		observation := updates.protocolObservation
+		observation.Stage = failureStage
+		observation.Reason = result.ProtocolFailureReason
+		observation.ToolEvents = updates.toolEventCount
+		observation.ToolRequests = updates.toolRequestCount
+		observation.ToolCompletions = updates.toolCompleteCount
+		observation.PermissionDenials = updates.permissionDenials
+		result.ProtocolObservation = observation.Redacted()
+		// Preserve counters on every exit, including a protocol failure before
+		// the successful-result construction below.
+		result.ToolEventCount = updates.toolEventCount
+		result.ToolRequestCount = updates.toolRequestCount
+		result.ToolCompleteCount = updates.toolCompleteCount
+		if req.BeforeCleanup != nil {
+			if err := persistBeforeCleanup(req.BeforeCleanup, result.ProtocolObservation); err != nil {
+				result.Success = false
+				result.State = StateFailed
+				returnErr = errors.Join(returnErr, errors.New("ACP pre-cleanup diagnostic persistence failed"))
+			}
+		}
 		_ = proc.Stdin().Close()
 		result.Cleanup = cleanupACPProcess(proc)
 		waitErr := proc.Wait()
@@ -689,6 +714,9 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	// replay automatically.
 	outputHasher := sha256.New()
 	updates = newUpdateAccumulator(outputHasher, req.ExpectedNonce, strings.TrimSpace(req.Model))
+	updates.denyPermission = func(message rpcMessage) error {
+		return denyACPPermission(ctx, proc.Stdin(), updates.providerSessionID, message)
+	}
 	nextID := 1
 	call := func(method string, params any) (json.RawMessage, error) {
 		id := nextID
@@ -1013,8 +1041,16 @@ func drainPostResponseUpdates(ctx context.Context, events <-chan rpcEvent, updat
 			if !ok {
 				return nil
 			}
+			updates.observeProtocol(event)
 			if event.err != nil {
 				return event.err
+			}
+			if event.message.Method == "session/request_permission" && updates.denyPermission != nil {
+				if err := updates.denyPermission(event.message); err != nil {
+					return err
+				}
+				updates.permissionDenials++
+				continue
 			}
 			if event.message.Method != "" && len(event.message.ID) != 0 {
 				return protocolError(provider.ProtocolUnexpectedRequest)
@@ -1646,8 +1682,16 @@ func waitResponse(ctx context.Context, events <-chan rpcEvent, requestID int, up
 // consumeResponseEvent processes notifications and accepts a response only
 // when it is bound to the exact request ID the caller is awaiting.
 func consumeResponseEvent(event rpcEvent, requestID int, updates *updateAccumulator) (json.RawMessage, bool, error) {
+	updates.observeProtocol(event)
 	if event.err != nil {
 		return nil, false, event.err
+	}
+	if event.message.Method == "session/request_permission" && updates != nil && updates.denyPermission != nil {
+		if err := updates.denyPermission(event.message); err != nil {
+			return nil, false, err
+		}
+		updates.permissionDenials++
+		return nil, false, nil
 	}
 	if event.message.Method != "" && len(event.message.ID) != 0 {
 		return nil, false, protocolError(provider.ProtocolUnexpectedRequest)
@@ -1753,6 +1797,9 @@ func providerRPCErrorCode(err error) *int64 {
 }
 
 type updateAccumulator struct {
+	denyPermission         func(rpcMessage) error
+	permissionDenials      int
+	protocolObservation    provider.ProtocolObservation
 	hasher                 io.Writer
 	chunks                 int
 	bytes                  int64
@@ -1768,6 +1815,129 @@ type updateAccumulator struct {
 	expectedModel          string
 	sessionModelObserved   bool
 	providerSessionID      string
+}
+
+// denyACPPermission implements only reject_once from ACP schema 0.11.4's
+// RequestPermissionResponse/SelectedPermissionOutcome. No option is approved,
+// no remembered permission is created, and no provider tool is executed here.
+func denyACPPermission(ctx context.Context, writer io.Writer, session string, message rpcMessage) error {
+	if len(message.ID) == 0 || string(message.ID) == "null" {
+		return protocolError(provider.ProtocolUnexpectedRequest)
+	}
+	var numericID int64
+	var stringID string
+	if json.Unmarshal(message.ID, &numericID) != nil && json.Unmarshal(message.ID, &stringID) != nil {
+		return protocolError(provider.ProtocolMalformedMessage)
+	}
+	var request struct {
+		SessionID string `json:"sessionId"`
+		ToolCall  struct {
+			ID string `json:"toolCallId"`
+		} `json:"toolCall"`
+		Options []struct {
+			ID   string `json:"optionId"`
+			Kind string `json:"kind"`
+			Name string `json:"name"`
+		} `json:"options"`
+	}
+	if json.Unmarshal(message.Params, &request) != nil || request.ToolCall.ID == "" || request.Options == nil {
+		return protocolError(provider.ProtocolMalformedMessage)
+	}
+	if session == "" || request.SessionID != session {
+		return protocolError(provider.ProtocolSessionMismatch)
+	}
+	selected := ""
+	seen := map[string]bool{}
+	for _, option := range request.Options {
+		if option.ID == "" || seen[option.ID] {
+			return protocolError(provider.ProtocolMalformedMessage)
+		}
+		seen[option.ID] = true
+		switch option.Kind {
+		case "allow_once", "allow_always", "reject_always":
+		case "reject_once":
+			if selected == "" {
+				selected = option.ID
+			}
+		default:
+			return protocolError(provider.ProtocolMalformedMessage)
+		}
+	}
+	outcome := map[string]string{"outcome": "selected", "optionId": selected}
+	if ctx.Err() != nil {
+		// ACP requires pending permission requests to receive cancelled when
+		// their prompt is cancelled. This never grants or remembers permission.
+		outcome = map[string]string{"outcome": "cancelled"}
+	} else if selected == "" {
+		return protocolError(provider.ProtocolUnexpectedRequest)
+	}
+	payload, err := json.Marshal(struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  any             `json:"result"`
+	}{"2.0", message.ID, map[string]any{"outcome": outcome}})
+	if err != nil {
+		return protocolError(provider.ProtocolMalformedMessage)
+	}
+	payload = append(payload, '\n')
+	written, err := writer.Write(payload)
+	if err != nil {
+		return errors.New("ACP permission denial write failed")
+	}
+	if written != len(payload) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func persistBeforeCleanup(callback func(provider.ProtocolObservation) error, observation provider.ProtocolObservation) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("diagnostic callback panicked")
+		}
+	}()
+	return callback(observation)
+}
+
+func (a *updateAccumulator) observeProtocol(event rpcEvent) {
+	if a == nil {
+		return
+	}
+	o := provider.ProtocolObservation{Method: event.message.Method, RequestIDKind: "present", SessionMatch: "absent"}
+	if o.Method == "" {
+		o.Method = "absent"
+	}
+	if len(event.message.ID) == 0 {
+		o.RequestIDKind = "absent"
+	} else if string(event.message.ID) == "null" {
+		o.RequestIDKind = "null"
+	}
+	// Inspect only the documented carrier. Values are compared transiently
+	// and are never retained, including values inside vendor envelopes.
+	params := event.message.Params
+	if isBenignACPNotification(rpcMessage{Method: event.message.Method}) {
+		if unwrapped, err := directOrWrappedVendorParams(event.message.Method, strings.TrimPrefix(event.message.Method, "_"), params); err == nil {
+			params = unwrapped
+		}
+	}
+	if len(params) != 0 {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(params, &fields) != nil {
+			o.SessionMatch = "malformed"
+		} else if raw, exists := fields["sessionId"]; exists {
+			var session string
+			if json.Unmarshal(raw, &session) != nil || session == "" {
+				o.SessionMatch = "malformed"
+			} else if a.providerSessionID == "" {
+				o.SessionMatch = "unbound"
+			} else if session == a.providerSessionID {
+				o.SessionMatch = "match"
+			} else {
+				o.SessionMatch = "mismatch"
+			}
+		}
+	}
+	a.protocolObservation = o.Redacted()
 }
 
 func newUpdateAccumulator(hasher io.Writer, nonce, expectedModel string) updateAccumulator {

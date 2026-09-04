@@ -921,6 +921,7 @@ func buildAttachResponse(ctx context.Context, session string) (output.SessionRes
 	}, nil
 }
 func newStatusCmd() *cobra.Command {
+	var providerProfile, providerOperationID string
 	var tags []string
 	var showAssignments bool
 	var filterStatus string
@@ -953,8 +954,22 @@ Examples:
   ntm status myproject --assignments --status=failed --agent=codex
   ntm status myproject --assignments --summary
   ntm status myproject --watch`,
-		Args: cobra.ExactArgs(1),
+		Args: func(cmd *cobra.Command, args []string) error {
+			if providerProfile != "" {
+				return cobra.NoArgs(cmd, args)
+			}
+			return cobra.ExactArgs(1)(cmd, args)
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if providerProfile != "" {
+				if err := validateProviderControlFlags(cmd, "provider-profile", "operation-id"); err != nil {
+					return err
+				}
+				return inspectProviderAssignment(cmd, providerProfile, providerOperationID)
+			}
+			if providerOperationID != "" {
+				return errors.New("--operation-id requires --provider-profile")
+			}
 			opts := statusOptions{
 				tags:            tags,
 				showAssignments: showAssignments,
@@ -969,6 +984,8 @@ Examples:
 		},
 	}
 	cmd.Flags().StringSliceVar(&tags, "tag", nil, "filter panes by tag")
+	cmd.Flags().StringVar(&providerProfile, "provider-profile", "", "Inspect a structured provider assignment instead of a terminal session")
+	cmd.Flags().StringVar(&providerOperationID, "operation-id", "", "Exact structured provider operation ID")
 	cmd.Flags().BoolVar(&showAssignments, "assignments", false, "show bead-to-agent assignments")
 	cmd.Flags().StringVar(&filterStatus, "status", "", "filter assignments by status (assigned, working, completed, failed, reassigned)")
 	cmd.Flags().StringVar(&filterAgent, "agent", "", "filter assignments by agent type (claude, codex, gemini)")
