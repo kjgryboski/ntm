@@ -57,6 +57,8 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
   qualification checks without retaining rejected methods, payloads, session
   identifiers, or provider error text. Unexpected reverse requests and foreign
   standard ACP session updates fail closed with distinct diagnostic reasons.
+  The signing bridge validates the same closed vocabulary, and Grok's offline
+  preflight exercises a failed diagnostic receipt before admitting a paid turn.
 
 ---
 

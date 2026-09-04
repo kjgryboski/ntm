@@ -476,7 +476,7 @@ func validateBridgeQualification(object map[string]json.RawMessage) error {
 		if err != nil {
 			return err
 		}
-		if err := bridgeAllowed(check, []string{"name", "passed", "provenance"}, "name", "passed", "provenance", "evidence_sha256", "detail"); err != nil {
+		if err := bridgeAllowed(check, []string{"name", "passed", "provenance"}, "name", "passed", "provenance", "evidence_sha256", "detail", "failure_reason"); err != nil {
 			return err
 		}
 		name, ok := bridgeString(check, "name")
@@ -490,6 +490,12 @@ func validateBridgeQualification(object map[string]json.RawMessage) error {
 		var passed bool
 		if json.Unmarshal(check["passed"], &passed) != nil {
 			return errors.New("qualification check passed is invalid")
+		}
+		if raw, present := check["failure_reason"]; present {
+			var reason provider.ProtocolFailureReason
+			if json.Unmarshal(raw, &reason) != nil || reason == "" || !reason.Valid() || passed {
+				return errors.New("qualification check failure reason is invalid")
+			}
 		}
 		provenance, ok := bridgeString(check, "provenance")
 		if !ok || provenance != "live" && provenance != "local_authoritative" && provenance != "local_observed_process_tree" {

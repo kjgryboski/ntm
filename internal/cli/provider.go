@@ -365,7 +365,7 @@ func defaultProviderDoctorDependencies() providerDoctorDependencies {
 			if err != nil {
 				return providerattestation.SignatureMetadata{}, err
 			}
-			return preflightProviderReceiptSignerMetadata(ctx, sign)
+			return preflightProviderGrokReceiptSignerMetadata(ctx, sign)
 		},
 		codexCredentialStatus: func(ctx context.Context, profile config.ProviderProfileConfig) (providercredential.Status, error) {
 			return zai.CodexCredentialStatus(ctx, profile.CredentialBridgeCommand, profile.CredentialBridgeCommandSHA256, profile.BrokerCredentialID)

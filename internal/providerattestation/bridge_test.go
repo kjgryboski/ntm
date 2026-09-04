@@ -73,6 +73,27 @@ func TestValidateBridgePayloadAcceptsObservedProcessTreeQualificationEvidence(t 
 	}
 }
 
+func TestBridgeQualificationFailureReasonIsClosedAndFailureOnly(t *testing.T) {
+	failed := bytes.ReplaceAll(validBridgeQualificationPayload(), []byte(`"passed":true`), []byte(`"passed":false`))
+	for _, value := range []string{`"unknown_method"`, `"malformed_envelope"`, `"session_mismatch"`, `"other_protocol_error"`} {
+		payload := bytes.Replace(failed, []byte(`"name":"gate"`), []byte(`"name":"gate","failure_reason":`+value), 1)
+		if err := ValidateBridgePayload(payload); err != nil {
+			t.Fatalf("closed failure diagnostic rejected: %v", err)
+		}
+		passing := bytes.ReplaceAll(payload, []byte(`"passed":false`), []byte(`"passed":true`))
+		if !errors.Is(ValidateBridgePayload(passing), ErrBridgePayloadDenied) {
+			t.Fatal("passing check accepted a failure diagnostic")
+		}
+	}
+	for _, value := range []string{`"SENSITIVE_CANARY"`, `""`, `null`, `123`, `{}`} {
+		payload := bytes.Replace(failed, []byte(`"name":"gate"`), []byte(`"name":"gate","failure_reason":`+value), 1)
+		err := ValidateBridgePayload(payload)
+		if !errors.Is(err, ErrBridgePayloadDenied) || strings.Contains(err.Error(), "SENSITIVE_CANARY") {
+			t.Fatal("invalid diagnostic accepted or echoed")
+		}
+	}
+}
+
 func TestValidateBridgePayloadRequiresRuntimeDigestForBinaryQualification(t *testing.T) {
 	for _, transport := range []string{
 		"zai_codex_runtime",

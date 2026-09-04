@@ -20,6 +20,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
+	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 )
@@ -572,6 +573,9 @@ func TestProviderGrokQualificationSignsBoundedProtocolReason(t *testing.T) {
 		signed := false
 		deps.sign = func(_ context.Context, receipt *providerqualification.Receipt) error {
 			payload, err := receipt.CanonicalPayload()
+			if bridgeErr := providerattestation.ValidateBridgePayload(payload); bridgeErr != nil {
+				t.Fatalf("diagnostic receipt rejected by signing bridge: %v", bridgeErr)
+			}
 			if err != nil || !strings.Contains(string(payload), `"failure_reason":"`+string(want)+`"`) || strings.Contains(string(payload), "SENSITIVE_CANARY") {
 				t.Fatal("signer did not receive a bounded diagnostic in its canonical payload")
 			}
@@ -584,6 +588,32 @@ func TestProviderGrokQualificationSignsBoundedProtocolReason(t *testing.T) {
 		if !signed || stored.Validate() != nil {
 			t.Fatal("failed provider run did not produce a valid signed-payload receipt")
 		}
+	}
+}
+
+func TestProviderGrokQualificationRejectsLegacySignerBeforeDispatch(t *testing.T) {
+	profile := providerTestGrokProfile(agent.DefaultGrokAutomationPolicyName)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deps, _, _, _, _ := grokQualificationDepsForTest(t, profile, grok.Result{})
+	deps.pinnedSigner = func(config.ProviderProfileConfig) (func(context.Context, []byte) (providerattestation.SignatureMetadata, error), error) {
+		return func(_ context.Context, payload []byte) (providerattestation.SignatureMetadata, error) {
+			if !bytes.Contains(payload, []byte(`"failure_reason"`)) {
+				t.Fatal("Grok preflight did not exercise the new bridge field")
+			}
+			return providerattestation.SignatureMetadata{}, providerattestation.ErrBridgePayloadDenied
+		}, nil
+	}
+	dispatched := false
+	deps.run = func(context.Context, grok.Runner, grok.Request) (grok.Result, error) {
+		dispatched = true
+		return grok.Result{}, nil
+	}
+	err = runProviderGrokQualification(&cobra.Command{}, providerQualificationOptions{live: true}, profile, identity, deps)
+	if err == nil || dispatched || !strings.Contains(err.Error(), "before dispatch") {
+		t.Fatalf("legacy signer did not block dispatch: dispatched=%v err=%v", dispatched, err)
 	}
 }
 

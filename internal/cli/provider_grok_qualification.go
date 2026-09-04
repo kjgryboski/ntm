@@ -74,7 +74,8 @@ var providerGrokQualificationDeps = providerGrokQualificationDependencies{
 	store:                providerqualification.Store,
 	sign:                 signProviderQualificationReceipt,
 	preflight: func(ctx context.Context) error {
-		return preflightProviderReceiptSigner(ctx, signProviderReceiptPayload)
+		_, err := preflightProviderGrokReceiptSignerMetadata(ctx, signProviderReceiptPayload)
+		return err
 	},
 	pinnedSigner: providerGrokPinnedSigner,
 	admission:    ratelimit.DefaultAdmissionController(),
@@ -116,7 +117,8 @@ func runProviderGrokQualification(cmd *cobra.Command, opts providerQualification
 			return signProviderQualificationReceiptWith(ctx, receipt, signPayload)
 		}
 		preflight = func(ctx context.Context) error {
-			return preflightProviderReceiptSigner(ctx, signPayload)
+			_, err := preflightProviderGrokReceiptSignerMetadata(ctx, signPayload)
+			return err
 		}
 	}
 	if err := preflight(commandCtx); err != nil {

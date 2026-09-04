@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 )
@@ -105,10 +106,18 @@ func preflightProviderReceiptSigner(ctx context.Context, sign func(context.Conte
 }
 
 func preflightProviderReceiptSignerMetadata(ctx context.Context, sign func(context.Context, []byte) (providerattestation.SignatureMetadata, error)) (providerattestation.SignatureMetadata, error) {
+	return preflightProviderReceiptSignerMetadataFor(ctx, sign, false)
+}
+
+func preflightProviderGrokReceiptSignerMetadata(ctx context.Context, sign func(context.Context, []byte) (providerattestation.SignatureMetadata, error)) (providerattestation.SignatureMetadata, error) {
+	return preflightProviderReceiptSignerMetadataFor(ctx, sign, true)
+}
+
+func preflightProviderReceiptSignerMetadataFor(ctx context.Context, sign func(context.Context, []byte) (providerattestation.SignatureMetadata, error), grokDiagnostics bool) (providerattestation.SignatureMetadata, error) {
 	if sign == nil {
 		return providerattestation.SignatureMetadata{}, errors.New("provider receipt attestor is unavailable")
 	}
-	payload, err := providerReceiptSignerPreflightPayload()
+	payload, err := providerReceiptSignerPreflightPayloadFor(grokDiagnostics)
 	if err != nil {
 		return providerattestation.SignatureMetadata{}, err
 	}
@@ -128,15 +137,30 @@ func preflightProviderReceiptSignerMetadata(ctx context.Context, sign func(conte
 // runtime digest whose bridge-schema mismatch previously surfaced too late.
 // The failed synthetic receipt is never stored and cannot promote a provider.
 func providerReceiptSignerPreflightPayload() ([]byte, error) {
-	checks := make([]providerqualification.Check, 0, len(providerqualification.CodexIdentityPreflightRequiredChecks()))
-	for _, name := range providerqualification.CodexIdentityPreflightRequiredChecks() {
+	return providerReceiptSignerPreflightPayloadFor(false)
+}
+
+// Grok exercises its diagnostic field through the real bridge before dispatch.
+// The generic preflight remains unchanged for other provider transports.
+func providerReceiptSignerPreflightPayloadFor(grokDiagnostics bool) ([]byte, error) {
+	transport := "zai_codex_identity_preflight"
+	names := providerqualification.CodexIdentityPreflightRequiredChecks()
+	if grokDiagnostics {
+		transport = "xai_acp"
+		names = providerqualification.GrokRequiredChecks()
+	}
+	checks := make([]providerqualification.Check, 0, len(names))
+	for _, name := range names {
 		checks = append(checks, providerqualification.Check{Name: name, Provenance: "local_authoritative"})
+	}
+	if grokDiagnostics {
+		checks[0].FailureReason = provider.ProtocolOther
 	}
 	fixedTime := time.Unix(1, 0).UTC()
 	receipt := providerqualification.Receipt{
 		Mode:               providerqualification.ModeLive,
 		Provider:           "signer-preflight",
-		Transport:          "zai_codex_identity_preflight",
+		Transport:          transport,
 		IdentitySHA256:     providerReceiptPreflightDigest,
 		PolicySHA256:       providerReceiptPreflightDigest,
 		RuntimeVersion:     "schema-runtime-sha256-v1",
