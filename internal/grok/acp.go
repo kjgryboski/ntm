@@ -1819,9 +1819,11 @@ func (a *updateAccumulator) observeVendorNotification(method string, params json
 	}
 }
 
-// directOrWrappedVendorParams unwraps ACP's `_x.ai/...` extension envelope.
-// Direct `x.ai/...` notifications carry their typed payload in params. Exact
-// method equality prevents a wrapper from smuggling a different event type.
+// directOrWrappedVendorParams accepts the flat payload emitted by pinned
+// agent-client-protocol 0.10.4 / schema 0.11.4 (ExtNotification is serde
+// transparent), including with the `_` method prefix. Grok's leader fixtures
+// also describe a nested envelope. An explicit envelope must bind its inner
+// method exactly; it cannot smuggle a different event type.
 func directOrWrappedVendorParams(method, canonical string, params json.RawMessage) (json.RawMessage, error) {
 	if method == canonical {
 		return params, nil
@@ -1830,10 +1832,17 @@ func directOrWrappedVendorParams(method, canonical string, params json.RawMessag
 		return nil, errors.New("Grok ACP vendor notification method is not canonical")
 	}
 	var envelope struct {
-		Method string          `json:"method"`
+		Method json.RawMessage `json:"method"`
 		Params json.RawMessage `json:"params"`
 	}
-	if err := json.Unmarshal(params, &envelope); err != nil || envelope.Method != canonical || len(envelope.Params) == 0 {
+	if err := json.Unmarshal(params, &envelope); err != nil {
+		return nil, errors.New("Grok ACP vendor notification envelope is malformed")
+	}
+	if len(envelope.Method) == 0 && len(envelope.Params) == 0 {
+		return params, nil
+	}
+	var innerMethod string
+	if err := json.Unmarshal(envelope.Method, &innerMethod); err != nil || innerMethod != canonical || len(envelope.Params) == 0 {
 		return nil, errors.New("Grok ACP vendor notification envelope is malformed")
 	}
 	return envelope.Params, nil

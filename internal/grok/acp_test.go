@@ -170,7 +170,7 @@ func TestPinnedGrokHousekeepingNotificationsRemainFailClosed(t *testing.T) {
 
 func TestGrokVendorSessionCarriersCannotSupplyAuthoritativeEvidence(t *testing.T) {
 	const nonce = "NTM_ACK_0123456789abcdef0123456789abcdef"
-	for _, wrapped := range []bool{false, true} {
+	for _, form := range []string{"direct", "prefixed-flat", "wrapped"} {
 		updates := newUpdateAccumulator(io.Discard, nonce, "grok-4.6")
 		updates.providerSessionID = "s"
 		for _, update := range []string{
@@ -181,8 +181,10 @@ func TestGrokVendorSessionCarriersCannotSupplyAuthoritativeEvidence(t *testing.T
 		} {
 			method := "x.ai/session_notification"
 			payload := `{"sessionId":"s","update":` + update + `}`
-			if wrapped {
+			if form == "wrapped" {
 				payload = `{"method":"` + method + `","params":` + payload + `}`
+			}
+			if form != "direct" {
 				method = "_" + method
 			}
 			if err := updates.observeVendorNotification(method, json.RawMessage(payload)); err != nil {
@@ -191,21 +193,41 @@ func TestGrokVendorSessionCarriersCannotSupplyAuthoritativeEvidence(t *testing.T
 		}
 		updates.nonce.Finalize()
 		if updates.nonce.verified || updates.chunks != 0 || updates.bytes != 0 || updates.toolRequestCount != 0 || updates.toolCompleteCount != 0 || updates.sessionModelObserved {
-			t.Fatalf("wrapped=%v: vendor carrier supplied authoritative evidence: %+v", wrapped, updates)
+			t.Fatalf("form=%s: vendor carrier supplied authoritative evidence: %+v", form, updates)
 		}
 		if updates.nonMessageUpdateCount != 4 {
-			t.Fatalf("wrapped=%v: retained %d update names, want 4", wrapped, updates.nonMessageUpdateCount)
+			t.Fatalf("form=%s: retained %d update names, want 4", form, updates.nonMessageUpdateCount)
 		}
 		method := "x.ai/session/prompt_complete"
 		payload := `{"sessionId":"s","stopReason":"end_turn"}`
-		if wrapped {
+		if form == "wrapped" {
 			payload = `{"method":"` + method + `","params":` + payload + `}`
+		}
+		if form != "direct" {
 			method = "_" + method
 		}
 		_, done, err := consumeResponseEvent(rpcEvent{message: rpcMessage{JSONRPC: "2.0", Method: method, Params: json.RawMessage(payload)}}, 4, &updates)
 		if err != nil || done {
-			t.Fatalf("wrapped=%v: prompt-complete notification ended request: done=%v err=%v", wrapped, done, err)
+			t.Fatalf("form=%s: prompt-complete notification ended request: done=%v err=%v", form, done, err)
 		}
+	}
+}
+
+func TestRunAcceptsPinnedGrokPrefixedFlatSessionNotifications(t *testing.T) {
+	// ACP schema 0.11.4 serializes ExtNotification transparently: the method
+	// gets an underscore prefix, but params is the typed payload, not a wrapper.
+	transcript := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
+		`{"jsonrpc":"2.0","id":2,"result":{}}`,
+		`{"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"sessionId":"s","update":{"sessionUpdate":"session_status"}}}`,
+		`{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s"}}`,
+		`{"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"sessionId":"s","update":{"sessionUpdate":"retry_state"}}}`,
+		`{"jsonrpc":"2.0","method":"_x.ai/session/prompt_complete","params":{"sessionId":"s"}}`,
+		`{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}`,
+	}, "\n") + "\n"
+	result, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{Prompt: "hello", CWD: "/repo"})
+	if err != nil || !result.Success || !result.CompletionConfirmed || result.NonMessageUpdateCount != 2 {
+		t.Fatalf("prefixed flat transcript result=%+v err=%v", result, err)
 	}
 }
 
@@ -214,6 +236,8 @@ func TestRunRejectsMalformedOrMismatchedGrokSessionCarrier(t *testing.T) {
 		"empty direct payload":      `{"jsonrpc":"2.0","method":"x.ai/session_notification","params":{}}`,
 		"null update":               `{"jsonrpc":"2.0","method":"x.ai/session_notification","params":{"sessionId":"s","update":null}}`,
 		"missing update name":       `{"jsonrpc":"2.0","method":"x.ai/session_notification","params":{"sessionId":"s","update":{}}}`,
+		"wrapper missing method":    `{"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"params":{"sessionId":"s","update":{"sessionUpdate":"retry_state"}}}}`,
+		"wrapper null method":       `{"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"method":null,"params":{"sessionId":"s","update":{"sessionUpdate":"retry_state"}}}}`,
 		"malformed wrapped payload": `{"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"method":"x.ai/settings/update","params":{"sessionId":"s","update":{"sessionUpdate":"retry_state"}}}}`,
 	} {
 		t.Run(name, func(t *testing.T) {

@@ -50,6 +50,9 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
   request-ID and unknown-method fail-closed checks. MCP progress can no longer
   be mistaken for malformed prompt traffic, while session carriers are bound
   to the active session and contribute no terminal completion evidence.
+  The pinned ACP schema's underscore-prefixed flat payloads are accepted
+  alongside the reviewed nested leader envelopes; explicit envelope methods
+  must still match exactly.
 
 ---
 
