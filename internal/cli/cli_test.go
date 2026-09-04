@@ -248,17 +248,20 @@ func TestValidateProviderRobotCommandExclusivity(t *testing.T) {
 
 func TestResolveGrokACPProviderProfileFailsClosed(t *testing.T) {
 	base := config.ProviderProfileConfig{
-		Provider:         "xai",
-		AccountAlias:     "kevin",
-		Model:            "grok-code",
-		Endpoint:         "https://api.x.ai/v1",
-		Runtime:          "grok",
-		ConfigSHA256:     strings.Repeat("a", 64),
-		Command:          "grok",
-		RuntimeHome:      "/tmp/grok-kevin",
-		AutomationPolicy: agent.DefaultGrokAutomationPolicyName,
-		ExactTargetOnly:  true,
+		Provider:                      "xai",
+		AccountAlias:                  "kevin",
+		Model:                         "grok-code",
+		Endpoint:                      "https://api.x.ai/v1",
+		Runtime:                       "grok",
+		RuntimeVersion:                "test",
+		Command:                       "grok",
+		RuntimeHome:                   "/tmp/grok-kevin",
+		CredentialBridgeCommand:       "/usr/local/libexec/ntm/test-provider-bridge.exe",
+		CredentialBridgeCommandSHA256: strings.Repeat("b", 64),
+		AutomationPolicy:              agent.DefaultGrokAutomationPolicyName,
+		ExactTargetOnly:               true,
 	}
+	base.ConfigSHA256 = base.CanonicalManifestSHA256()
 	with := func(profile config.ProviderProfileConfig) *config.Config {
 		return &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{"xai-grok-primary": profile}}
 	}
