@@ -113,6 +113,9 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	if err != nil {
 		return fmt.Errorf("Codex qualification requires a working pinned receipt signer before workspace creation: %w", err)
 	}
+	if err := preflightProviderCodexQualificationTurnSigner(ctx, signPayload, signerPreflight.KeyMetadata, identity, manifest, deps.now()); err != nil {
+		return fmt.Errorf("Codex qualification requires qualification-turn receipt schema support before workspace creation: %w", err)
+	}
 	if deps.admission.CapacityStatus().Scope != provider.CapacityControlScopeLocalShared {
 		return errors.New("Codex qualification requires the local shared capacity store")
 	}
@@ -528,6 +531,46 @@ func canonicalProviderCodexQualificationTurnArtifact(artifact providerCodexQuali
 		RuntimeVersion: artifact.RuntimeVersion, StartedAt: artifact.StartedAt, CompletedAt: artifact.CompletedAt,
 		ReceiptSHA256: artifact.ReceiptSHA256, ErrorSHA256: artifact.ErrorSHA256,
 	})
+}
+
+func preflightProviderCodexQualificationTurnSigner(ctx context.Context, sign func(context.Context, []byte) (providerattestation.SignatureMetadata, error), trustedSigner providerattestation.KeyMetadata, identity provider.Identity, manifest zai.CodexManifestAttestation, observedAt time.Time) error {
+	if sign == nil || observedAt.IsZero() {
+		return errors.New("Codex qualification-turn signer preflight is incomplete")
+	}
+	observedAt = observedAt.UTC()
+	artifact := providerCodexQualificationTurnArtifact{
+		SchemaVersion:          "ntm.provider-codex-qualification-turn.v1",
+		State:                  "admission_denied",
+		IdentitySHA256:         identity.Hash(),
+		BindingSHA256:          sha256StringCLI("codex-qualification-turn-schema-preflight-binding-v1"),
+		NonceSHA256:            sha256StringCLI("codex-qualification-turn-schema-preflight-nonce-v1"),
+		OperationIDSHA256:      sha256StringCLI("codex-qualification-turn-schema-preflight-operation-v1"),
+		ConfigSHA256:           manifest.ConfigSHA256,
+		BinarySHA256:           manifest.BinarySHA256,
+		BrokerCommandSHA256:    manifest.AuthHelperSHA256,
+		CredentialBridgeSHA256: manifest.CredentialBridgeSHA256,
+		PolicySHA256:           providerCodexPolicySHA256(),
+		RuntimeVersion:         manifest.RuntimeVersion,
+		StartedAt:              observedAt,
+		CompletedAt:            observedAt,
+		ReceiptSHA256:          digestSafeJSON(zai.CodexRunReceipt{}),
+		ErrorSHA256:            sha256StringCLI("codex-qualification-turn-schema-preflight-error-v1"),
+	}
+	payload, err := canonicalProviderCodexQualificationTurnArtifact(artifact)
+	if err != nil {
+		return err
+	}
+	if err := providerattestation.ValidateBridgePayload(payload); err != nil {
+		return err
+	}
+	signature, err := sign(ctx, payload)
+	if err != nil {
+		return err
+	}
+	if signature.KeyMetadata != trustedSigner {
+		return errors.New("Codex qualification-turn signer changed during schema preflight")
+	}
+	return providerattestation.Verify(payload, signature)
 }
 
 func runCodexQualificationTurn(ctx context.Context, timeout time.Duration, run func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error), profile config.ProviderProfileConfig, identity provider.Identity, manifest zai.CodexManifestAttestation, workspace providerCodexQualificationWorkspace, manifestVerifier func(context.Context) error, instruction, nonce, parent string, write bool, expectedCommand, expectedFile string, observer func(string)) codexQualificationTurn {

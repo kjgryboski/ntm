@@ -361,6 +361,36 @@ func TestCodexQualificationTurnSignatureFailureLeavesClaimBlocked(t *testing.T) 
 	}
 }
 
+func TestProviderCodexQualificationRejectsBridgeWithoutTurnSchemaBeforeAdmission(t *testing.T) {
+	profile := providerCodexProfile(t.TempDir())
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := &codexQualificationAdmissionFake{
+		decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true},
+		status:   ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared},
+	}
+	providerCalls := 0
+	deps := codexQualificationDepsForTest(profile, admission, func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		providerCalls++
+		return zai.CodexRunReceipt{}, nil
+	})
+	baseSigner := newProviderNativeTestSigner()
+	deps.pinnedSigner = func(config.ProviderProfileConfig) (func(context.Context, []byte) (providerattestation.SignatureMetadata, error), error) {
+		return func(ctx context.Context, payload []byte) (providerattestation.SignatureMetadata, error) {
+			if bytes.Contains(payload, []byte(`"schema_version":"ntm.provider-codex-qualification-turn.v1"`)) {
+				return providerattestation.SignatureMetadata{}, errors.New("qualification-turn schema unsupported")
+			}
+			return baseSigner(ctx, payload)
+		}, nil
+	}
+	err = runProviderCodexQualification(&cobra.Command{}, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Minute}, profile, identity, deps)
+	if err == nil || !strings.Contains(err.Error(), "qualification-turn receipt schema support") || providerCalls != 0 || admission.acquires != 0 {
+		t.Fatalf("err=%v provider_calls=%d admission=%+v", err, providerCalls, admission)
+	}
+}
+
 func TestProviderCodexQualificationRejectsSignerChangeOnFinalReceipt(t *testing.T) {
 	profile := providerCodexProfile(t.TempDir())
 	identity, err := profile.Identity()
@@ -397,7 +427,7 @@ func TestProviderCodexQualificationRejectsSignerChangeOnFinalReceipt(t *testing.
 	deps.pinnedSigner = func(config.ProviderProfileConfig) (func(context.Context, []byte) (providerattestation.SignatureMetadata, error), error) {
 		return func(ctx context.Context, payload []byte) (providerattestation.SignatureMetadata, error) {
 			signCalls++
-			if signCalls <= 2 {
+			if signCalls <= 7 {
 				return firstSigner(ctx, payload)
 			}
 			return secondSigner(ctx, payload)
@@ -408,7 +438,7 @@ func TestProviderCodexQualificationRejectsSignerChangeOnFinalReceipt(t *testing.
 		return "/redacted/unexpected-final.json", nil
 	}
 	err = runProviderCodexQualification(&cobra.Command{}, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Minute}, profile, identity, deps)
-	if err == nil || !strings.Contains(err.Error(), "signer changed after preflight") || providerCalls != 4 || signCalls != 3 || finalStored || !codexQualificationWorkspaceRemoved(workspace) {
+	if err == nil || !strings.Contains(err.Error(), "signer changed after preflight") || providerCalls != 4 || signCalls != 8 || finalStored || !codexQualificationWorkspaceRemoved(workspace) {
 		t.Fatalf("err=%v provider_calls=%d sign_calls=%d final_stored=%t workspace=%+v", err, providerCalls, signCalls, finalStored, workspace)
 	}
 }
@@ -526,7 +556,7 @@ func TestProviderCodexQualificationRejectsSignerChangeOnIdentityPreflight(t *tes
 	deps.pinnedSigner = func(config.ProviderProfileConfig) (func(context.Context, []byte) (providerattestation.SignatureMetadata, error), error) {
 		return func(ctx context.Context, payload []byte) (providerattestation.SignatureMetadata, error) {
 			signCalls++
-			if signCalls == 1 {
+			if signCalls <= 3 {
 				return firstSigner(ctx, payload)
 			}
 			return secondSigner(ctx, payload)
@@ -541,7 +571,7 @@ func TestProviderCodexQualificationRejectsSignerChangeOnIdentityPreflight(t *tes
 		return "/redacted/unexpected.json", nil
 	}
 	err = runProviderCodexQualification(&cobra.Command{}, providerQualificationOptions{profile: "zai-codex", live: true, timeout: time.Second, suiteTimeout: time.Minute}, profile, identity, deps)
-	if err == nil || !strings.Contains(err.Error(), "signer changed after preflight") || providerCalls != 1 || signCalls != 2 || prepared || stored {
+	if err == nil || !strings.Contains(err.Error(), "signer changed after preflight") || providerCalls != 1 || signCalls != 4 || prepared || stored {
 		t.Fatalf("err=%v provider_calls=%d sign_calls=%d prepared=%t stored=%t", err, providerCalls, signCalls, prepared, stored)
 	}
 }
