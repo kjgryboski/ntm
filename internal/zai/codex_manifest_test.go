@@ -47,7 +47,7 @@ func writeCodexManifestFixture(t *testing.T) CodexManifestExpectation {
 	models = strings.Replace(models, "      \"default_verbosity\": null,\n", "", 1)
 	helperHash := sha256.Sum256([]byte("#!/bin/sh\nexit 1\n"))
 	binaryHash := sha256.Sum256([]byte("#!/bin/sh\nprintf 'codex-cli 0.149.0\\n'\n"))
-	descriptor := fmt.Sprintf("{\n  \"manifest_version\": %q,\n  \"provider\": \"zai\",\n  \"account_alias\": \"kevin\",\n  \"credential_class\": \"coding_plan\",\n  \"billing_class\": \"coding_plan\",\n  \"entitlement\": \"codex_responses\",\n  \"runtime\": \"codex\",\n  \"model\": \"glm-5.3\",\n  \"endpoint\": %q,\n  \"credential_id\": \"ntm.zai.coding_plan.kevin\",\n  \"broker_protocol\": \"ntm-provider-bridge-v1\",\n  \"bridge_sha256\": %q,\n  \"sync_policy\": \"host-local-metadata-only\"\n}\n", CodexManifestVersion, OfficialCodexEndpoint, hex.EncodeToString(helperHash[:]))
+	descriptor := fmt.Sprintf("{\n  \"manifest_version\": %q,\n  \"provider\": \"zai\",\n  \"account_alias\": \"kevin\",\n  \"credential_class\": \"coding_plan\",\n  \"billing_class\": \"coding_plan\",\n  \"entitlement\": \"codex_responses\",\n  \"runtime\": \"codex\",\n  \"model\": \"glm-5.3\",\n  \"endpoint\": %q,\n  \"credential_id\": \"ntm.zai.coding_plan.kevin\",\n  \"broker_protocol\": \"ntm-provider-bridge-v1\",\n  \"bridge_path\": %q,\n  \"bridge_sha256\": %q,\n  \"sync_policy\": \"host-local-metadata-only\"\n}\n", CodexManifestVersion, OfficialCodexEndpoint, bridge, hex.EncodeToString(helperHash[:]))
 	files := map[string][]byte{
 		"auth.json":      {},
 		"config.toml":    []byte(config),
@@ -59,20 +59,19 @@ func writeCodexManifestFixture(t *testing.T) CodexManifestExpectation {
 			t.Fatal(err)
 		}
 	}
-	hasher := sha256.New()
-	for _, name := range []string{"config.toml", "models.json", "zai-codex.json"} {
-		_, _ = hasher.Write([]byte(name))
-		_, _ = hasher.Write([]byte{0})
-		_, _ = hasher.Write(files[name])
-		_, _ = hasher.Write([]byte{0})
-	}
-	return CodexManifestExpectation{
-		RuntimeHome: runtimeHome, Account: "kevin", Model: "glm-5.3",
+	expectation := CodexManifestExpectation{
+		RuntimeHome: runtimeHome, Account: "kevin", Endpoint: OfficialCodexEndpoint, Model: "glm-5.3",
 		BrokerCredentialID: "ntm.zai.coding_plan.kevin", Binary: binary, BinarySHA256: hex.EncodeToString(binaryHash[:]),
 		BrokerCommand: helper, BrokerCommandSHA256: hex.EncodeToString(helperHash[:]),
 		CredentialBridgeCommand: bridge, CredentialBridgeCommandSHA256: hex.EncodeToString(helperHash[:]),
-		Version: "0.149.0", ConfigSHA256: hex.EncodeToString(hasher.Sum(nil)),
+		Version: "0.149.0",
 	}
+	digest, err := CAAMCodexManifestSHA256(expectation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectation.ConfigSHA256 = digest
+	return expectation
 }
 
 func TestAttestCodexManifestRejectsNonemptyAuthFile(t *testing.T) {
@@ -117,6 +116,24 @@ func TestAttestCodexManifestRejectsTamperAndWrongIdentity(t *testing.T) {
 				t.Fatal("tampered manifest was accepted")
 			}
 		})
+	}
+}
+
+func TestAttestCodexManifestRejectsDescriptorBridgePathAfterDigestRefresh(t *testing.T) {
+	expectation := writeCodexManifestFixture(t)
+	descriptorPath := filepath.Join(expectation.RuntimeHome, "zai-codex.json")
+	contents, err := os.ReadFile(descriptorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(descriptorPath, []byte(strings.Replace(string(contents), expectation.CredentialBridgeCommand, "/usr/local/libexec/ntm/substituted-bridge", 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CAAMCodexManifestSHA256(expectation); err == nil {
+		t.Fatal("canonical manifest verification accepted substituted bridge path")
+	}
+	if _, err := AttestCodexManifest(context.Background(), expectation); err == nil {
+		t.Fatal("descriptor bridge-path substitution retained manifest authority")
 	}
 }
 

@@ -416,7 +416,10 @@ type Result struct {
 	// FailureStage is a bounded controller label, never provider text. It lets
 	// operators distinguish setup/handshake/tooling failures without retaining
 	// stderr, RPC payloads, prompts, paths, or credentials.
-	FailureStage            string `json:"failure_stage,omitempty"`
+	FailureStage string `json:"failure_stage,omitempty"`
+	// ProviderRPCErrorCode retains only a JSON-RPC integer code. Provider
+	// messages and non-integer vendor payloads remain excluded from receipts.
+	ProviderRPCErrorCode    *int64 `json:"provider_rpc_error_code,omitempty"`
 	ProviderSessionID       string `json:"provider_session_id,omitempty"`
 	StopReason              string `json:"stop_reason,omitempty"`
 	CompletionConfirmed     bool   `json:"completion_confirmed"`
@@ -1032,6 +1035,7 @@ func exitCodeFromError(err error) (int, bool) {
 func finishFailure(result Result, code ErrorCode, err error) (Result, error) {
 	result.Success = false
 	result.FailureCode = code
+	result.ProviderRPCErrorCode = providerRPCErrorCode(err)
 	result.State = StateFailed
 	if code == ErrTimeout {
 		result.State = StateAbortedSafe
@@ -1048,6 +1052,7 @@ func finishFailure(result Result, code ErrorCode, err error) (Result, error) {
 func finishCancellationFailure(result Result, code ErrorCode, err error) (Result, error) {
 	result.Success = false
 	result.FailureCode = code
+	result.ProviderRPCErrorCode = providerRPCErrorCode(err)
 	if code == ErrCancelled {
 		result.State = StateCancelled
 	} else {
@@ -1577,7 +1582,7 @@ func consumeResponseEvent(event rpcEvent, requestID int, updates *updateAccumula
 		return nil, false, fmt.Errorf("unexpected ACP response id %s, want %s", string(event.message.ID), wantID)
 	}
 	if event.message.Error != nil {
-		return nil, false, &providerError{message: event.message.Error.Message}
+		return nil, false, &providerError{message: event.message.Error.Message, code: parseRPCErrorCode(event.message.Error.Code)}
 	}
 	if len(event.message.Result) == 0 {
 		return nil, false, errors.New("ACP response omitted both result and error")
@@ -1595,7 +1600,10 @@ func isBenignACPNotification(message rpcMessage) bool {
 	return len(message.ID) == 0 && strings.HasPrefix(message.Method, "_x.ai/")
 }
 
-type providerError struct{ message string }
+type providerError struct {
+	message string
+	code    *int64
+}
 
 func (e *providerError) Error() string {
 	if e == nil || e.message == "" {
@@ -1607,6 +1615,23 @@ func (e *providerError) Error() string {
 func isRPCError(err error) bool {
 	var provider *providerError
 	return errors.As(err, &provider)
+}
+
+func parseRPCErrorCode(raw json.RawMessage) *int64 {
+	var code int64
+	if len(raw) == 0 || json.Unmarshal(raw, &code) != nil {
+		return nil
+	}
+	return &code
+}
+
+func providerRPCErrorCode(err error) *int64 {
+	var provider *providerError
+	if !errors.As(err, &provider) || provider == nil || provider.code == nil {
+		return nil
+	}
+	code := *provider.code
+	return &code
 }
 
 type updateAccumulator struct {

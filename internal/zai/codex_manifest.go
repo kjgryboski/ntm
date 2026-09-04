@@ -21,7 +21,10 @@ import (
 )
 
 const (
-	CodexManifestVersion                 = "caam.zai-codex.v1"
+	// CodexManifestVersion is CAAM's current descriptor/metadata contract.
+	// NTM must not accept the earlier v1 descriptor: it did not bind the
+	// trusted credential-bridge path.
+	CodexManifestVersion                 = "caam.zai-codex.v2"
 	CodexObservePermissionProfile        = "zai_observe"
 	CodexWorkspaceWritePermissionProfile = "zai_workspace_write"
 	codexPermissionGlobScanMaxDepth      = 8
@@ -30,6 +33,7 @@ const (
 type CodexManifestExpectation struct {
 	RuntimeHome                   string
 	Account                       string
+	Endpoint                      string
 	Model                         string
 	BrokerCredentialID            string
 	Binary                        string
@@ -103,6 +107,7 @@ type codexDescriptor struct {
 	Endpoint        string `json:"endpoint"`
 	CredentialID    string `json:"credential_id"`
 	BrokerProtocol  string `json:"broker_protocol"`
+	BridgePath      string `json:"bridge_path"`
 	BridgeSHA256    string `json:"bridge_sha256"`
 	SyncPolicy      string `json:"sync_policy"`
 }
@@ -162,7 +167,7 @@ type codexProviderConfig struct {
 
 func AttestCodexManifest(ctx context.Context, e CodexManifestExpectation) (CodexManifestAttestation, error) {
 	var out CodexManifestAttestation
-	if ctx == nil || !filepath.IsAbs(e.RuntimeHome) || !filepath.IsAbs(e.Binary) || !filepath.IsAbs(e.BrokerCommand) || !filepath.IsAbs(e.CredentialBridgeCommand) || !validManifestDigest(e.ConfigSHA256) || !validManifestDigest(e.BinarySHA256) || !validManifestDigest(e.BrokerCommandSHA256) || !validManifestDigest(e.CredentialBridgeCommandSHA256) || strings.TrimSpace(e.Account) == "" || strings.TrimSpace(e.Model) == "" || strings.TrimSpace(e.BrokerCredentialID) == "" || strings.TrimSpace(e.Version) == "" {
+	if ctx == nil || !filepath.IsAbs(e.RuntimeHome) || !filepath.IsAbs(e.Binary) || !filepath.IsAbs(e.BrokerCommand) || !filepath.IsAbs(e.CredentialBridgeCommand) || !validManifestDigest(e.ConfigSHA256) || !validManifestDigest(e.BinarySHA256) || !validManifestDigest(e.BrokerCommandSHA256) || !validManifestDigest(e.CredentialBridgeCommandSHA256) || !canonicalCodexAccount(e.Account) || strings.TrimSpace(e.Endpoint) != OfficialCodexEndpoint || strings.TrimSpace(e.Model) == "" || strings.TrimSpace(e.BrokerCredentialID) == "" || strings.TrimSpace(e.Version) == "" {
 		return out, errors.New("invalid Codex manifest expectation")
 	}
 	if err := validateIsolatedCodexHome(e.RuntimeHome); err != nil {
@@ -171,42 +176,16 @@ func AttestCodexManifest(ctx context.Context, e CodexManifestExpectation) (Codex
 	if err := validateCodexAuthBoundary(e.RuntimeHome); err != nil {
 		return out, err
 	}
-	names := []string{"config.toml", "models.json", "zai-codex.json"}
-	files := make(map[string][]byte, len(names))
-	hasher := sha256.New()
-	for _, n := range names {
-		p := filepath.Join(e.RuntimeHome, n)
-		b, err := regularFile(p)
-		if err != nil {
-			return out, err
-		}
-		files[n] = b
-		_, _ = hasher.Write([]byte(n))
-		_, _ = hasher.Write([]byte{0})
-		_, _ = hasher.Write(b)
-		_, _ = hasher.Write([]byte{0})
+	files, configSHA256, err := caamCodexManifestFilesAndSHA256(e)
+	if err != nil {
+		return out, err
 	}
-	out.ConfigSHA256 = hex.EncodeToString(hasher.Sum(nil))
+	if err := validateCAAMCodexManifestFiles(files, e); err != nil {
+		return out, err
+	}
+	out.ConfigSHA256 = configSHA256
 	if out.ConfigSHA256 != e.ConfigSHA256 {
 		return out, errors.New("Codex manifest digest mismatch")
-	}
-	var models codexModels
-	if err := decodeStrictJSON(files["models.json"], &models); err != nil || !validCodexModelCatalog(models, e.Model) {
-		return out, errors.New("invalid Codex models manifest")
-	}
-	var descriptor codexDescriptor
-	if err := decodeStrictJSON(files["zai-codex.json"], &descriptor); err != nil || descriptor.ManifestVersion != CodexManifestVersion || descriptor.Provider != "zai" || descriptor.AccountAlias != e.Account || descriptor.CredentialClass != "coding_plan" || descriptor.BillingClass != "coding_plan" || descriptor.Entitlement != "codex_responses" || descriptor.Runtime != "codex" || descriptor.Model != e.Model || descriptor.Endpoint != OfficialCodexEndpoint || descriptor.CredentialID != e.BrokerCredentialID || descriptor.BrokerProtocol != "ntm-provider-bridge-v1" || descriptor.BridgeSHA256 != e.CredentialBridgeCommandSHA256 || descriptor.SyncPolicy != "host-local-metadata-only" {
-		return out, errors.New("invalid Codex broker descriptor")
-	}
-	var cfg codexConfig
-	metadata, err := toml.Decode(string(files["config.toml"]), &cfg)
-	if err != nil || len(metadata.Undecoded()) != 0 {
-		return out, errors.New("invalid Codex config")
-	}
-	p, ok := cfg.Providers["zai"]
-	wantExclude := []string{"ZAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_*", "XAI_*", "*TOKEN*", "*SECRET*", "*PASSWORD*", "*KEY*", "CODEX_HOME"}
-	if !ok || len(cfg.Providers) != 1 || cfg.CLIAuthCredentialsStore != "ephemeral" || cfg.ModelProvider != "zai" || cfg.Model != e.Model || cfg.ModelCatalogJSON != "~/.codex/models.json" || cfg.ModelReasoningEffort != "max" || cfg.ApprovalPolicy != "never" || cfg.AllowLoginShell == nil || *cfg.AllowLoginShell || cfg.CheckForUpdateOnStartup == nil || *cfg.CheckForUpdateOnStartup || cfg.DefaultPermissions != CodexObservePermissionProfile || cfg.History.Persistence != "none" || cfg.ShellEnvironmentPolicy.Inherit != "core" || cfg.ShellEnvironmentPolicy.IgnoreDefaultExcludes == nil || *cfg.ShellEnvironmentPolicy.IgnoreDefaultExcludes || !equalCodexStrings(cfg.ShellEnvironmentPolicy.Exclude, wantExclude) || !validCodexPermissionProfiles(cfg.Permissions) || p.Name != "Z.ai Coding Plan" || p.BaseURL != OfficialCodexEndpoint || p.EnvKey != "ZAI_API_KEY" || p.WireAPI != "responses" {
-		return out, errors.New("invalid Codex provider config")
 	}
 	helper, err := regularExecutable(e.BrokerCommand)
 	if err != nil {
@@ -249,6 +228,28 @@ func AttestCodexManifest(ctx context.Context, e CodexManifestExpectation) (Codex
 	}
 	out.RuntimeVersion = e.Version
 	return out, nil
+}
+
+func validateCAAMCodexManifestFiles(files map[string][]byte, e CodexManifestExpectation) error {
+	var models codexModels
+	if err := decodeStrictJSON(files["models.json"], &models); err != nil || !validCodexModelCatalog(models, e.Model) {
+		return errors.New("invalid Codex models manifest")
+	}
+	var descriptor codexDescriptor
+	if err := decodeStrictJSON(files["zai-codex.json"], &descriptor); err != nil || descriptor.ManifestVersion != CodexManifestVersion || descriptor.Provider != "zai" || descriptor.AccountAlias != e.Account || descriptor.CredentialClass != "coding_plan" || descriptor.BillingClass != "coding_plan" || descriptor.Entitlement != "codex_responses" || descriptor.Runtime != "codex" || descriptor.Model != e.Model || descriptor.Endpoint != e.Endpoint || descriptor.CredentialID != e.BrokerCredentialID || descriptor.BrokerProtocol != "ntm-provider-bridge-v1" || descriptor.BridgePath != e.CredentialBridgeCommand || descriptor.BridgeSHA256 != e.CredentialBridgeCommandSHA256 || descriptor.SyncPolicy != "host-local-metadata-only" {
+		return errors.New("invalid Codex broker descriptor")
+	}
+	var cfg codexConfig
+	metadata, err := toml.Decode(string(files["config.toml"]), &cfg)
+	if err != nil || len(metadata.Undecoded()) != 0 {
+		return errors.New("invalid Codex config")
+	}
+	p, ok := cfg.Providers["zai"]
+	wantExclude := []string{"ZAI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_*", "XAI_*", "*TOKEN*", "*SECRET*", "*PASSWORD*", "*KEY*", "CODEX_HOME"}
+	if !ok || len(cfg.Providers) != 1 || cfg.CLIAuthCredentialsStore != "ephemeral" || cfg.ModelProvider != "zai" || cfg.Model != e.Model || cfg.ModelCatalogJSON != "~/.codex/models.json" || cfg.ModelReasoningEffort != "max" || cfg.ApprovalPolicy != "never" || cfg.AllowLoginShell == nil || *cfg.AllowLoginShell || cfg.CheckForUpdateOnStartup == nil || *cfg.CheckForUpdateOnStartup || cfg.DefaultPermissions != CodexObservePermissionProfile || cfg.History.Persistence != "none" || cfg.ShellEnvironmentPolicy.Inherit != "core" || cfg.ShellEnvironmentPolicy.IgnoreDefaultExcludes == nil || *cfg.ShellEnvironmentPolicy.IgnoreDefaultExcludes || !equalCodexStrings(cfg.ShellEnvironmentPolicy.Exclude, wantExclude) || !validCodexPermissionProfiles(cfg.Permissions) || p.Name != "Z.ai Coding Plan" || p.BaseURL != e.Endpoint || p.EnvKey != "ZAI_API_KEY" || p.WireAPI != "responses" {
+		return errors.New("invalid Codex provider config")
+	}
+	return nil
 }
 
 func validCodexModelCatalog(catalog codexModels, model string) bool {
@@ -359,6 +360,68 @@ func decodeStrictJSON(data []byte, target any) error {
 		return errors.New("JSON contains trailing data")
 	}
 	return nil
+}
+
+// CAAMCodexManifestSHA256 computes CAAM's v2 Z.ai Codex manifest over the
+// exact profile metadata and the three private runtime files. It is the one
+// digest contract used by both configuration admission and live attestation.
+// It also validates every structured managed file against the expectation so
+// callers cannot bless a self-consistent digest for conflicting identity data.
+func CAAMCodexManifestSHA256(e CodexManifestExpectation) (string, error) {
+	files, digest, err := caamCodexManifestFilesAndSHA256(e)
+	if err != nil {
+		return "", err
+	}
+	if err := validateCAAMCodexManifestFiles(files, e); err != nil {
+		return "", err
+	}
+	return digest, nil
+}
+
+func caamCodexManifestFilesAndSHA256(e CodexManifestExpectation) (map[string][]byte, string, error) {
+	if !filepath.IsAbs(e.RuntimeHome) || filepath.Base(filepath.Clean(e.RuntimeHome)) != ".codex" || !canonicalCodexAccount(e.Account) || strings.TrimSpace(e.Endpoint) != OfficialCodexEndpoint || strings.TrimSpace(e.Model) == "" || strings.TrimSpace(e.BrokerCredentialID) == "" || !filepath.IsAbs(e.CredentialBridgeCommand) || !validManifestDigest(e.CredentialBridgeCommandSHA256) {
+		return nil, "", errors.New("invalid CAAM v2 Codex manifest binding")
+	}
+	endpoint := strings.TrimRight(strings.TrimSpace(e.Endpoint), "/")
+	capacity := sha256.New()
+	for _, field := range []string{"zai", e.Account, endpoint, "coding_plan", "coding_plan", "codex_responses"} {
+		_, _ = capacity.Write([]byte(field))
+		_, _ = capacity.Write([]byte{0})
+	}
+	fields := []string{
+		"caam.zai-codex.manifest.v2", "zai-codex", CodexManifestVersion, "zai",
+		e.Account, "coding_plan", "coding_plan", "codex_responses", "codex", endpoint,
+		strings.TrimSpace(e.Model), strings.TrimSpace(e.BrokerCredentialID),
+		"subscription:" + hex.EncodeToString(capacity.Sum(nil)), "host-local-metadata-only",
+		e.CredentialBridgeCommand, e.CredentialBridgeCommandSHA256,
+	}
+	hasher := sha256.New()
+	for _, field := range fields {
+		_, _ = hasher.Write([]byte(field))
+		_, _ = hasher.Write([]byte{0})
+	}
+	files := make(map[string][]byte, 3)
+	for _, name := range []string{"config.toml", "models.json", "zai-codex.json"} {
+		path := filepath.Join(e.RuntimeHome, name)
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+			return nil, "", fmt.Errorf("CAAM v2 Codex manifest file %s is not a private regular file", name)
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return nil, "", fmt.Errorf("read CAAM v2 Codex manifest file %s: %w", name, err)
+		}
+		files[name] = contents
+		_, _ = hasher.Write([]byte(name))
+		_, _ = hasher.Write([]byte{0})
+		_, _ = hasher.Write(contents)
+		_, _ = hasher.Write([]byte{0})
+	}
+	return files, hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func canonicalCodexAccount(value string) bool {
+	return value != "" && strings.TrimSpace(value) == value && strings.ToLower(value) == value
 }
 
 func validManifestDigest(value string) bool {

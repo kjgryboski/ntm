@@ -96,7 +96,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	defer suiteCancel()
 	// All three preflights deliberately occur before creating a worktree or
 	// requesting a token. The status bridge exposes no credential material.
-	manifestExpectation := zai.CodexManifestExpectation{RuntimeHome: profile.RuntimeHome, Account: identity.AccountAlias(), Model: identity.Model(), BrokerCredentialID: profile.BrokerCredentialID, Binary: profile.Command, BinarySHA256: profile.RuntimeSHA256, BrokerCommand: profile.BrokerCommand, BrokerCommandSHA256: profile.BrokerCommandSHA256, CredentialBridgeCommand: profile.CredentialBridgeCommand, CredentialBridgeCommandSHA256: profile.CredentialBridgeCommandSHA256, Version: profile.RuntimeVersion, ConfigSHA256: profile.ConfigSHA256}
+	manifestExpectation := zai.CodexManifestExpectation{RuntimeHome: profile.RuntimeHome, Account: identity.AccountAlias(), Endpoint: identity.Endpoint(), Model: identity.Model(), BrokerCredentialID: profile.BrokerCredentialID, Binary: profile.Command, BinarySHA256: profile.RuntimeSHA256, BrokerCommand: profile.BrokerCommand, BrokerCommandSHA256: profile.BrokerCommandSHA256, CredentialBridgeCommand: profile.CredentialBridgeCommand, CredentialBridgeCommandSHA256: profile.CredentialBridgeCommandSHA256, Version: profile.RuntimeVersion, ConfigSHA256: profile.ConfigSHA256}
 	manifest, err := deps.attest(ctx, manifestExpectation)
 	if err != nil {
 		return fmt.Errorf("Codex qualification manifest attestation failed: %w", err)

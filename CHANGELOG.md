@@ -13,6 +13,30 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
 
 ## [Unreleased]
 
+### Security
+
+- **Z.ai Codex admission now shares CAAM's v2 manifest contract.** NTM
+  recomputes the versioned identity/file digest and strictly validates the
+  endpoint, account, model, credential id, bridge path/digest, policy, and
+  model catalog before a brokered Coding Plan run. Legacy v1 profiles and
+  self-consistent descriptor substitutions fail closed.
+- **Provider lifecycle promotion now requires provider-scope authority.** A
+  signed receipt cannot promote lifecycle work when cancellation or cleanup is
+  only local-process, local-client, or ACP-agent evidence. Current Grok and
+  Z.ai transports therefore remain lifecycle `NO_GO` without overstating local
+  process control as cloud acknowledgement.
+- **Pinned Windows receipt signing is descriptor-executed.** WSL opens and
+  hashes the root-owned bridge, verifies every parent directory, and executes
+  that exact file descriptor, closing the path-replacement interval between
+  verification and invocation.
+
+### Fixed
+
+- Grok live qualification now takes one shared capacity lease per provider
+  request instead of holding one lease across a multi-turn lineage suite, and
+  preserves only an integer JSON-RPC failure code alongside bounded redacted
+  failure metadata.
+
 ---
 
 ## [v1.31.0] -- 2026-09-01 [GitHub Release]

@@ -894,50 +894,20 @@ func (p ProviderProfileConfig) CAAMCompatibleManifestSHA256() (string, error) {
 	if p.Provider != "zai" || p.Runtime != "codex" || p.CredentialClass != provider.CredentialClassCodingPlan || p.BillingClass != provider.BillingClassCodingPlan || p.Entitlement != provider.EntitlementCodexResponses {
 		return "", errors.New("CAAM manifest projection requires a Z.ai Coding Plan Codex profile")
 	}
-	runtimeHome := filepath.Clean(strings.TrimSpace(p.RuntimeHome))
-	if filepath.Base(runtimeHome) != ".codex" || !filepath.IsAbs(runtimeHome) {
-		return "", errors.New("Z.ai Codex runtime_home must be the absolute private .codex directory")
-	}
-	endpoint := strings.TrimRight(strings.TrimSpace(p.Endpoint), "/")
 	accountAlias, err := canonicalCAAMZaiCodexAccountAlias(p.AccountAlias)
 	if err != nil {
 		return "", err
 	}
-	bridgePath := strings.TrimSpace(p.CredentialBridgeCommand)
-	bridgeSHA := strings.ToLower(strings.TrimSpace(p.CredentialBridgeCommandSHA256))
-	capacityFields := []string{"zai", accountAlias, endpoint, "coding_plan", "coding_plan", "codex_responses"}
-	capacity := sha256.New()
-	for _, field := range capacityFields {
-		_, _ = capacity.Write([]byte(field))
-		_, _ = capacity.Write([]byte{0})
-	}
-	fields := []string{
-		"caam.zai-codex.manifest.v2", "zai-codex", "caam.zai-codex.v2", "zai",
-		accountAlias, "coding_plan", "coding_plan", "codex_responses",
-		"codex", endpoint, strings.TrimSpace(p.Model), strings.TrimSpace(p.BrokerCredentialID),
-		"subscription:" + hex.EncodeToString(capacity.Sum(nil)), "host-local-metadata-only", bridgePath, bridgeSHA,
-	}
-	h := sha256.New()
-	for _, field := range fields {
-		_, _ = h.Write([]byte(field))
-		_, _ = h.Write([]byte{0})
-	}
-	for _, name := range []string{"config.toml", "models.json", "zai-codex.json"} {
-		path := filepath.Join(runtimeHome, name)
-		info, err := os.Lstat(path)
-		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
-			return "", fmt.Errorf("Z.ai Codex manifest file %s is not a private regular file", name)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return "", fmt.Errorf("read Z.ai Codex manifest file %s: %w", name, err)
-		}
-		_, _ = h.Write([]byte(name))
-		_, _ = h.Write([]byte{0})
-		_, _ = h.Write(data)
-		_, _ = h.Write([]byte{0})
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	digest, err := zai.CAAMCodexManifestSHA256(zai.CodexManifestExpectation{
+		RuntimeHome:                   p.RuntimeHome,
+		Account:                       accountAlias,
+		Endpoint:                      p.Endpoint,
+		Model:                         p.Model,
+		BrokerCredentialID:            p.BrokerCredentialID,
+		CredentialBridgeCommand:       p.CredentialBridgeCommand,
+		CredentialBridgeCommandSHA256: p.CredentialBridgeCommandSHA256,
+	})
+	return digest, err
 }
 
 // VerifyCanonicalManifest rejects a hand-entered configuration digest when it

@@ -48,6 +48,12 @@ func authorizeProviderOperationWithDependencies(input providerOperationAuthoriza
 	if !validProviderOperation(operation) || deps.load == nil || deps.now == nil || !input.Identity.Valid() || strings.TrimSpace(input.Transport) == "" || !validProviderNativeDigest(input.PolicySHA256) || strings.TrimSpace(input.RuntimeVersion) == "" || !validProviderNativeDigest(input.RuntimeSHA256) || input.MaxQualificationAge <= 0 {
 		return "", errors.New("provider operation authorization input is incomplete")
 	}
+	if operation == providerOperationLifecycle {
+		capability, ok := provider.CapabilityMatrix()[input.Transport]
+		if !ok || !providerLifecycleFullyAuthoritative(capability) {
+			return "", errors.New("provider lifecycle dispatch is unavailable because cancellation and cleanup are not provider-authoritative for this transport")
+		}
+	}
 	receipt, _, err := deps.load(input.QualificationDir, input.Identity.Hash(), input.Transport)
 	if err != nil {
 		return "", fmt.Errorf("%s dispatch requires a current signed live qualification: %w", operation, err)

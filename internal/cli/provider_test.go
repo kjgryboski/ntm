@@ -635,6 +635,77 @@ func TestProviderSessionOperationGateBlocksDispatchBeforeAdmission(t *testing.T)
 	}
 }
 
+func TestProviderSessionLifecycleAuthorityBlocksSignedHeadlessQualificationBeforeRunner(t *testing.T) {
+	profile := providerTestGrokProfile(agent.DefaultGrokAutomationPolicyName)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1_800_000_000, 0).UTC()
+	checks := make([]providerqualification.Check, 0, len(providerqualification.GrokRequiredChecks()))
+	for _, name := range providerqualification.GrokRequiredChecks() {
+		checks = append(checks, providerqualification.Check{
+			Name: name, Passed: true, Provenance: "live", EvidenceSHA256: providerTestHash("headless-" + name),
+			Detail: "syntactically valid signed lifecycle qualification fixture",
+		})
+	}
+	receipt := providerqualification.Receipt{
+		Mode: providerqualification.ModeLive, Provider: "xai", Transport: "xai_headless_session",
+		IdentitySHA256: identity.Hash(), PolicySHA256: agent.GrokAutomationPolicySHA256(profile.AutomationPolicy),
+		RuntimeVersion: profile.RuntimeVersion, RuntimeSHA256: providerTestHash("grok-binary"),
+		StartedAt: now.Add(-time.Minute), CompletedAt: now, DisposableRepoHash: providerTestHash("disposable-worktree"), Checks: checks,
+	}
+	if err := receipt.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	signer := newProviderNativeTestSigner()
+	payload, err := receipt.CanonicalPayload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature, err := signer(context.Background(), payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := receipt.AttachAttestation(signature); err != nil || receipt.Validate() != nil || !receipt.Passed {
+		t.Fatalf("signed lifecycle fixture was not valid: attach=%v validate=%v receipt=%+v", err, receipt.Validate(), receipt)
+	}
+
+	admission := &providerSessionAdmissionFake{
+		decision: ratelimit.Decision{Allowed: true, NoFailover: true},
+		status:   ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared},
+	}
+	deps := providerSessionTestDeps(t, profile, admission)
+	deps.sign = signer
+	deps.attestationPreflight = func(ctx context.Context) error {
+		return providerSessionAttestationPreflightWithSigner(ctx, signer)
+	}
+	qualificationLoaded := false
+	deps.authorizeOperation = func(request providerOperationAuthorization) (string, error) {
+		return authorizeProviderOperationWithDependencies(request, providerOperationAuthorizationDependencies{
+			load: func(string, string, string) (providerqualification.Receipt, string, error) {
+				qualificationLoaded = true
+				return receipt, "signed-headless-lifecycle.json", nil
+			},
+			now: func() time.Time { return now.Add(time.Minute) },
+		})
+	}
+	deps.run = func(context.Context, grok.LifecycleRunner, grok.SessionRequest) (grok.SessionReceipt, error) {
+		t.Fatal("a signed qualification bypassed the provider-scope lifecycle authority boundary")
+		return grok.SessionReceipt{}, nil
+	}
+
+	err = runProviderSession(&cobra.Command{}, grok.SessionResume, providerSessionOptions{
+		profile: "grok-qualified", sessionID: "parent", prompt: "bounded", cwd: t.TempDir(), timeout: time.Second,
+	}, deps)
+	if err == nil || !strings.Contains(err.Error(), "not provider-authoritative") {
+		t.Fatalf("err=%v", err)
+	}
+	if qualificationLoaded || admission.acquires != 0 || admission.releases != 0 || admission.successes != 0 {
+		t.Fatalf("signed receipt reached dispatch path: loaded=%v admission=%+v", qualificationLoaded, admission)
+	}
+}
+
 func TestProviderSessionOutputSignatureBindsCompletedReceipt(t *testing.T) {
 	output := providerSessionOutput{
 		SchemaVersion: providerSessionSchema, Success: true, Dispatched: true, Profile: "grok-qualified", Transport: "xai_headless_session",

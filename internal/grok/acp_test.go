@@ -732,11 +732,27 @@ func TestRunReportsBoundedSessionNewFailureStage(t *testing.T) {
 	}, "\n") + "\n"
 	result, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader("diagnostic body must not be retained"))}, Request{Prompt: "hello", CWD: "/repo"})
 	assertCode(t, err, ErrProvider)
-	if result.FailureStage != "session_new" || result.ProviderSessionID != "" || result.Stderr.SHA256 == "" {
+	if result.FailureStage != "session_new" || result.ProviderSessionID != "" || result.Stderr.SHA256 == "" || result.ProviderRPCErrorCode == nil || *result.ProviderRPCErrorCode != -32000 {
 		t.Fatalf("result = %+v", result)
 	}
 	if strings.Contains(string(mustJSON(t, result)), "redacted provider setup failure") || strings.Contains(string(mustJSON(t, result)), "diagnostic body") {
 		t.Fatal("bounded failure diagnostics retained provider text")
+	}
+}
+
+func TestRunOmitsNonIntegerProviderErrorCode(t *testing.T) {
+	transcript := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}]}}`,
+		`{"jsonrpc":"2.0","id":2,"result":{}}`,
+		`{"jsonrpc":"2.0","id":3,"error":{"code":"account-secret-shaped-code","message":"private provider text"}}`,
+	}, "\n") + "\n"
+	result, err := Run(t.Context(), &fakeRunner{proc: newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))}, Request{Prompt: "hello", CWD: "/repo"})
+	assertCode(t, err, ErrProvider)
+	if result.ProviderRPCErrorCode != nil {
+		t.Fatalf("non-integer provider error code was retained: %+v", result.ProviderRPCErrorCode)
+	}
+	if strings.Contains(string(mustJSON(t, result)), "account-secret-shaped-code") || strings.Contains(string(mustJSON(t, result)), "private provider text") {
+		t.Fatal("provider error payload leaked into receipt")
 	}
 }
 

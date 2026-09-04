@@ -61,6 +61,88 @@ func grokQualificationDepsForTest(t *testing.T, profile config.ProviderProfileCo
 	return deps, admission, &stored, &request, &calls
 }
 
+type providerGrokQualificationAdmissionFake struct {
+	decisions                     []ratelimit.Decision
+	acquires, releases, successes int
+}
+
+func (f *providerGrokQualificationAdmissionFake) Acquire(provider.Identity) ratelimit.Decision {
+	f.acquires++
+	if len(f.decisions) == 0 {
+		return ratelimit.Decision{NoFailover: true}
+	}
+	decision := f.decisions[0]
+	if len(f.decisions) > 1 {
+		f.decisions = f.decisions[1:]
+	}
+	return decision
+}
+
+func (f *providerGrokQualificationAdmissionFake) Release(provider.Identity, ratelimit.Decision) {
+	f.releases++
+}
+
+func (f *providerGrokQualificationAdmissionFake) RecordSuccess(provider.Identity) {
+	f.successes++
+}
+
+func (f *providerGrokQualificationAdmissionFake) CapacityStatus() ratelimit.CapacityStatus {
+	return ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}
+}
+
+func TestAcquireProviderGrokQualificationTurnWaitsForExactIdentityCapacity(t *testing.T) {
+	profile := providerTestGrokProfile(agent.DefaultGrokAutomationPolicyName)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryAt := time.Now().Add(time.Millisecond)
+	admission := &providerGrokQualificationAdmissionFake{decisions: []ratelimit.Decision{
+		{Reason: ratelimit.ErrorRateLimited, RetryAt: &retryAt, NoFailover: true},
+		{Allowed: true, NoFailover: true},
+	}}
+	decision, err := acquireProviderGrokQualificationTurn(t.Context(), admission, identity)
+	if err != nil || !decision.Allowed || !decision.NoFailover {
+		t.Fatalf("decision=%+v err=%v", decision, err)
+	}
+	if admission.acquires != 2 || admission.releases != 0 || admission.successes != 0 {
+		t.Fatalf("admission=%+v", admission)
+	}
+}
+
+func TestAcquireProviderGrokQualificationTurnContextExpiryDoesNotRelease(t *testing.T) {
+	profile := providerTestGrokProfile(agent.DefaultGrokAutomationPolicyName)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryAt := time.Now().Add(time.Hour)
+	admission := &providerGrokQualificationAdmissionFake{decisions: []ratelimit.Decision{{Reason: ratelimit.ErrorRateLimited, RetryAt: &retryAt, NoFailover: true}}}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := acquireProviderGrokQualificationTurn(ctx, admission, identity); err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context cancellation", err)
+	}
+	if admission.acquires != 1 || admission.releases != 0 || admission.successes != 0 {
+		t.Fatalf("admission=%+v", admission)
+	}
+}
+
+func TestAcquireProviderGrokQualificationTurnRejectsAllowedFailoverAndReleasesLease(t *testing.T) {
+	profile := providerTestGrokProfile(agent.DefaultGrokAutomationPolicyName)
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := &providerGrokQualificationAdmissionFake{decisions: []ratelimit.Decision{{Allowed: true, NoFailover: false}}}
+	if _, err := acquireProviderGrokQualificationTurn(t.Context(), admission, identity); err == nil || !strings.Contains(err.Error(), "did not prohibit provider failover") {
+		t.Fatalf("err=%v", err)
+	}
+	if admission.acquires != 1 || admission.releases != 1 || admission.successes != 0 {
+		t.Fatalf("admission=%+v", admission)
+	}
+}
+
 func TestProviderGrokQualificationProducesHonestObserveOnlyNoGoReceipt(t *testing.T) {
 	profile := providerTestGrokProfile(agent.DefaultGrokAutomationPolicyName)
 	identity, err := profile.Identity()
@@ -84,7 +166,7 @@ func TestProviderGrokQualificationProducesHonestObserveOnlyNoGoReceipt(t *testin
 	if !errors.As(err, &exit) {
 		t.Fatalf("err=%v, want NO-GO exit", err)
 	}
-	if *calls != 1 || admission.acquires != 1 || admission.releases != 1 || admission.successes != 0 {
+	if *calls != 1 || admission.acquires != 1 || admission.releases != 1 || admission.successes != 1 {
 		t.Fatalf("calls=%d admission=%+v", *calls, admission)
 	}
 	if request.ExpectedNonce != "NTM_ACK_GROK_QUALIFICATION" || request.Model != identity.Model() || request.RuntimeVersion != profile.RuntimeVersion || request.CWD != "/qualification" || request.Binary != "/usr/local/bin/grok" || request.RuntimeHome != profile.RuntimeHome || len(request.AutomationPolicyArgs) == 0 {
@@ -417,7 +499,7 @@ func TestProviderGrokHeadlessLineageQualificationProducesSignedPartialReceipt(t 
 	if !errors.As(err, &exit) {
 		t.Fatalf("err=%v, want partial qualification exit", err)
 	}
-	if *calls != 1 || sessionCalls != 2 || cleanups != 1 || admission.acquires != 1 || admission.releases != 1 || admission.successes != 0 {
+	if *calls != 1 || sessionCalls != 2 || cleanups != 1 || admission.acquires != 3 || admission.releases != 3 || admission.successes != 3 {
 		t.Fatalf("ACP=%d sessions=%d cleanups=%d admission=%+v", *calls, sessionCalls, cleanups, admission)
 	}
 	if stored.Transport != "xai_headless_session" || stored.Passed || stored.Validate() != nil {

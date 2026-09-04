@@ -277,3 +277,34 @@ func TestAuthorizeProviderOperationPromotesOnlyQualifiedGrokWorkspaceOperations(
 		t.Fatalf("locally asserted Grok identity was accepted: digest=%q err=%v", digest, err)
 	}
 }
+
+func TestAuthorizeProviderOperationRejectsLifecycleWhenAuthorityIsOnlyLocal(t *testing.T) {
+	for _, transport := range []string{"xai_acp", "xai_headless_session", "zai_codex_runtime"} {
+		t.Run(transport, func(t *testing.T) {
+			profile := providerTestGrokProfile(agent.GrokWorkspaceWritePolicyName)
+			identity, err := profile.Identity()
+			if err != nil {
+				t.Fatal(err)
+			}
+			loaded := false
+			_, err = authorizeProviderOperationWithDependencies(providerOperationAuthorization{
+				Identity: identity, Transport: transport,
+				PolicySHA256: strings.Repeat("a", 64), RuntimeVersion: profile.RuntimeVersion,
+				RuntimeSHA256: strings.Repeat("b", 64), Operation: providerOperationLifecycle,
+				MaxQualificationAge: time.Hour,
+			}, providerOperationAuthorizationDependencies{
+				load: func(string, string, string) (providerqualification.Receipt, string, error) {
+					loaded = true
+					return providerqualification.Receipt{}, "", nil
+				},
+				now: time.Now,
+			})
+			if err == nil || !strings.Contains(err.Error(), "not provider-authoritative") {
+				t.Fatalf("lifecycle authority error = %v", err)
+			}
+			if loaded {
+				t.Fatal("qualification receipt was consulted after the static authority boundary failed")
+			}
+		})
+	}
+}

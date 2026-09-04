@@ -16,7 +16,7 @@ import (
 
 const providerProfileTestHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-func TestCAAMCompatibleZaiCodexManifestBindsPrivateFilesAndBridge(t *testing.T) {
+func TestCAAMCompatibleZaiCodexManifestRejectsMalformedPrivateFiles(t *testing.T) {
 	root := t.TempDir()
 	runtimeHome := filepath.Join(root, ".codex")
 	if err := os.MkdirAll(runtimeHome, 0o700); err != nil {
@@ -34,19 +34,11 @@ func TestCAAMCompatibleZaiCodexManifestBindsPrivateFilesAndBridge(t *testing.T) 
 	profile.RuntimeSHA256, profile.BrokerCommand, profile.BrokerCommandSHA256 = providerProfileTestHash, "/usr/bin/caam", providerProfileTestHash
 	profile.CredentialBridgeCommand, profile.CredentialBridgeCommandSHA256 = "/usr/local/libexec/ntm/ntm-provider-bridge", providerProfileTestHash
 	profile.RuntimeVersion = "0.149.0"
-	digest, err := profile.CAAMCompatibleManifestSHA256()
-	if err != nil {
-		t.Fatal(err)
-	}
-	profile.ConfigSHA256 = digest
-	if err := profile.VerifyCanonicalManifest(); err != nil {
-		t.Fatalf("matching CAAM manifest was rejected: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(runtimeHome, "models.json"), []byte("{\"changed\":true}\n"), 0o600); err != nil {
-		t.Fatal(err)
+	if _, err := profile.CAAMCompatibleManifestSHA256(); err == nil {
+		t.Fatal("malformed CAAM private files retained canonical manifest authority")
 	}
 	if err := profile.VerifyCanonicalManifest(); err == nil {
-		t.Fatal("changed private Codex file retained manifest authority")
+		t.Fatal("malformed CAAM private files retained provider profile authority")
 	}
 }
 

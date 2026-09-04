@@ -256,7 +256,7 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 	}
 	commandCtx := providerCommandContext(cmd)
 	manifestExpectation := zai.CodexManifestExpectation{
-		RuntimeHome: profile.RuntimeHome, Account: identity.AccountAlias(), Model: identity.Model(),
+		RuntimeHome: profile.RuntimeHome, Account: identity.AccountAlias(), Endpoint: identity.Endpoint(), Model: identity.Model(),
 		BrokerCredentialID: profile.BrokerCredentialID, Binary: profile.Command, BinarySHA256: profile.RuntimeSHA256,
 		BrokerCommand: profile.BrokerCommand, BrokerCommandSHA256: profile.BrokerCommandSHA256,
 		CredentialBridgeCommand: profile.CredentialBridgeCommand, CredentialBridgeCommandSHA256: profile.CredentialBridgeCommandSHA256,

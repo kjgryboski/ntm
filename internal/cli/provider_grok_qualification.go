@@ -146,14 +146,6 @@ func runProviderGrokQualification(cmd *cobra.Command, opts providerQualification
 	if deps.admission.CapacityStatus().Scope != provider.CapacityControlScopeLocalShared {
 		return errors.New("Grok qualification requires the cross-process local shared capacity store")
 	}
-	decision := deps.admission.Acquire(identity)
-	if !decision.Allowed || !decision.NoFailover {
-		if decision.Allowed {
-			deps.admission.Release(identity, decision)
-		}
-		return errors.New("Grok qualification admission was denied for the exact identity; failover is prohibited")
-	}
-	defer deps.admission.Release(identity, decision)
 	if opts.grokHeadlessLineage {
 		if deps.runSession == nil || deps.sessionRunner == nil || deps.prepareLineage == nil || deps.cleanupLineage == nil || deps.hashBinary == nil {
 			return errors.New("Grok headless lineage qualification dependencies are incomplete")
@@ -177,12 +169,23 @@ func runProviderGrokQualification(cmd *cobra.Command, opts providerQualification
 		runTimeout = opts.suiteTimeout
 	}
 	runCtx, runCancel := context.WithTimeout(commandCtx, runTimeout)
+	decision, err := acquireProviderGrokQualificationTurn(runCtx, deps.admission, identity)
+	if err != nil {
+		runCancel()
+		return err
+	}
 	result, runErr := deps.run(runCtx, grok.OSRunner{}, grok.Request{
 		Prompt: "Reply with this exact nonce and no other text. Do not use tools: " + nonce,
 		CWD:    cwd, Binary: binary, RuntimeHome: profile.RuntimeHome, Model: identity.Model(), RuntimeVersion: profile.RuntimeVersion, ExpectedNonce: nonce,
 		AutomationPolicyArgs: agent.GrokAutomationACPPolicyArgs(profile.AutomationPolicy),
 	})
+	deps.admission.Release(identity, decision)
 	runCancel()
+	if runErr == nil && result.Success {
+		// This updates capacity liveness only; the signed receipt checks below
+		// remain the sole authority for qualification promotion.
+		deps.admission.RecordSuccess(identity)
+	}
 	completed := deps.now().UTC()
 	receipt := providerqualification.Receipt{
 		Mode: providerqualification.ModeLive, Provider: "xai", Transport: "xai_acp",
@@ -226,11 +229,46 @@ func runProviderGrokQualification(cmd *cobra.Command, opts providerQualification
 		}
 		return &providerQualificationExitError{}
 	}
-	// This cannot be reached by the current observe-only producer because its
-	// unexercised gates are intentionally false. Keep the success accounting
-	// correct if a future complete scenario runner replaces it.
-	deps.admission.RecordSuccess(identity)
 	return nil
+}
+
+// acquireProviderGrokQualificationTurn gives every real provider request its
+// own shared-store lease and token. A multi-step qualification may wait for a
+// controller-supplied refill time, but it never bypasses capacity, retries a
+// permanent denial, or changes identity/provider as a fallback.
+func acquireProviderGrokQualificationTurn(ctx context.Context, admission providerDoctorAdmission, identity provider.Identity) (ratelimit.Decision, error) {
+	if ctx == nil || admission == nil {
+		return ratelimit.Decision{}, errors.New("Grok qualification admission is unavailable")
+	}
+	for {
+		decision := admission.Acquire(identity)
+		if decision.Allowed {
+			if !decision.NoFailover {
+				admission.Release(identity, decision)
+				return ratelimit.Decision{}, errors.New("Grok qualification admission did not prohibit provider failover")
+			}
+			return decision, nil
+		}
+		if !decision.NoFailover || decision.RetryAt == nil {
+			return ratelimit.Decision{}, errors.New("Grok qualification admission was denied for the exact identity; failover is prohibited")
+		}
+		wait := time.Until(*decision.RetryAt)
+		if wait <= 0 {
+			wait = time.Millisecond
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ratelimit.Decision{}, fmt.Errorf("wait for Grok qualification capacity: %w", context.Cause(ctx))
+		case <-timer.C:
+		}
+	}
 }
 
 type providerGrokLineageWorkspace struct {
@@ -319,12 +357,21 @@ Do not call any other tool. After all four calls, reply with this exact nonce an
 		runTimeout = opts.suiteTimeout
 	}
 	runCtx, runCancel := context.WithTimeout(suiteCtx, runTimeout)
+	decision, err := acquireProviderGrokQualificationTurn(runCtx, deps.admission, identity)
+	if err != nil {
+		runCancel()
+		return err
+	}
 	result, runErr := deps.run(runCtx, grok.OSRunner{}, grok.Request{
 		Prompt: prompt, ExpectedNonce: nonce, CWD: workspace.Worktree,
 		Binary: binary, RuntimeHome: workspace.RuntimeHome, Model: identity.Model(), RuntimeVersion: profile.RuntimeVersion,
 		AutomationPolicyArgs: agent.GrokAutomationACPPolicyArgs(profile.AutomationPolicy), Broker: broker,
 	})
+	deps.admission.Release(identity, decision)
 	runCancel()
+	if runErr == nil && result.Success {
+		deps.admission.RecordSuccess(identity)
+	}
 
 	audit, auditErr := deps.readWorkspaceAudit(auditGuard, auditPath, workspace.Worktree, revision)
 	finalContent, finalErr := deps.readWorkspaceFile(filepath.Join(workspace.Worktree, filepath.FromSlash(providerGrokWorkspaceTarget)))
@@ -345,8 +392,6 @@ Do not call any other tool. After all four calls, reply with this exact nonce an
 	modelObserved := runErr == nil && result.Success && result.AcknowledgementVerified && result.Authenticated && result.RuntimeEventContract.Passed && result.Model == identity.Model() && grokDoctorModelEvidenceConfirmed(result.ModelEvidence) && result.ResolvedModel == expectedResolvedModel && result.ResolvedModelEvidence == "completion_metadata.usage.model_usage_singleton"
 	policyDeniedPush := providerGrokWorkspacePushBoundary(profile.AutomationPolicy, *broker)
 	processClean := !result.Cleanup.ObservedAt.IsZero() && result.Cleanup.Reaped && result.Cleanup.ResidualPIDs != nil && len(result.Cleanup.ResidualPIDs) == 0
-	workspaceScenarioPassed := modelObserved && exactToolLifecycle && assertions.ReadObserved && assertions.EditObserved && finalContentOK && assertions.TestObserved && assertions.SecretDenied && policyDeniedPush && processClean && cleaned
-
 	receipt := providerqualification.Receipt{
 		Mode: providerqualification.ModeLive, Provider: "xai", Transport: "xai_acp",
 		IdentitySHA256: identity.Hash(), PolicySHA256: policySHA256, RuntimeVersion: runtimeVersion, RuntimeSHA256: binarySHA256,
@@ -370,9 +415,6 @@ Do not call any other tool. After all four calls, reply with this exact nonce an
 	path, err := deps.store(opts.qualificationDir, receipt)
 	if err != nil {
 		return fmt.Errorf("store Grok workspace qualification receipt: %w", err)
-	}
-	if workspaceScenarioPassed {
-		deps.admission.RecordSuccess(identity)
 	}
 	output := providerQualificationRunOutput{SchemaVersion: providerqualification.SchemaVersion, Profile: opts.profile, Transport: receipt.Transport, IdentitySHA256: identity.Hash(), RuntimeVersion: runtimeVersion, PolicySHA256: receipt.PolicySHA256, ReceiptPath: path, Receipt: receipt}
 	if IsJSONOutput() {
@@ -591,13 +633,22 @@ func runProviderGrokHeadlessLineageQualification(commandCtx context.Context, cmd
 		return fmt.Errorf("generate Grok lineage bootstrap nonce: %w", err)
 	}
 	bootstrapCtx, bootstrapCancel := context.WithTimeout(suiteCtx, opts.timeout)
+	decision, err := acquireProviderGrokQualificationTurn(bootstrapCtx, deps.admission, identity)
+	if err != nil {
+		bootstrapCancel()
+		return err
+	}
 	bootstrap, bootstrapErr := deps.run(bootstrapCtx, grok.OSRunner{}, grok.Request{
 		Prompt:        "Do not call tools. Reply with this exact nonce and no other text: " + bootstrapNonce,
 		ExpectedNonce: bootstrapNonce, CWD: workspace.Worktree, RuntimeHome: workspace.RuntimeHome,
 		Binary: binary, Model: identity.Model(), RuntimeVersion: profile.RuntimeVersion,
 		AutomationPolicyArgs: agent.GrokAutomationACPPolicyArgs(profile.AutomationPolicy),
 	})
+	deps.admission.Release(identity, decision)
 	bootstrapCancel()
+	if bootstrapErr == nil && bootstrap.Success {
+		deps.admission.RecordSuccess(identity)
+	}
 
 	expectedResolvedModel := grok.ExpectedResolvedModel(profile.RuntimeVersion, identity.Model())
 	bootstrapOK := bootstrapErr == nil && bootstrap.Success && bootstrap.AcknowledgementVerified && bootstrap.Authenticated && bootstrap.ProviderSessionID != "" && bootstrap.Model == identity.Model() && bootstrap.ModelEvidence == "completion_metadata" && bootstrap.ResolvedModel == expectedResolvedModel && bootstrap.ResolvedModelEvidence == "completion_metadata.usage.model_usage_singleton" && bootstrap.RuntimeEventContract.Passed
@@ -674,7 +725,11 @@ func runProviderGrokLineageStep(ctx context.Context, timeout time.Duration, deps
 	}
 	stepCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return deps.runSession(stepCtx, deps.sessionRunner, grok.SessionRequest{
+	decision, err := acquireProviderGrokQualificationTurn(stepCtx, deps.admission, identity)
+	if err != nil {
+		return grok.SessionReceipt{}, err
+	}
+	receipt, runErr := deps.runSession(stepCtx, deps.sessionRunner, grok.SessionRequest{
 		Action: action, SessionID: parentSessionID,
 		Prompt:        "Do not call tools. Reply with this exact nonce and no other text: " + nonce,
 		ExpectedNonce: nonce, CWD: workspace.Worktree, Worktree: workspace.Worktree,
@@ -682,6 +737,11 @@ func runProviderGrokLineageStep(ctx context.Context, timeout time.Duration, deps
 		PolicyArgs:   agent.GrokAutomationLifecyclePolicyArgs(profile.AutomationPolicy),
 		PolicySHA256: policySHA256, ConfigSHA256: identity.ConfigSHA256(), BinarySHA256: binarySHA256,
 	})
+	deps.admission.Release(identity, decision)
+	if runErr == nil && receipt.ProviderAcknowledged && receipt.CompletionConfirmed {
+		deps.admission.RecordSuccess(identity)
+	}
+	return receipt, runErr
 }
 
 func validProviderGrokLineageReceipt(receipt grok.SessionReceipt, action grok.SessionAction, parentSHA256, worktreeSHA256, policySHA256, configSHA256, binarySHA256, requestedModel, resolvedModel string) bool {
@@ -813,7 +873,11 @@ func grokQualificationModelDetail(result grok.Result, runErr error, expectedPubl
 		if stage == "" {
 			stage = "unknown"
 		}
-		return fmt.Sprintf("provider_run_failed:%s:stage=%s:exit=%s:stderr_bytes=%d:stderr_sha256=%s", result.FailureCode, stage, exit, result.Stderr.Bytes, result.Stderr.SHA256)
+		rpcCode := "none"
+		if result.ProviderRPCErrorCode != nil {
+			rpcCode = fmt.Sprint(*result.ProviderRPCErrorCode)
+		}
+		return fmt.Sprintf("provider_run_failed:%s:stage=%s:rpc_code=%s:exit=%s:stderr_bytes=%d:stderr_sha256=%s", result.FailureCode, stage, rpcCode, exit, result.Stderr.Bytes, result.Stderr.SHA256)
 	case !result.Success || !result.CompletionConfirmed:
 		return "terminal_completion_unverified"
 	case !result.AcknowledgementVerified:

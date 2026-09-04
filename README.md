@@ -489,6 +489,10 @@ The same ladder is enforced at production dispatch: Z.ai Codex review/write,
 Grok ACP review/write, and Grok headless lifecycle commands load and verify a
 current signed qualification for the exact identity, transport, policy,
 runtime, operation, and trusted signing key before starting the provider.
+Lifecycle dispatch additionally requires provider-scope cancellation and
+cleanup authority. Because the current Grok and Z.ai adapters prove only
+ACP-agent or local process-tree control for those boundaries, lifecycle remains
+fail-closed even if every scenario check is present in a signed receipt.
 Observe-only ACP remains the narrowly scoped evidence-gathering lane.
 Doctor also remains `NO_GO` whenever the exact or shared subscription admission
 state would reject a new request, including an active lease, transient circuit,
