@@ -4,18 +4,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Dicklesworthstone/ntm/internal/agent"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 )
 
 func TestGetProviderConformanceRunsSyntheticHarnessWithoutCoordinationStores(t *testing.T) {
 	cfg := &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{
-		"xai-primary": {
-			Provider: "xai", AccountAlias: "test", Model: "grok-code", Endpoint: "https://api.x.ai/v1",
-			Runtime: "grok", ConfigSHA256: strings.Repeat("a", 64), Command: "grok", RuntimeHome: "/tmp/grok-test",
-			AutomationPolicy: agent.DefaultGrokAutomationPolicyName, ExactTargetOnly: true,
-		},
+		"xai-primary": syntheticGrokProviderProfile("test", "grok-code", "/tmp/grok-test"),
 		"zai-primary": {
 			Provider: "zai", AccountAlias: "test", Model: "glm-5.3-flash", Endpoint: "https://api.z.ai/api/anthropic",
 			Runtime: "claude-code", ConfigSHA256: strings.Repeat("b", 64), Command: "claude",
@@ -65,11 +60,7 @@ func TestGetProviderConformanceRunsSyntheticHarnessWithoutCoordinationStores(t *
 
 func TestGetProviderConformanceRejectsProviderTransportMismatch(t *testing.T) {
 	cfg := &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{
-		"xai-primary": {
-			Provider: "xai", AccountAlias: "test", Model: "grok-code", Endpoint: "https://api.x.ai/v1",
-			Runtime: "grok", ConfigSHA256: strings.Repeat("a", 64), Command: "grok", RuntimeHome: "/tmp/grok-test",
-			AutomationPolicy: agent.DefaultGrokAutomationPolicyName, ExactTargetOnly: true,
-		},
+		"xai-primary": syntheticGrokProviderProfile("test", "grok-code", "/tmp/grok-test"),
 	}}
 	if _, err := GetProviderConformance(t.Context(), cfg, "xai-primary", "zai_claude_runtime"); err == nil {
 		t.Fatal("provider/transport mismatch was accepted")

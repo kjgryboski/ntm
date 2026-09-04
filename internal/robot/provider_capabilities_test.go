@@ -79,13 +79,8 @@ func TestGetProviderCapabilitiesRedactsConfiguredProfiles(t *testing.T) {
 }
 
 func TestGetProviderCapabilitiesDoesNotCallConfiguredGrokProfileLaunchable(t *testing.T) {
-	hash := strings.Repeat("a", 64)
 	cfg := &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{
-		"xai-grok": {
-			Provider: "xai", AccountAlias: "operator", Model: "grok-4.6",
-			Endpoint: "https://api.x.ai/v1", Runtime: "grok", ConfigSHA256: hash,
-			Command: "grok", RuntimeHome: "/tmp/grok-operator", AutomationPolicy: "grok-readonly-ci", ExactTargetOnly: true,
-		},
+		"xai-grok": syntheticGrokProviderProfile("operator", "grok-4.6", "/tmp/grok-operator"),
 	}}
 	output, err := GetProviderCapabilities(cfg)
 	if err != nil {
@@ -94,6 +89,25 @@ func TestGetProviderCapabilitiesDoesNotCallConfiguredGrokProfileLaunchable(t *te
 	if got := output.ProviderProfiles[0].ProfileState; got != "operation_evidence_required" {
 		t.Fatalf("configured Grok profile state = %q", got)
 	}
+}
+
+func syntheticGrokProviderProfile(accountAlias, model, runtimeHome string) config.ProviderProfileConfig {
+	profile := config.ProviderProfileConfig{
+		Provider:                      "xai",
+		AccountAlias:                  accountAlias,
+		Model:                         model,
+		Endpoint:                      "https://api.x.ai/v1",
+		Runtime:                       "grok",
+		RuntimeVersion:                "test",
+		Command:                       "grok",
+		RuntimeHome:                   runtimeHome,
+		CredentialBridgeCommand:       "/usr/local/libexec/ntm/test-provider-bridge.exe",
+		CredentialBridgeCommandSHA256: strings.Repeat("a", 64),
+		AutomationPolicy:              "grok-readonly-ci",
+		ExactTargetOnly:               true,
+	}
+	profile.ConfigSHA256 = profile.CanonicalManifestSHA256()
+	return profile
 }
 
 func TestGetProviderCapabilitiesDoesNotPromoteTupleValidUnlaunchableProfile(t *testing.T) {
