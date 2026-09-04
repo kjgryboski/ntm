@@ -78,11 +78,62 @@ func ValidateBridgePayload(payload []byte) error {
 		err = validateBridgeSession(object)
 	case "ntm.provider-codex-run.v1":
 		err = validateBridgeCodexRun(object)
+	case "ntm.provider-codex-qualification-turn.v1":
+		err = validateBridgeCodexQualificationTurn(object)
 	default:
 		err = ErrBridgePayloadDenied
 	}
 	if err != nil {
 		return ErrBridgePayloadDenied
+	}
+	return nil
+}
+
+// validateBridgeCodexQualificationTurn keeps the Windows signer a narrow
+// oracle for a qualification turn's complete authority envelope.  The full
+// redacted runtime receipt remains in the durable ledger, and receipt_sha256
+// binds it to this signed projection without sending provider event data to
+// the bridge.
+func validateBridgeCodexQualificationTurn(object map[string]json.RawMessage) error {
+	required := []string{
+		"schema_version", "state", "identity_sha256", "binding_sha256", "nonce_sha256", "operation_id_sha256",
+		"config_sha256", "binary_sha256", "broker_command_sha256", "credential_bridge_sha256", "policy_sha256",
+		"runtime_version", "started_at", "completed_at", "receipt_sha256",
+	}
+	allowed := append(append([]string{}, required...), "error_sha256")
+	if err := bridgeAllowed(object, required, allowed...); err != nil {
+		return err
+	}
+	if schema, _ := bridgeString(object, "schema_version"); schema != "ntm.provider-codex-qualification-turn.v1" {
+		return errors.New("Codex qualification turn schema mismatch")
+	}
+	validStates := map[string]bool{"completed": true, "outcome_unknown": true, "admission_denied": true, "reservation_binding_failed": true}
+	if state, ok := bridgeString(object, "state"); !ok || !validStates[state] {
+		return errors.New("Codex qualification turn state is invalid")
+	}
+	for _, field := range []string{
+		"identity_sha256", "binding_sha256", "nonce_sha256", "operation_id_sha256", "config_sha256", "binary_sha256",
+		"broker_command_sha256", "credential_bridge_sha256", "policy_sha256", "receipt_sha256",
+	} {
+		if !bridgeSHA256(object, field) {
+			return fmt.Errorf("invalid Codex qualification turn digest %q", field)
+		}
+	}
+	if !bridgeSafeString(object, "runtime_version", 256) {
+		return errors.New("Codex qualification turn runtime version is invalid")
+	}
+	if !bridgeTimestamp(object, "started_at") || !bridgeTimestamp(object, "completed_at") {
+		return errors.New("Codex qualification turn timestamps are invalid")
+	}
+	var startedAt, completedAt time.Time
+	if json.Unmarshal(object["started_at"], &startedAt) != nil || json.Unmarshal(object["completed_at"], &completedAt) != nil || completedAt.Before(startedAt) {
+		return errors.New("Codex qualification turn timestamp order is invalid")
+	}
+	if raw, present := object["error_sha256"]; present {
+		var digest string
+		if json.Unmarshal(raw, &digest) != nil || !bridgeSHA256Pattern.MatchString(digest) {
+			return errors.New("Codex qualification turn error digest is invalid")
+		}
 	}
 	return nil
 }

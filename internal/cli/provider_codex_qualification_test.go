@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -18,8 +19,21 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/zai"
 )
+
+type orderedCodexQualificationAdmissionFake struct {
+	codexQualificationAdmissionFake
+	claimedBeforeAcquire func() bool
+}
+
+func (f *orderedCodexQualificationAdmissionFake) Acquire(identity provider.Identity) ratelimit.SubscriptionDecision {
+	if f.claimedBeforeAcquire != nil && !f.claimedBeforeAcquire() {
+		return ratelimit.SubscriptionDecision{Reason: ratelimit.ErrorUnknown, NoFailover: true}
+	}
+	return f.codexQualificationAdmissionFake.Acquire(identity)
+}
 
 type codexQualificationAdmissionFake struct {
 	decision                                                                       ratelimit.SubscriptionDecision
@@ -216,6 +230,134 @@ func TestProviderCodexIdentityOnlyRunsExactlyOneSignedReadOnlyPreflight(t *testi
 	}
 	if !stored.Passed || stored.Transport != "zai_codex_identity_preflight" || stored.Attestation == nil || stored.Validate() != nil || !strings.Contains(output.String(), "11/11") {
 		t.Fatalf("identity-only receipt=%+v output=%q", stored, output.String())
+	}
+}
+
+func TestCodexQualificationTurnClaimsBeforeReservationAndPersistsSignedBoundArtifact(t *testing.T) {
+	profile := providerCodexProfile(t.TempDir())
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := &providerNativeLedgerFake{}
+	admission := &orderedCodexQualificationAdmissionFake{codexQualificationAdmissionFake: codexQualificationAdmissionFake{
+		decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true},
+	}}
+	admission.claimedBeforeAcquire = func() bool { return len(ledger.ops) == 1 }
+	manifest := providerCodexManifestForTest(profile)
+	workspace := providerCodexQualificationWorkspace{Worktree: t.TempDir()}
+	nonce := "NTM_ACK_0123456789abcdef0123456789abcdef"
+	signer := newProviderNativeTestSigner()
+	metadata, err := signer(context.Background(), []byte(providerattestation.ProviderAttestationPreflight))
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn := runAdmittedCodexQualificationTurn(context.Background(), time.Second, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		return successfulProviderCodexReceipt(spec), nil
+	}, ledger, signer, metadata.KeyMetadata, func() time.Time { return time.Unix(2_000_000_000, 0).UTC() }, profile, identity, manifest, workspace, func(context.Context) error { return nil }, "reply with the nonce only", nonce, "", false, "", "", nil)
+	if turn.err != nil || !turn.admitted || admission.acquires != 1 || admission.bindings != 1 {
+		t.Fatalf("turn=%+v admission=%+v", turn, admission)
+	}
+	operationID := "zai-qualification-" + turn.binding[:32]
+	op, err := ledger.GetSendOperation(operationID, providerCodexQualificationOperationScope)
+	if err != nil || op == nil || op.Status != state.SendOperationCompleted || op.BindingHash != turn.binding || op.PayloadSHA256 != sha256StringCLI(nonce) {
+		t.Fatalf("operation=%+v err=%v", op, err)
+	}
+	var artifact providerCodexQualificationTurnArtifact
+	if err := json.Unmarshal([]byte(op.OutcomeJSON), &artifact); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := canonicalProviderCodexQualificationTurnArtifact(artifact)
+	if err != nil || artifact.Attestation == nil || providerattestation.Verify(payload, *artifact.Attestation) != nil || artifact.BindingSHA256 != turn.binding || artifact.NonceSHA256 != sha256StringCLI(nonce) || artifact.ReceiptSHA256 != digestSafeJSON(artifact.Receipt) {
+		t.Fatalf("artifact=%+v err=%v", artifact, err)
+	}
+	if strings.Contains(op.OutcomeJSON, nonce) || strings.Contains(op.OutcomeJSON, workspace.Worktree) || strings.Contains(op.OutcomeJSON, "reply with the nonce only") {
+		t.Fatalf("sensitive qualification input leaked into artifact: %s", op.OutcomeJSON)
+	}
+	for _, mutate := range []func(*providerCodexQualificationTurnArtifact){
+		func(value *providerCodexQualificationTurnArtifact) { value.State = "outcome_unknown" },
+		func(value *providerCodexQualificationTurnArtifact) { value.ConfigSHA256 = strings.Repeat("f", 64) },
+		func(value *providerCodexQualificationTurnArtifact) { value.RuntimeVersion = "other-runtime" },
+		func(value *providerCodexQualificationTurnArtifact) {
+			value.CompletedAt = value.StartedAt.Add(-time.Second)
+		},
+		func(value *providerCodexQualificationTurnArtifact) { value.ErrorSHA256 = strings.Repeat("e", 64) },
+	} {
+		tampered := artifact
+		mutate(&tampered)
+		tamperedPayload, tamperedErr := canonicalProviderCodexQualificationTurnArtifact(tampered)
+		if tamperedErr != nil || providerattestation.Verify(tamperedPayload, *tampered.Attestation) == nil {
+			t.Fatalf("tampered signed authority field unexpectedly verified: %+v err=%v", tampered, tamperedErr)
+		}
+	}
+}
+
+func TestCodexQualificationTurnSignsAdmissionDeniedAndOutcomeUnknown(t *testing.T) {
+	profile := providerCodexProfile(t.TempDir())
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := providerCodexManifestForTest(profile)
+	workspace := providerCodexQualificationWorkspace{Worktree: t.TempDir()}
+	for _, tc := range []struct {
+		name     string
+		decision ratelimit.SubscriptionDecision
+		run      func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error)
+		want     string
+	}{
+		{name: "admission denied", decision: ratelimit.SubscriptionDecision{Reason: ratelimit.ErrorRateLimited, NoFailover: true}, run: func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+			t.Fatal("denied turn dispatched")
+			return zai.CodexRunReceipt{}, nil
+		}, want: "admission_denied"},
+		{name: "outcome unknown", decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, run: func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+			r := successfulProviderCodexReceipt(spec)
+			r.OutcomeKnown = false
+			return r, errors.New("interrupted")
+		}, want: "outcome_unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ledger := &providerNativeLedgerFake{}
+			admission := &codexQualificationAdmissionFake{decision: tc.decision}
+			signer := newProviderNativeTestSigner()
+			metadata, signErr := signer(context.Background(), []byte(providerattestation.ProviderAttestationPreflight))
+			if signErr != nil {
+				t.Fatal(signErr)
+			}
+			turn := runAdmittedCodexQualificationTurn(context.Background(), time.Second, admission, tc.run, ledger, signer, metadata.KeyMetadata, func() time.Time { return time.Unix(2_000_000_000, 0).UTC() }, profile, identity, manifest, workspace, func(context.Context) error { return nil }, "reply", "NTM_ACK_0123456789abcdef0123456789abcdef", "", false, "", "", nil)
+			if turn.err == nil || len(ledger.ops) != 1 {
+				t.Fatalf("turn=%+v ops=%d", turn, len(ledger.ops))
+			}
+			for _, op := range ledger.ops {
+				var artifact providerCodexQualificationTurnArtifact
+				if op.Status != state.SendOperationCompleted || json.Unmarshal([]byte(op.OutcomeJSON), &artifact) != nil || artifact.State != tc.want || artifact.Attestation == nil {
+					t.Fatalf("operation=%+v artifact=%+v", op, artifact)
+				}
+			}
+		})
+	}
+}
+
+func TestCodexQualificationTurnSignatureFailureLeavesClaimBlocked(t *testing.T) {
+	profile := providerCodexProfile(t.TempDir())
+	identity, err := profile.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := &providerNativeLedgerFake{}
+	admission := &codexQualificationAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}}
+	turn := runAdmittedCodexQualificationTurn(context.Background(), time.Second, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+		return successfulProviderCodexReceipt(spec), nil
+	}, ledger, func(context.Context, []byte) (providerattestation.SignatureMetadata, error) {
+		return providerattestation.SignatureMetadata{}, errors.New("signer unavailable")
+	}, providerattestation.KeyMetadata{}, func() time.Time { return time.Unix(2_000_000_000, 0).UTC() }, profile, identity, providerCodexManifestForTest(profile), providerCodexQualificationWorkspace{Worktree: t.TempDir()}, func(context.Context) error { return nil }, "reply", "NTM_ACK_0123456789abcdef0123456789abcdef", "", false, "", "", nil)
+	if turn.err == nil || !strings.Contains(turn.err.Error(), "terminal artifact") {
+		t.Fatalf("turn=%+v", turn)
+	}
+	for _, op := range ledger.ops {
+		if op.Status != state.SendOperationInProgress || op.OutcomeJSON != "" {
+			t.Fatalf("signing failure must fail closed with blocked operation: %+v", op)
+		}
 	}
 }
 
@@ -600,6 +742,7 @@ func TestProviderCodexQualificationRejectsContradictoryPreflightResidualsBeforeW
 }
 
 func codexQualificationDepsForTest(profile config.ProviderProfileConfig, admission providerCodexQualificationAdmission, run func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error)) providerCodexQualificationDependencies {
+	ledger := &providerNativeLedgerFake{}
 	return providerCodexQualificationDependencies{
 		attest: func(context.Context, zai.CodexManifestExpectation) (zai.CodexManifestAttestation, error) {
 			return zai.CodexManifestAttestation{ConfigSHA256: profile.ConfigSHA256, BinarySHA256: profile.RuntimeSHA256, AuthHelperSHA256: profile.BrokerCommandSHA256, CredentialBridgeSHA256: profile.CredentialBridgeCommandSHA256, RuntimeVersion: profile.RuntimeVersion}, nil
@@ -617,7 +760,11 @@ func codexQualificationDepsForTest(profile config.ProviderProfileConfig, admissi
 		storePreflight: func(providerqualification.Receipt) (string, error) {
 			return "/redacted/identity-preflight.json", nil
 		},
-		admission: admission, now: func() time.Time { return time.Unix(2_000_000_000, 0).UTC() },
+		admission: admission,
+		openLedger: func() (providerNativeOperationLedger, func() error, error) {
+			return ledger, func() error { return nil }, nil
+		},
+		now: func() time.Time { return time.Unix(2_000_000_000, 0).UTC() },
 	}
 }
 

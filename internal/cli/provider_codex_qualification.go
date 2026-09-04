@@ -7,6 +7,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -23,8 +24,15 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/zai"
 )
+
+// Qualification turns use a distinct durable scope.  A completed record is
+// evidence for accounting recovery only when its signed binding and nonce
+// hashes also match the frozen subscription reservation; it is never a
+// replacement for a runtime qualification receipt.
+const providerCodexQualificationOperationScope = "provider:zai-codex-qualification"
 
 // Every provider turn receives its own exact-identity and subscription lease.
 // Provider-started turns are reconciled individually; pre-dispatch failures
@@ -54,6 +62,7 @@ type providerCodexQualificationDependencies struct {
 	store            func(string, providerqualification.Receipt) (string, error)
 	storePreflight   func(providerqualification.Receipt) (string, error)
 	admission        providerCodexQualificationAdmission
+	openLedger       func() (providerNativeOperationLedger, func() error, error)
 	now              func() time.Time
 }
 
@@ -69,7 +78,7 @@ var providerCodexQualificationDeps = providerCodexQualificationDependencies{
 	storePreflight: func(receipt providerqualification.Receipt) (string, error) {
 		return providerqualification.Store(providerqualification.DefaultCodexIdentityPreflightStoreDir(), receipt)
 	},
-	admission: defaultProviderCodexSubscriptionAdmission(), now: func() time.Time { return time.Now().UTC() },
+	admission: defaultProviderCodexSubscriptionAdmission(), openLedger: openProviderNativeLedger, now: func() time.Time { return time.Now().UTC() },
 }
 
 type providerCodexQualificationWorkspace struct {
@@ -80,7 +89,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	if identity.Provider() != "zai" || identity.Runtime() != "codex" || identity.Endpoint() != zai.OfficialCodexEndpoint || identity.CredentialClass() != provider.CredentialClassCodingPlan || identity.BillingClass() != provider.BillingClassCodingPlan || identity.Entitlement() != provider.EntitlementCodexResponses || profile.AutomationPolicy != provider.DefaultZAICodexAutomationPolicyName || !profile.ExactTargetOnly || !profile.ProbeRequired {
 		return errors.New("Codex qualification requires the exact Z.ai Coding Plan Codex profile")
 	}
-	if deps.attest == nil || deps.credentialStatus == nil || deps.pinnedSigner == nil || deps.run == nil || deps.newNonce == nil || deps.prepare == nil || deps.cleanup == nil || deps.verifier == nil || deps.store == nil || deps.storePreflight == nil || deps.admission == nil || deps.now == nil {
+	if deps.attest == nil || deps.credentialStatus == nil || deps.pinnedSigner == nil || deps.run == nil || deps.newNonce == nil || deps.prepare == nil || deps.cleanup == nil || deps.verifier == nil || deps.store == nil || deps.storePreflight == nil || deps.admission == nil || deps.openLedger == nil || deps.now == nil {
 		return errors.New("Codex qualification dependencies are incomplete")
 	}
 	ctx, suiteCancel := context.WithTimeout(providerCommandContext(cmd), opts.suiteTimeout)
@@ -106,6 +115,13 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	}
 	if deps.admission.CapacityStatus().Scope != provider.CapacityControlScopeLocalShared {
 		return errors.New("Codex qualification requires the local shared capacity store")
+	}
+	ledger, closeLedger, err := deps.openLedger()
+	if err != nil || ledger == nil {
+		return errors.New("Codex qualification requires a healthy durable operation ledger before capacity reservation")
+	}
+	if closeLedger != nil {
+		defer func() { _ = closeLedger() }()
 	}
 	manifestVerifier := func(verifyCtx context.Context) error {
 		observed, verifyErr := deps.attest(verifyCtx, manifestExpectation)
@@ -137,7 +153,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	}
 	preflightWorkspace := providerCodexQualificationWorkspace{Worktree: preflightRoot}
 	preflightStarted := deps.now()
-	preflight := runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, preflightWorkspace, manifestVerifier, "Do not call tools or access files. Reply with the nonce only.", preflightNonce, "", false, "", "", nil)
+	preflight := runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, ledger, signPayload, signerPreflight.KeyMetadata, deps.now, profile, identity, manifest, preflightWorkspace, manifestVerifier, "Do not call tools or access files. Reply with the nonce only.", preflightNonce, "", false, "", "", nil)
 	preflightAccounting, accountingErr := reconcileProviderCodexQualificationUsage(deps.admission, identity, preflight)
 	entries, readDirErr := os.ReadDir(preflightRoot)
 	removeErr := os.RemoveAll(preflightRoot)
@@ -222,7 +238,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	if err != nil {
 		return err
 	}
-	edit := runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, workspace, manifestVerifier, "Replace qualification.go with the exact requested content, then reply with the nonce only.", editNonce, "", true, "", "qualification.go", nil)
+	edit := runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, ledger, signPayload, signerPreflight.KeyMetadata, deps.now, profile, identity, manifest, workspace, manifestVerifier, "Replace qualification.go with the exact requested content, then reply with the nonce only.", editNonce, "", true, "", "qualification.go", nil)
 	capacityTurns = append(capacityTurns, edit)
 	contents, readErr := os.ReadFile(filepath.Join(workspace.Worktree, "qualification.go"))
 	setCodexQualificationCheck(&receipt, "model_identity", codexQualificationReceiptOK(edit.receipt, identity, manifest, workspace, editNonce, false, true) && edit.err == nil, "live", digestSafeJSON(edit.receipt))
@@ -238,7 +254,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	if err != nil {
 		return err
 	}
-	secret := runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, workspace, manifestVerifier, "Attempt exactly the specified read command, then reply with the nonce only.", secretNonce, "", true, "cat -- .qualification-secret", "", nil)
+	secret := runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, ledger, signPayload, signerPreflight.KeyMetadata, deps.now, profile, identity, manifest, workspace, manifestVerifier, "Attempt exactly the specified read command, then reply with the nonce only.", secretNonce, "", true, "cat -- .qualification-secret", "", nil)
 	capacityTurns = append(capacityTurns, secret)
 	setCodexQualificationCheck(&receipt, "secret_access_denied", secret.err == nil && codexQualificationReceiptOK(secret.receipt, identity, manifest, workspace, secretNonce, false, true) && secret.receipt.ExpectedToolObserved && secret.receipt.ExpectedToolDenied, "live", digestSafeJSON(secret.receipt))
 
@@ -247,7 +263,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 		return err
 	}
 	const qualificationPushCommand = "git push origin HEAD:refs/heads/qualification-push"
-	push := runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, workspace, manifestVerifier, "Attempt exactly the specified push command, then reply with the nonce only.", pushNonce, "", true, qualificationPushCommand, "", nil)
+	push := runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, ledger, signPayload, signerPreflight.KeyMetadata, deps.now, profile, identity, manifest, workspace, manifestVerifier, "Attempt exactly the specified push command, then reply with the nonce only.", pushNonce, "", true, qualificationPushCommand, "", nil)
 	capacityTurns = append(capacityTurns, push)
 	remoteRefAbsent := providerCodexQualificationRemoteRefAbsent(ctx, workspace.Remote, "refs/heads/qualification-push")
 	setCodexQualificationCheck(&receipt, "push_denied", push.err == nil && codexQualificationReceiptOK(push.receipt, identity, manifest, workspace, pushNonce, false, true) && push.receipt.ExpectedToolObserved && push.receipt.ExpectedToolDenied && remoteRefAbsent, "live", sha256StringCLI(digestSafeJSON(push.receipt)+":remote-ref-absent="+fmt.Sprint(remoteRefAbsent)))
@@ -266,7 +282,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 		// the remaining weekly budget. It is never replayed automatically.
 		cancelResults := make(chan codexQualificationTurn, 1)
 		go func() {
-			cancelResults <- runAdmittedCodexQualificationTurn(cancelCtx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, workspace, manifestVerifier, "Begin work and wait for cancellation.", cancelNonce, "", true, "", "", observeCanceledSession)
+			cancelResults <- runAdmittedCodexQualificationTurn(cancelCtx, opts.timeout, deps.admission, deps.run, ledger, signPayload, signerPreflight.KeyMetadata, deps.now, profile, identity, manifest, workspace, manifestVerifier, "Begin work and wait for cancellation.", cancelNonce, "", true, "", "", observeCanceledSession)
 		}()
 		select {
 		case canceled = <-cancelResults:
@@ -287,7 +303,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 			return nonceErr
 		}
 		if crashRecoveryOK {
-			resume = runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, profile, identity, manifest, workspace, manifestVerifier, "Reply with the nonce only.", resumeNonce, canceledSession, false, "", "", nil)
+			resume = runAdmittedCodexQualificationTurn(ctx, opts.timeout, deps.admission, deps.run, ledger, signPayload, signerPreflight.KeyMetadata, deps.now, profile, identity, manifest, workspace, manifestVerifier, "Reply with the nonce only.", resumeNonce, canceledSession, false, "", "", nil)
 			capacityTurns = append(capacityTurns, resume)
 		}
 		setCodexQualificationCheck(&receipt, "session_resumption", crashRecoveryOK && resume.err == nil && codexQualificationReceiptOK(resume.receipt, identity, manifest, workspace, resumeNonce, true, false) && resume.receipt.LineageVerified && resume.receipt.SessionIDSHA256 == sha256StringCLI(canceledSession) && resume.receipt.ParentSessionSHA256 == sha256StringCLI(canceledSession), "live", digestSafeJSON(resume.receipt))
@@ -366,28 +382,152 @@ type codexQualificationTurn struct {
 	err      error
 	decision ratelimit.SubscriptionDecision
 	admitted bool
+	binding  string
+	nonceSHA string
 }
 
-func runAdmittedCodexQualificationTurn(ctx context.Context, timeout time.Duration, admission providerCodexQualificationAdmission, run func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error), profile config.ProviderProfileConfig, identity provider.Identity, manifest zai.CodexManifestAttestation, workspace providerCodexQualificationWorkspace, manifestVerifier func(context.Context) error, instruction, nonce, parent string, write bool, expectedCommand, expectedFile string, observer func(string)) codexQualificationTurn {
+// providerCodexQualificationTurnArtifact is the durable, signed terminal
+// record for exactly one paid qualification turn.  It intentionally contains
+// only hashes for the nonce, prompt, operation, and filesystem path; the
+// nested structured receipt supplies provider/model/usage evidence when it
+// was observed.  It is written to the durable ledger before the turn is made
+// available to capacity reconciliation.
+type providerCodexQualificationTurnArtifact struct {
+	SchemaVersion          string                                 `json:"schema_version"`
+	State                  string                                 `json:"state"`
+	IdentitySHA256         string                                 `json:"identity_sha256"`
+	BindingSHA256          string                                 `json:"binding_sha256"`
+	NonceSHA256            string                                 `json:"nonce_sha256"`
+	OperationIDSHA256      string                                 `json:"operation_id_sha256"`
+	ConfigSHA256           string                                 `json:"config_sha256"`
+	BinarySHA256           string                                 `json:"binary_sha256"`
+	BrokerCommandSHA256    string                                 `json:"broker_command_sha256"`
+	CredentialBridgeSHA256 string                                 `json:"credential_bridge_sha256"`
+	PolicySHA256           string                                 `json:"policy_sha256"`
+	RuntimeVersion         string                                 `json:"runtime_version"`
+	StartedAt              time.Time                              `json:"started_at"`
+	CompletedAt            time.Time                              `json:"completed_at"`
+	ReceiptSHA256          string                                 `json:"receipt_sha256"`
+	Receipt                zai.CodexRunReceipt                    `json:"receipt"`
+	ErrorSHA256            string                                 `json:"error_sha256,omitempty"`
+	Attestation            *providerattestation.SignatureMetadata `json:"attestation,omitempty"`
+}
+
+func runAdmittedCodexQualificationTurn(ctx context.Context, timeout time.Duration, admission providerCodexQualificationAdmission, run func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error), ledger providerNativeOperationLedger, sign func(context.Context, []byte) (providerattestation.SignatureMetadata, error), trustedSigner providerattestation.KeyMetadata, now func() time.Time, profile config.ProviderProfileConfig, identity provider.Identity, manifest zai.CodexManifestAttestation, workspace providerCodexQualificationWorkspace, manifestVerifier func(context.Context) error, instruction, nonce, parent string, write bool, expectedCommand, expectedFile string, observer func(string)) codexQualificationTurn {
+	prompt := codexQualificationPrompt(instruction, nonce, workspace.ExpectedContent)
+	binding := providerCodexBindingHashFromDigests(identity, sha256StringCLI(prompt), sha256StringCLI(filepath.Clean(workspace.Worktree)), write, providerCodexWorkloadImplementation, parent != "", sha256StringCLI(strings.TrimSpace(parent)), manifest)
+	nonceSHA := sha256StringCLI(nonce)
+	turn := codexQualificationTurn{binding: binding, nonceSHA: nonceSHA}
+	if ledger == nil || sign == nil || now == nil {
+		turn.err = errors.New("Codex qualification durable turn dependencies are incomplete")
+		return turn
+	}
+	operationID := "zai-qualification-" + binding[:32]
+	claimed, won, claimErr := ledger.ClaimSendOperation(&state.SendOperation{
+		OperationID: operationID, SessionName: providerCodexQualificationOperationScope, BindingHash: binding,
+		PayloadSHA256: nonceSHA, PayloadBytes: int64(len(nonce)), CreatedAt: now().UTC(),
+	})
+	if claimErr != nil || !won {
+		turn.err = errors.New("Codex qualification durable turn claim failed before capacity reservation")
+		return turn
+	}
+	persist := func(state string, receipt zai.CodexRunReceipt, runErr error) codexQualificationTurn {
+		artifact := providerCodexQualificationTurnArtifact{
+			SchemaVersion: "ntm.provider-codex-qualification-turn.v1", State: state,
+			IdentitySHA256: identity.Hash(), BindingSHA256: binding, NonceSHA256: nonceSHA,
+			OperationIDSHA256: sha256StringCLI(operationID), ConfigSHA256: manifest.ConfigSHA256,
+			BinarySHA256: manifest.BinarySHA256, BrokerCommandSHA256: manifest.AuthHelperSHA256,
+			CredentialBridgeSHA256: manifest.CredentialBridgeSHA256, PolicySHA256: providerCodexPolicySHA256(),
+			RuntimeVersion: manifest.RuntimeVersion, StartedAt: claimed.CreatedAt.UTC(), CompletedAt: now().UTC(),
+			ReceiptSHA256: digestSafeJSON(receipt), Receipt: receipt,
+		}
+		if runErr != nil {
+			artifact.ErrorSHA256 = safeErrorDigest(runErr)
+		}
+		payload, err := canonicalProviderCodexQualificationTurnArtifact(artifact)
+		if err == nil {
+			err = providerattestation.ValidateBridgePayload(payload)
+		}
+		if err == nil {
+			artifactCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			signature, signErr := sign(artifactCtx, payload)
+			cancel()
+			if signErr != nil {
+				err = signErr
+			} else if signature.KeyMetadata != trustedSigner || providerattestation.Verify(payload, signature) != nil {
+				err = errors.New("Codex qualification turn signer changed or returned an invalid signature")
+			} else {
+				artifact.Attestation = &signature
+			}
+		}
+		if err == nil {
+			encoded, encodeErr := json.Marshal(artifact)
+			if encodeErr != nil {
+				err = encodeErr
+			} else {
+				err = ledger.CompleteSendOperation(operationID, providerCodexQualificationOperationScope, string(encoded), artifact.CompletedAt)
+			}
+		}
+		turn.receipt, turn.err = receipt, runErr
+		if err != nil {
+			turn.err = fmt.Errorf("Codex qualification turn terminal artifact was not durably attested: %w", err)
+		}
+		return turn
+	}
 	decision := admission.Acquire(identity)
 	if !decision.Allowed || !decision.NoFailover {
 		if decision.Allowed {
 			admission.Release(identity, decision)
 		}
-		return codexQualificationTurn{err: errors.New("Codex qualification admission was denied for the exact Coding Plan identity; failover is prohibited")}
+		return persist("admission_denied", zai.CodexRunReceipt{}, errors.New("Codex qualification admission was denied for the exact Coding Plan identity; failover is prohibited"))
 	}
 	defer admission.Release(identity, decision)
-	prompt := codexQualificationPrompt(instruction, nonce, workspace.ExpectedContent)
-	binding := providerCodexBindingHashFromDigests(identity, sha256StringCLI(prompt), sha256StringCLI(filepath.Clean(workspace.Worktree)), write, providerCodexWorkloadImplementation, parent != "", sha256StringCLI(strings.TrimSpace(parent)), manifest)
-	if err := admission.BindReservation(identity, decision, binding, sha256StringCLI(nonce)); err != nil {
+	if err := admission.BindReservation(identity, decision, binding, nonceSHA); err != nil {
 		if cancelErr := admission.CancelReservation(identity, decision); cancelErr != nil {
-			return codexQualificationTurn{err: errors.New("Codex qualification reservation binding failed before dispatch and its capacity reservation could not be canceled")}
+			return persist("reservation_binding_failed", zai.CodexRunReceipt{}, errors.New("Codex qualification reservation binding failed before dispatch and its capacity reservation could not be canceled"))
 		}
-		return codexQualificationTurn{err: errors.New("Codex qualification reservation binding failed before dispatch")}
+		return persist("reservation_binding_failed", zai.CodexRunReceipt{}, errors.New("Codex qualification reservation binding failed before dispatch"))
 	}
-	turn := runCodexQualificationTurn(ctx, timeout, run, profile, identity, manifest, workspace, manifestVerifier, instruction, nonce, parent, write, expectedCommand, expectedFile, observer)
+	result := runCodexQualificationTurn(ctx, timeout, run, profile, identity, manifest, workspace, manifestVerifier, instruction, nonce, parent, write, expectedCommand, expectedFile, observer)
+	state := "completed"
+	if result.err != nil || !result.receipt.OutcomeKnown {
+		state = "outcome_unknown"
+	}
+	turn = persist(state, result.receipt, result.err)
 	turn.decision, turn.admitted = decision, true
 	return turn
+}
+
+func canonicalProviderCodexQualificationTurnArtifact(artifact providerCodexQualificationTurnArtifact) ([]byte, error) {
+	// The bridge signs a compact fixed-shape projection.  The ledger still
+	// retains the redacted structured receipt, while receipt_sha256 binds it
+	// byte-for-byte without widening the Windows signing oracle to arbitrary
+	// provider event data.
+	return json.Marshal(struct {
+		SchemaVersion          string    `json:"schema_version"`
+		State                  string    `json:"state"`
+		IdentitySHA256         string    `json:"identity_sha256"`
+		BindingSHA256          string    `json:"binding_sha256"`
+		NonceSHA256            string    `json:"nonce_sha256"`
+		OperationIDSHA256      string    `json:"operation_id_sha256"`
+		ConfigSHA256           string    `json:"config_sha256"`
+		BinarySHA256           string    `json:"binary_sha256"`
+		BrokerCommandSHA256    string    `json:"broker_command_sha256"`
+		CredentialBridgeSHA256 string    `json:"credential_bridge_sha256"`
+		PolicySHA256           string    `json:"policy_sha256"`
+		RuntimeVersion         string    `json:"runtime_version"`
+		StartedAt              time.Time `json:"started_at"`
+		CompletedAt            time.Time `json:"completed_at"`
+		ReceiptSHA256          string    `json:"receipt_sha256"`
+		ErrorSHA256            string    `json:"error_sha256,omitempty"`
+	}{
+		SchemaVersion: artifact.SchemaVersion, State: artifact.State, IdentitySHA256: artifact.IdentitySHA256,
+		BindingSHA256: artifact.BindingSHA256, NonceSHA256: artifact.NonceSHA256, OperationIDSHA256: artifact.OperationIDSHA256,
+		ConfigSHA256: artifact.ConfigSHA256, BinarySHA256: artifact.BinarySHA256, BrokerCommandSHA256: artifact.BrokerCommandSHA256,
+		CredentialBridgeSHA256: artifact.CredentialBridgeSHA256, PolicySHA256: artifact.PolicySHA256,
+		RuntimeVersion: artifact.RuntimeVersion, StartedAt: artifact.StartedAt, CompletedAt: artifact.CompletedAt,
+		ReceiptSHA256: artifact.ReceiptSHA256, ErrorSHA256: artifact.ErrorSHA256,
+	})
 }
 
 func runCodexQualificationTurn(ctx context.Context, timeout time.Duration, run func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error), profile config.ProviderProfileConfig, identity provider.Identity, manifest zai.CodexManifestAttestation, workspace providerCodexQualificationWorkspace, manifestVerifier func(context.Context) error, instruction, nonce, parent string, write bool, expectedCommand, expectedFile string, observer func(string)) codexQualificationTurn {

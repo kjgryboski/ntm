@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/ntm/internal/provider"
@@ -27,12 +28,38 @@ func TestValidateBridgePayloadAllowsOnlyNamedReceiptSchemas(t *testing.T) {
 		validBridgeQualificationPayload(),
 		validBridgeSessionPayload(),
 		validBridgeCodexRunPayload(),
+		validBridgeCodexQualificationTurnPayload(),
 	} {
 		if err := ValidateBridgePayload(payload); err != nil {
 			t.Fatalf("payload %q rejected: %v", payload, err)
 		}
 	}
 	for _, payload := range [][]byte{nil, []byte("ntm.provider-receipt-attestation-preflight.v1"), []byte(`{"schema_version":"other"}`), []byte(`{"schema_version":"ntm.provider-session.v2"}`), []byte(`{"schema_version":"ntm.provider-session.v2"}{}`), []byte("not json")} {
+		if err := ValidateBridgePayload(payload); !errors.Is(err, ErrBridgePayloadDenied) {
+			t.Fatalf("payload %q error=%v", payload, err)
+		}
+	}
+}
+
+func TestValidateBridgePayloadRejectsRawQualificationTurnData(t *testing.T) {
+	for _, payload := range [][]byte{
+		bytes.Replace(validBridgeCodexQualificationTurnPayload(), []byte(`"nonce_sha256":"`+bridgeTestDigest+`"`), []byte(`"nonce":"raw-nonce"`), 1),
+		bytes.Replace(validBridgeCodexQualificationTurnPayload(), []byte(`"receipt_sha256":"`+bridgeTestDigest+`"`), []byte(`"receipt_sha256":"`+bridgeTestDigest+`","prompt":"private prompt"`), 1),
+	} {
+		if err := ValidateBridgePayload(payload); !errors.Is(err, ErrBridgePayloadDenied) {
+			t.Fatalf("payload %q error=%v", payload, err)
+		}
+	}
+}
+
+func TestValidateBridgePayloadRejectsInvalidQualificationTurnAuthority(t *testing.T) {
+	for _, payload := range [][]byte{
+		bytes.Replace(validBridgeCodexQualificationTurnPayload(), []byte(`"state":"completed"`), []byte(`"state":"unrecognized"`), 1),
+		bytes.Replace(validBridgeCodexQualificationTurnPayload(), []byte(`"config_sha256":"`+bridgeTestDigest+`"`), []byte(`"config_sha256":"not-a-digest"`), 1),
+		bytes.Replace(validBridgeCodexQualificationTurnPayload(), []byte(`"runtime_version":"0.153.0"`), []byte(`"runtime_version":"`+strings.Repeat("x", 257)+`"`), 1),
+		bytes.Replace(validBridgeCodexQualificationTurnPayload(), []byte(`"completed_at":"2026-09-02T12:01:00Z"`), []byte(`"completed_at":"2026-09-02T11:59:59Z"`), 1),
+		bytes.Replace(validBridgeCodexQualificationTurnPayload(), []byte(`"receipt_sha256":"`+bridgeTestDigest+`"`), []byte(`"receipt_sha256":"`+bridgeTestDigest+`","error_sha256":"not-a-digest"`), 1),
+	} {
 		if err := ValidateBridgePayload(payload); !errors.Is(err, ErrBridgePayloadDenied) {
 			t.Fatalf("payload %q error=%v", payload, err)
 		}
@@ -244,6 +271,10 @@ func validBridgeSessionPayload() []byte {
 
 func validBridgeCodexRunPayload() []byte {
 	return []byte(`{"schema_version":"ntm.provider-codex-run.v1","success":true,"profile":"zai-codex-kevin","transport":"zai_codex_runtime","identity_sha256":"` + bridgeTestDigest + `","config_sha256":"` + bridgeTestDigest + `","binary_sha256":"` + bridgeTestDigest + `","broker_command_sha256":"` + bridgeTestDigest + `","credential_bridge_sha256":"` + bridgeTestDigest + `","runtime_version":"0.149.0","broker_credential_sha256":"` + bridgeTestDigest + `","qualification_receipt_sha256":"` + bridgeTestDigest + `","operation_id_sha256":"` + bridgeTestDigest + `","binding_sha256":"` + bridgeTestDigest + `","receipt_state":"completed","state":"completed","admission":{"allowed":true,"no_failover":true,"capacity_control_scope":"local_shared"},"receipt":{"adapter_version":"zai-codex-runtime-v1","action":"start","requested_model":"glm-5.3","resolved_model":"glm-5.3","model_evidence":"turn.completed.server_model","config_sha256":"` + bridgeTestDigest + `","binary_sha256":"` + bridgeTestDigest + `","broker_command_sha256":"` + bridgeTestDigest + `","credential_bridge_sha256":"` + bridgeTestDigest + `","policy_sha256":"` + bridgeTestDigest + `","runtime_version":"0.149.0","cwd_sha256":"` + bridgeTestDigest + `","prompt_sha256":"` + bridgeTestDigest + `","session_id_sha256":"` + bridgeTestDigest + `","nonce_sha256":"` + bridgeTestDigest + `","output_sha256":"` + bridgeTestDigest + `","event_stream_sha256":"` + bridgeTestDigest + `","stderr_sha256":"` + bridgeTestDigest + `","tool_events_sha256":"` + bridgeTestDigest + `","tool_event_count":0,"expected_tool_observed":false,"expected_tool_denied":false,"expected_file_observed":false,"usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":2,"total_tokens":3},"exit_code":0,"stop_reason":"turn.completed","provider_started":true,"process_started":true,"outcome_known":true,"completion_confirmed":true,"nonce_verified":true,"model_verified":true,"lineage_verified":true,"zero_residuals":true,"cancellation":{"provider_acknowledged":false,"local_termination":"cleanup_not_observed_process_exited","residual_process_ids":[],"observed_at":"2026-09-02T12:00:00Z"},"started_at":"2026-09-02T12:00:00Z","completed_at":"2026-09-02T12:01:00Z"}}`)
+}
+
+func validBridgeCodexQualificationTurnPayload() []byte {
+	return []byte(`{"schema_version":"ntm.provider-codex-qualification-turn.v1","state":"completed","identity_sha256":"` + bridgeTestDigest + `","binding_sha256":"` + bridgeTestDigest + `","nonce_sha256":"` + bridgeTestDigest + `","operation_id_sha256":"` + bridgeTestDigest + `","config_sha256":"` + bridgeTestDigest + `","binary_sha256":"` + bridgeTestDigest + `","broker_command_sha256":"` + bridgeTestDigest + `","credential_bridge_sha256":"` + bridgeTestDigest + `","policy_sha256":"` + bridgeTestDigest + `","runtime_version":"0.153.0","started_at":"2026-09-02T12:00:00Z","completed_at":"2026-09-02T12:01:00Z","receipt_sha256":"` + bridgeTestDigest + `"}`)
 }
 
 func TestWindowsBridgeSignerRejectsUnallowlistedPayloadBeforeInvoke(t *testing.T) {
