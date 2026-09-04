@@ -40,6 +40,11 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
   array. Strict ACP agents no longer reject the otherwise valid stdio MCP
   descriptor during `session/new`, and NTM still passes no credential-bearing
   environment entries to the broker.
+- Grok ACP initialization now declares NTM's deliberately absent reverse
+  filesystem/terminal capabilities and supplies xAI's non-interactive startup
+  hints on both initialize and session creation. Grok 1.0.13 therefore blocks
+  on MCP initialization before accepting the first workspace prompt instead
+  of silently using its progressive interactive startup path.
 
 ---
 

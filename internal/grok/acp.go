@@ -689,8 +689,16 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 
 	failureStage = "initialize"
 	initRaw, err := call("initialize", initializeParams{
-		ProtocolVersion:    1,
-		ClientCapabilities: map[string]any{},
+		ProtocolVersion: 1,
+		ClientCapabilities: clientCapabilities{
+			FS:       fileSystemCapabilities{},
+			Terminal: false,
+		},
+		Meta: initializeMeta{
+			StartupHints:  ntmStartupHints(),
+			ClientType:    "ntm",
+			ClientVersion: "provider-acp-v1",
+		},
 	})
 	if err != nil {
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
@@ -718,7 +726,10 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	cachedTokenAuthenticated = true
 
 	failureStage = "session_new"
-	newRaw, err := call("session/new", sessionNewParams{CWD: req.CWD, MCPServers: mcpServers})
+	newRaw, err := call("session/new", sessionNewParams{
+		CWD: req.CWD, MCPServers: mcpServers,
+		Meta: sessionNewMeta{StartupHints: ntmStartupHints(), ModelID: strings.TrimSpace(req.Model)},
+	})
 	if err != nil {
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
 	}
@@ -1171,8 +1182,38 @@ func reconcileACPResidualsAfterReapWithInspector(receipt ProcessCleanupReceipt, 
 }
 
 type initializeParams struct {
-	ProtocolVersion    int            `json:"protocolVersion"`
-	ClientCapabilities map[string]any `json:"clientCapabilities"`
+	ProtocolVersion    int                `json:"protocolVersion"`
+	ClientCapabilities clientCapabilities `json:"clientCapabilities"`
+	Meta               initializeMeta     `json:"_meta"`
+}
+
+// NTM deliberately does not advertise ACP reverse filesystem or terminal
+// services. Grok receives all workspace authority through the typed MCP broker
+// instead. Explicit false values keep the capability boundary unambiguous.
+type clientCapabilities struct {
+	FS       fileSystemCapabilities `json:"fs"`
+	Terminal bool                   `json:"terminal"`
+}
+
+type fileSystemCapabilities struct {
+	ReadTextFile  bool `json:"readTextFile"`
+	WriteTextFile bool `json:"writeTextFile"`
+}
+
+type grokStartupHints struct {
+	NonInteractive    bool `json:"nonInteractive"`
+	SkipGitStatus     bool `json:"skipGitStatus"`
+	SkipProjectLayout bool `json:"skipProjectLayout"`
+}
+
+func ntmStartupHints() grokStartupHints {
+	return grokStartupHints{NonInteractive: true, SkipGitStatus: true, SkipProjectLayout: true}
+}
+
+type initializeMeta struct {
+	StartupHints  grokStartupHints `json:"startupHints"`
+	ClientType    string           `json:"clientType"`
+	ClientVersion string           `json:"clientVersion"`
 }
 
 type authMethod struct {
@@ -1191,6 +1232,12 @@ type authenticateParams struct {
 type sessionNewParams struct {
 	CWD        string                      `json:"cwd"`
 	MCPServers []WorkspaceBrokerDescriptor `json:"mcpServers"`
+	Meta       sessionNewMeta              `json:"_meta"`
+}
+
+type sessionNewMeta struct {
+	StartupHints grokStartupHints `json:"startupHints"`
+	ModelID      string           `json:"modelId,omitempty"`
 }
 
 type sessionNewResult struct {

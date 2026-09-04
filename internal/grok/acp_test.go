@@ -76,6 +76,16 @@ func TestRunCompletesFromACPTranscript(t *testing.T) {
 			t.Fatalf("request[%d].method = %q, want %q", index, got, want)
 		}
 	}
+	var initialize initializeParams
+	if err := json.Unmarshal(requests[0].Params, &initialize); err != nil {
+		t.Fatal(err)
+	}
+	if initialize.ProtocolVersion != 1 || initialize.ClientCapabilities.FS.ReadTextFile || initialize.ClientCapabilities.FS.WriteTextFile || initialize.ClientCapabilities.Terminal {
+		t.Fatalf("initialize capabilities = %+v", initialize)
+	}
+	if !initialize.Meta.StartupHints.NonInteractive || !initialize.Meta.StartupHints.SkipGitStatus || !initialize.Meta.StartupHints.SkipProjectLayout || initialize.Meta.ClientType != "ntm" || initialize.Meta.ClientVersion != "provider-acp-v1" {
+		t.Fatalf("initialize metadata = %+v", initialize.Meta)
+	}
 	if got := nestedString(t, requests[1].Params, "methodId"); got != "cached_token" {
 		t.Fatalf("authenticate methodId = %q, want cached_token", got)
 	}
@@ -164,6 +174,11 @@ func TestRunPlacesNamedPolicyAndExactModelBeforeACPSubcommand(t *testing.T) {
 	if !sameStrings(runner.spec.Args, want) {
 		t.Fatalf("ACP args = %#v, want %#v", runner.spec.Args, want)
 	}
+	requests := decodeRequests(t, proc.stdin.String())
+	var sessionParams sessionNewParams
+	if len(requests) < 3 || json.Unmarshal(requests[2].Params, &sessionParams) != nil || sessionParams.Meta.ModelID != "grok-exact-model" {
+		t.Fatalf("session/new model metadata = %+v", sessionParams.Meta)
+	}
 }
 
 func TestRunPassesOnlyTypedNTMWorkspaceBrokerToSessionNew(t *testing.T) {
@@ -180,6 +195,7 @@ func TestRunPassesOnlyTypedNTMWorkspaceBrokerToSessionNew(t *testing.T) {
 		t.Fatalf("session/new request = %#v", requests)
 	}
 	var params struct {
+		Meta       sessionNewMeta `json:"_meta"`
 		MCPServers []struct {
 			Name    string   `json:"name"`
 			Command string   `json:"command"`
@@ -192,6 +208,9 @@ func TestRunPassesOnlyTypedNTMWorkspaceBrokerToSessionNew(t *testing.T) {
 	}
 	if len(params.MCPServers) != 1 || params.MCPServers[0].Name != WorkspaceBrokerMCPName || !filepath.IsAbs(params.MCPServers[0].Command) || !slices.Equal(params.MCPServers[0].Args[:3], []string{"provider", "broker", "stdio"}) {
 		t.Fatalf("session/new MCP descriptor = %+v", params.MCPServers)
+	}
+	if !params.Meta.StartupHints.NonInteractive || !params.Meta.StartupHints.SkipGitStatus || !params.Meta.StartupHints.SkipProjectLayout {
+		t.Fatalf("session/new startup hints = %+v", params.Meta.StartupHints)
 	}
 	if params.MCPServers[0].Env == nil || len(params.MCPServers[0].Env) != 0 {
 		t.Fatalf("session/new MCP descriptor env = %#v, want an explicit empty ACP env array", params.MCPServers[0].Env)
