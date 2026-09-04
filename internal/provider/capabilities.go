@@ -68,6 +68,19 @@ type OperationCapabilities struct {
 	LiveErrorFeedback      EvidenceGrade `json:"live_error_feedback"`
 }
 
+// LocalLifecycleSupported admits only structured cancellation, local process
+// cleanup, and resume. It makes no assertion about remote inference or billing.
+// Actual dispatch additionally requires current signed checks for every step.
+func (c OperationCapabilities) LocalLifecycleSupported() bool {
+	cancelScope := c.CancellationAuthorityScope == EvidenceAuthorityScopeLocalProcessTree ||
+		c.CancellationAuthorityScope == EvidenceAuthorityScopeAgentACP ||
+		c.CancellationAuthorityScope == EvidenceAuthorityScopeProvider
+	cleanupScope := c.CleanupAuthorityScope == EvidenceAuthorityScopeLocalProcessTree ||
+		c.CleanupAuthorityScope == EvidenceAuthorityScopeProvider
+	return c.Cancellation == EvidenceAuthoritative && cancelScope &&
+		c.Cleanup == EvidenceAuthoritative && cleanupScope && c.Resume == EvidenceAuthoritative
+}
+
 // CapabilityMatrix is a static declaration of transport evidence, not an
 // assertion that a local account has been qualified. The key is a transport
 // identifier intentionally separate from a provider profile/config surface.

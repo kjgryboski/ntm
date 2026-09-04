@@ -50,8 +50,8 @@ func authorizeProviderOperationWithDependencies(input providerOperationAuthoriza
 	}
 	if operation == providerOperationLifecycle {
 		capability, ok := provider.CapabilityMatrix()[input.Transport]
-		if !ok || !providerLifecycleFullyAuthoritative(capability) {
-			return "", errors.New("provider lifecycle dispatch is unavailable because cancellation and cleanup are not provider-authoritative for this transport")
+		if !ok || !capability.LocalLifecycleSupported() {
+			return "", errors.New("provider lifecycle dispatch requires structured local cancellation, process cleanup, and resume support")
 		}
 	}
 	receipt, _, err := deps.load(input.QualificationDir, input.Identity.Hash(), input.Transport)
@@ -68,7 +68,7 @@ func authorizeProviderOperationWithDependencies(input providerOperationAuthoriza
 	if err != nil || providerattestation.Verify(payload, *receipt.Attestation) != nil {
 		return "", errors.New("provider operation qualification signature is invalid")
 	}
-	if receipt.Provider != input.Identity.Provider() || receipt.Transport != input.Transport || receipt.IdentitySHA256 != input.Identity.Hash() || receipt.PolicySHA256 != input.PolicySHA256 || receipt.RuntimeVersion != input.RuntimeVersion || receipt.RuntimeSHA256 != input.RuntimeSHA256 {
+	if receipt.Provider != input.Identity.Provider() || receipt.Transport != input.Transport || receipt.IdentitySHA256 != input.Identity.Hash() || receipt.PolicySHA256 != input.PolicySHA256 || !versionMatches(receipt.RuntimeVersion, input.RuntimeVersion) || receipt.RuntimeSHA256 != input.RuntimeSHA256 {
 		return "", errors.New("provider operation qualification does not bind the exact provider, transport, identity, policy, runtime version, and runtime digest")
 	}
 	now := deps.now().UTC()
@@ -100,13 +100,13 @@ func providerOperationRequiredChecks(transport, operation string) []string {
 		providerqualification.CheckPushDenied,
 	}
 	if operation == providerOperationWorkspaceWrite || operation == providerOperationLifecycle {
-		checks = append(checks, providerqualification.CheckWorkspaceEdit, providerqualification.CheckTestCommand)
-	}
-	if operation == providerOperationLifecycle {
-		checks = append(checks, providerqualification.CheckCrashRecovery, providerqualification.CheckCancellation, providerqualification.CheckResume, providerqualification.CheckProcessCleanup)
+		checks = append(checks, providerqualification.CheckWorkspaceEdit, providerqualification.CheckTestCommand, providerqualification.CheckProcessCleanup)
 		if transport == "zai_codex_runtime" {
 			checks = append(checks, "capacity_accounting")
 		}
+	}
+	if operation == providerOperationLifecycle {
+		checks = append(checks, providerqualification.CheckCrashRecovery, providerqualification.CheckCancellation, providerqualification.CheckResume)
 	}
 	return checks
 }

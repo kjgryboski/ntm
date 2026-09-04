@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -61,6 +63,64 @@ func TestReceiptSealsOnlyBoundedFailureReasons(t *testing.T) {
 	r.Checks[0].Passed = true
 	if r.Finalize() == nil {
 		t.Fatal("passing check accepted a failure reason")
+	}
+}
+
+func TestDiagnosticsAreRedactedDurableAndNeverReceipts(t *testing.T) {
+	r := passingReceipt(t, time.Now().UTC())
+	r.Provider = "SECRET_PROVIDER_CANARY"
+	r.RuntimeVersion = "SECRET_RUNTIME_CANARY"
+	r.Checks[0].Detail = "SECRET_PAYLOAD_CANARY"
+	r.Checks[0].Passed = false
+	r.Checks[0].FailureReason = provider.ProtocolSessionMismatch
+	r.Checks = append(r.Checks, Check{Name: "SECRET_CHECK_CANARY", Provenance: "live"})
+	if err := r.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	r.Checks[0].Provenance = "SECRET_PROVENANCE_CANARY"
+	r.Checks[0].EvidenceSHA256 = "SECRET_EVIDENCE_CANARY"
+	r.ReceiptSHA256 = ""
+	digest, err := digestReceipt(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.ReceiptSHA256 = digest
+	path, err := StoreDiagnostics(dir, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "SECRET_") {
+		t.Fatal("free-form data leaked")
+	}
+	var record DiagnosticObservation
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Trust != "unsigned_diagnostic_only" || record.ReceiptSHA256 != r.ReceiptSHA256 || record.Observations[0].FailureReason != provider.ProtocolSessionMismatch {
+		t.Fatal("lost diagnostic identity or structured reason")
+	}
+	var receipt Receipt
+	if json.Unmarshal(data, &receipt) != nil || receipt.Validate() == nil {
+		t.Fatal("diagnostics accepted as a receipt")
+	}
+	if _, _, err := LoadLatestForTransport(dir, r.IdentitySHA256, r.Transport); err == nil {
+		t.Fatal("diagnostics loaded as qualification")
+	}
+	second, err := StoreDiagnostics(dir, r)
+	if err != nil || second == path {
+		t.Fatal("observation was overwritten")
+	}
+	bad := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(bad, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StoreDiagnostics(bad, r); err == nil {
+		t.Fatal("storage failure ignored")
 	}
 }
 

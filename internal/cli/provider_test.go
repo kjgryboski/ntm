@@ -54,6 +54,76 @@ func TestProviderCapabilitiesHumanOutputIncludesAuthorityScopes(t *testing.T) {
 	}
 }
 
+func TestProviderBaselineSurfaceDoesNotGrandfatherPrimaryProviders(t *testing.T) {
+	cmd := newProviderBaselineCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"openai", "anthropic", "xai", "zai"} {
+		if !strings.Contains(out.String(), name+"\t\tassignment\tuntested") {
+			t.Fatalf("missing common baseline for %s", name)
+		}
+	}
+	if strings.Contains(out.String(), "\tproven") {
+		t.Fatal("unbound provider granted evidence")
+	}
+}
+
+func TestProviderBaselineSeparatesCapabilitySupportFromLiveEvidence(t *testing.T) {
+	report := providerDoctorReport{Identity: providerDoctorIdentity{Provider: "zai", Runtime: "codex", BillingClass: "coding_plan"}, Profile: "exact-zai", Transport: "zai_codex_runtime",
+		Runtime: providerDoctorRuntime{Drift: "none"}, Capabilities: provider.CapabilityMatrix()["zai_codex_runtime"],
+		Qualification: providerDoctorQualification{TrustedCurrent: true, ReceiptSHA256: providerTestHash("receipt"), CheckStates: map[string]bool{providerqualification.CheckWorkspaceEdit: true}},
+	}
+	lane := providerBaselineForReport(report)
+	if lane.Provider != "zai" || lane.Identity.Runtime != "codex" || lane.Identity.BillingClass != "coding_plan" {
+		t.Fatal("runtime erased provider identity")
+	}
+	states := map[string]string{}
+	for _, check := range lane.Checks {
+		states[check.Operation] = check.State
+	}
+	if states["workspace_edit"] != "proven" || states["assignment"] != "untested" || states["resume"] != "untested" {
+		t.Fatalf("overstated evidence: %v", states)
+	}
+	report.Qualification.TrustedCurrent = false
+	for _, check := range providerBaselineForReport(report).Checks {
+		if check.State == "proven" {
+			t.Fatal("unsigned evidence promoted")
+		}
+	}
+	report.Capabilities = provider.CapabilityMatrix()["xai_acp"]
+	for _, check := range providerBaselineForReport(report).Checks {
+		if check.Operation == "resume" && check.State != "unsupported" {
+			t.Fatal("unsupported ACP resume hidden")
+		}
+	}
+}
+
+func TestWorkspaceQualificationRequiresCleanupAndCodexCapacity(t *testing.T) {
+	for _, transport := range []string{"xai_acp", "zai_codex_runtime"} {
+		report := providerDoctorReport{Transport: transport, Qualification: providerDoctorQualification{TrustedCurrent: true, CheckStates: map[string]bool{}}}
+		for _, name := range providerOperationRequiredChecks(transport, providerOperationWorkspaceWrite) {
+			report.Qualification.CheckStates[name] = true
+		}
+		if !providerDoctorWorkspaceEvidence(report) {
+			t.Fatal("complete workspace evidence rejected")
+		}
+		report.Qualification.CheckStates[providerqualification.CheckProcessCleanup] = false
+		if providerDoctorWorkspaceEvidence(report) {
+			t.Fatal("workspace promotion omitted cleanup")
+		}
+		report.Qualification.CheckStates[providerqualification.CheckProcessCleanup] = true
+		if transport == "zai_codex_runtime" {
+			report.Qualification.CheckStates["capacity_accounting"] = false
+			if providerDoctorWorkspaceEvidence(report) {
+				t.Fatal("Codex workspace promotion omitted capacity")
+			}
+		}
+	}
+}
+
 func TestProviderRuntimeVersionPinMatchesOnlyAnExactToken(t *testing.T) {
 	if !versionMatches("grok 1.0.13", "1.0.13") || !versionMatches("2.1.252 (Claude Code)", "2.1.252") {
 		t.Fatal("exact runtime version token did not match")
@@ -635,7 +705,7 @@ func TestProviderSessionOperationGateBlocksDispatchBeforeAdmission(t *testing.T)
 	}
 }
 
-func TestProviderSessionLifecycleAuthorityBlocksSignedHeadlessQualificationBeforeRunner(t *testing.T) {
+func TestProviderSessionSignedLocalLifecycleReachesRunner(t *testing.T) {
 	profile := providerTestGrokProfile(agent.DefaultGrokAutomationPolicyName)
 	identity, err := profile.Identity()
 	if err != nil {
@@ -690,19 +760,17 @@ func TestProviderSessionLifecycleAuthorityBlocksSignedHeadlessQualificationBefor
 			now: func() time.Time { return now.Add(time.Minute) },
 		})
 	}
+	ran := false
 	deps.run = func(context.Context, grok.LifecycleRunner, grok.SessionRequest) (grok.SessionReceipt, error) {
-		t.Fatal("a signed qualification bypassed the provider-scope lifecycle authority boundary")
-		return grok.SessionReceipt{}, nil
+		ran = true
+		return grok.SessionReceipt{}, errors.New("bounded test interruption")
 	}
 
 	err = runProviderSession(&cobra.Command{}, grok.SessionResume, providerSessionOptions{
 		profile: "grok-qualified", sessionID: "parent", prompt: "bounded", cwd: t.TempDir(), timeout: time.Second,
 	}, deps)
-	if err == nil || !strings.Contains(err.Error(), "not provider-authoritative") {
-		t.Fatalf("err=%v", err)
-	}
-	if qualificationLoaded || admission.acquires != 0 || admission.releases != 0 || admission.successes != 0 {
-		t.Fatalf("signed receipt reached dispatch path: loaded=%v admission=%+v", qualificationLoaded, admission)
+	if !qualificationLoaded || !ran || admission.acquires != 1 || admission.releases != 1 || admission.successes != 0 {
+		t.Fatalf("local lifecycle did not dispatch and release correctly: err=%v loaded=%v ran=%v admission=%+v", err, qualificationLoaded, ran, admission)
 	}
 }
 
@@ -1472,6 +1540,7 @@ func TestProviderDoctorOperationScopedPromotion(t *testing.T) {
 		passingChecks = append(passingChecks, providerDoctorCheck{ID: id, Status: providerDoctorPass})
 	}
 	allQualificationChecks := map[string]bool{
+		"capacity_accounting":                     true,
 		providerqualification.CheckIdentity:       true,
 		providerqualification.CheckWorkspaceEdit:  true,
 		providerqualification.CheckTestCommand:    true,

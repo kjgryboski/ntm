@@ -339,24 +339,11 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	if err := receipt.Finalize(); err != nil {
 		return err
 	}
-	payload, err := receipt.CanonicalPayload()
-	if err != nil {
-		return err
-	}
-	if err := providerattestation.ValidateBridgePayload(payload); err != nil {
-		return fmt.Errorf("Codex qualification receipt violates the signing bridge contract: %w", err)
-	}
 	qualificationReceiptCtx, qualificationReceiptCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	signature, err := signPayload(qualificationReceiptCtx, payload)
+	err = signProviderQualificationReceiptWithKey(qualificationReceiptCtx, &receipt, signPayload, signerPreflight.KeyMetadata)
 	qualificationReceiptCancel()
 	if err != nil {
 		return fmt.Errorf("sign Codex qualification receipt: %w", err)
-	}
-	if signature.KeyMetadata != signerPreflight.KeyMetadata {
-		return errors.New("Codex qualification receipt signer changed after preflight")
-	}
-	if err := receipt.AttachAttestation(signature); err != nil {
-		return err
 	}
 	path, err := deps.store(opts.qualificationDir, receipt)
 	if err != nil {
@@ -636,22 +623,8 @@ func sealAndStoreProviderCodexIdentityPreflight(ctx context.Context, receipt *pr
 	if err := receipt.Finalize(); err != nil {
 		return "", err
 	}
-	payload, err := receipt.CanonicalPayload()
-	if err != nil {
-		return "", err
-	}
-	if err := providerattestation.ValidateBridgePayload(payload); err != nil {
-		return "", fmt.Errorf("Codex identity preflight receipt violates the signing bridge contract: %w", err)
-	}
-	signature, err := signPayload(ctx, payload)
-	if err != nil {
+	if err := signProviderQualificationReceiptWithKey(ctx, receipt, signPayload, trustedSigner); err != nil {
 		return "", fmt.Errorf("sign Codex identity preflight receipt: %w", err)
-	}
-	if signature.KeyMetadata != trustedSigner {
-		return "", errors.New("Codex identity preflight receipt signer changed after preflight")
-	}
-	if err := receipt.AttachAttestation(signature); err != nil {
-		return "", err
 	}
 	path, err := store(*receipt)
 	if err != nil {

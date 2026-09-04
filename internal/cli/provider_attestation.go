@@ -45,15 +45,7 @@ func signProviderQualificationReceipt(ctx context.Context, receipt *providerqual
 	if receipt == nil || providerReceiptAttestor == nil {
 		return errors.New("provider qualification receipt attestor is unavailable")
 	}
-	payload, err := receipt.CanonicalPayload()
-	if err != nil {
-		return err
-	}
-	signature, err := providerReceiptAttestor.Sign(ctx, providerReceiptAttestationKey, payload)
-	if err != nil {
-		return err
-	}
-	return receipt.AttachAttestation(signature)
+	return signProviderQualificationReceiptWith(ctx, receipt, signProviderReceiptPayload)
 }
 
 // signProviderQualificationReceiptWith keeps receipt attachment identical for
@@ -62,15 +54,41 @@ func signProviderQualificationReceiptWith(ctx context.Context, receipt *provider
 	if receipt == nil || sign == nil {
 		return errors.New("provider qualification receipt signer is unavailable")
 	}
+	diagnosticPath, err := providerqualification.StoreDiagnostics("", *receipt)
+	if err != nil {
+		return fmt.Errorf("preserve qualification diagnostics before signing: %w", err)
+	}
 	payload, err := receipt.CanonicalPayload()
 	if err != nil {
 		return err
 	}
 	signature, err := sign(ctx, payload)
 	if err != nil {
-		return err
+		return fmt.Errorf("qualification signing failed; unsigned diagnostics preserved at %s: %w", diagnosticPath, err)
 	}
-	return receipt.AttachAttestation(signature)
+	if err := receipt.AttachAttestation(signature); err != nil {
+		return fmt.Errorf("qualification signature invalid; unsigned diagnostics preserved at %s: %w", diagnosticPath, err)
+	}
+	return nil
+}
+
+func signProviderQualificationReceiptWithKey(ctx context.Context, receipt *providerqualification.Receipt, sign func(context.Context, []byte) (providerattestation.SignatureMetadata, error), trusted providerattestation.KeyMetadata) error {
+	if sign == nil {
+		return errors.New("provider qualification receipt signer is unavailable")
+	}
+	return signProviderQualificationReceiptWith(ctx, receipt, func(ctx context.Context, payload []byte) (providerattestation.SignatureMetadata, error) {
+		if err := providerattestation.ValidateBridgePayload(payload); err != nil {
+			return providerattestation.SignatureMetadata{}, err
+		}
+		signature, err := sign(ctx, payload)
+		if err != nil {
+			return signature, err
+		}
+		if signature.KeyMetadata != trusted {
+			return providerattestation.SignatureMetadata{}, errors.New("qualification receipt signer changed after preflight")
+		}
+		return signature, nil
+	})
 }
 
 // providerProfilePinnedSigner refuses ambient bridge selection.  Grok and

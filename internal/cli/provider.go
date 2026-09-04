@@ -402,7 +402,7 @@ func newProviderCmd() *cobra.Command {
 		Use:   "provider",
 		Short: "Inspect and qualify exact AI provider lanes",
 	}
-	cmd.AddCommand(newProviderDoctorCmd(), newProviderQualifyCmd(), newProviderSessionCmd(), newProviderNativeRunCmd(), newProviderCodexCmd(), newProviderVerifyCmd(), newProviderCredentialCmd(), newProviderAttestationCmd(), newProviderCapabilitiesCmd(), newProviderPolicyCmd(), newProviderTelemetryCmd(), newProviderBrokerCmd(), newProviderRoutingCmd())
+	cmd.AddCommand(newProviderDoctorCmd(), newProviderBaselineCmd(), newProviderQualifyCmd(), newProviderSessionCmd(), newProviderNativeRunCmd(), newProviderCodexCmd(), newProviderVerifyCmd(), newProviderCredentialCmd(), newProviderAttestationCmd(), newProviderCapabilitiesCmd(), newProviderPolicyCmd(), newProviderTelemetryCmd(), newProviderBrokerCmd(), newProviderRoutingCmd())
 	return cmd
 }
 
@@ -845,6 +845,121 @@ func newProviderCapabilitiesCmd() *cobra.Command {
 	}
 }
 
+type providerBaselineCheck struct {
+	Operation      string `json:"operation"`
+	State          string `json:"state"`
+	EvidenceSHA256 string `json:"evidence_sha256,omitempty"`
+}
+
+type providerBaselineLane struct {
+	Provider           string                          `json:"provider"`
+	Profile            string                          `json:"profile,omitempty"`
+	Identity           providerDoctorIdentity          `json:"identity"`
+	Transport          string                          `json:"transport,omitempty"`
+	QualificationState string                          `json:"qualification_state"`
+	CapacityBlock      string                          `json:"capacity_block,omitempty"`
+	CancellationScope  provider.EvidenceAuthorityScope `json:"cancellation_scope,omitempty"`
+	CleanupScope       provider.EvidenceAuthorityScope `json:"cleanup_scope,omitempty"`
+	Checks             []providerBaselineCheck         `json:"checks"`
+}
+
+// baseline is an offline evidence inventory, not a new qualification engine.
+// Ordinary pane usability never substitutes for the common signed scenarios.
+func newProviderBaselineCmd() *cobra.Command {
+	var profiles []string
+	cmd := &cobra.Command{Use: "baseline", Short: "Compare common provider evidence without making provider calls", Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			lanes := []providerBaselineLane{}
+			seen := map[string]bool{}
+			loaded := loadSelectedConfigOrDefault()
+			for _, profile := range profiles {
+				report, err := buildProviderDoctorReport(providerCommandContext(cmd), loaded, providerCommandOptions{
+					profile: profile, timeout: 60 * time.Second, qualificationAge: 24 * time.Hour, requireOperation: providerOperationWorkspaceWrite,
+				}, providerDoctorDeps)
+				if err != nil {
+					return err
+				}
+				lanes = append(lanes, providerBaselineForReport(report))
+				seen[report.Identity.Provider] = true
+			}
+			for _, name := range []string{"openai", "anthropic", "xai", "zai"} {
+				if !seen[name] {
+					lanes = append(lanes, providerBaselineForReport(providerDoctorReport{Identity: providerDoctorIdentity{Provider: name}}))
+				}
+			}
+			if IsJSONOutput() {
+				return encodeIndentedJSON(cmd.OutOrStdout(), struct {
+					Schema string                 `json:"schema_version"`
+					Note   string                 `json:"note"`
+					Lanes  []providerBaselineLane `json:"lanes"`
+				}{"ntm.provider-baseline.v1", "Offline inventory only. Unproven means a signed check is negative or lacks evidence; it does not assert whether the scenario was attempted. Untested means no trusted current evidence is available. No readiness is granted.", lanes})
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "PROVIDER\tPROFILE\tOPERATION\tEVIDENCE_STATE")
+			for _, lane := range lanes {
+				for _, check := range lane.Checks {
+					fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\n", lane.Provider, lane.Profile, check.Operation, check.State)
+				}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringSliceVar(&profiles, "profile", nil, "Exact profiles to inspect offline; may be repeated")
+	return cmd
+}
+
+func providerBaselineForReport(report providerDoctorReport) providerBaselineLane {
+	lane := providerBaselineLane{Provider: report.Identity.Provider, Profile: report.Profile, Identity: report.Identity,
+		Transport: report.Transport, QualificationState: report.Qualification.State,
+		CancellationScope: report.Capabilities.CancellationAuthorityScope, CleanupScope: report.Capabilities.CleanupAuthorityScope}
+	if report.Profile == "" {
+		lane.QualificationState = "identity_not_bound"
+	} else {
+		lane.CapacityBlock = providerDoctorCapacityAdmissionBlock(report.Capacity)
+	}
+	current := report.Qualification.TrustedCurrent && report.Runtime.Drift == "none"
+	for _, scenario := range []struct {
+		name        string
+		checks      []string
+		unsupported bool
+	}{
+		{"launch", nil, false}, {"assignment", nil, false}, {"prompt_delivery", nil, false},
+		{"model_identity", []string{providerqualification.CheckIdentity}, false},
+		{"workspace_edit", []string{providerqualification.CheckWorkspaceEdit}, false},
+		{"test_execution", []string{providerqualification.CheckTestCommand}, false},
+		{"permission_denial", []string{providerqualification.CheckSecretDenied, providerqualification.CheckPushDenied}, false},
+		{"completion_detection", nil, report.Capabilities.Completion == provider.EvidenceUnavailable},
+		{"cancellation", []string{providerqualification.CheckCancellation}, report.Capabilities.Cancellation == provider.EvidenceUnavailable},
+		{"recovery", []string{providerqualification.CheckCrashRecovery}, false},
+		{"resume", []string{providerqualification.CheckResume}, report.Capabilities.Resume == provider.EvidenceUnavailable},
+		{"cleanup", []string{providerqualification.CheckProcessCleanup}, report.Capabilities.Cleanup == provider.EvidenceUnavailable},
+		{"capacity_accounting", []string{"capacity_accounting"}, false},
+	} {
+		check := providerBaselineCheck{Operation: scenario.name, State: "untested"}
+		if scenario.unsupported {
+			check.State = "unsupported"
+		} else if current && len(scenario.checks) > 0 {
+			present := true
+			for _, name := range scenario.checks {
+				if _, ok := report.Qualification.CheckStates[name]; !ok {
+					present = false
+				}
+			}
+			if present {
+				check.State = "unproven"
+				check.EvidenceSHA256 = report.Qualification.ReceiptSHA256
+				if qualificationChecksPassed(report.Qualification, scenario.checks...) {
+					check.State = "proven"
+				}
+				if scenario.name == "model_identity" && !report.Qualification.ModelIdentityVerified {
+					check.State = "unproven"
+				}
+			}
+		}
+		lane.Checks = append(lane.Checks, check)
+	}
+	return lane
+}
+
 func runProviderDoctor(cmd *cobra.Command, opts providerCommandOptions) error {
 	started := providerDoctorDeps.now().UTC()
 	if strings.TrimSpace(opts.profile) == "" {
@@ -1016,7 +1131,7 @@ func buildProviderDoctorReport(ctx context.Context, cfg *config.Config, opts pro
 
 	if opts.online {
 		if report.Transport == "zai_codex_runtime" {
-			if report.Qualification.State == "current_pass" && report.Qualification.ModelIdentityVerified {
+			if report.Qualification.TrustedCurrent && report.Qualification.ModelIdentityVerified {
 				report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorPass, Provenance: "signed_live_qualification", Summary: "current signed qualification observed the exact provider-reported model and authenticated Coding Plan lane", Evidence: report.Qualification.ReceiptSHA256})
 			} else {
 				report.Checks = append(report.Checks, providerDoctorCheck{ID: "model_entitlement", Status: providerDoctorFail, Provenance: "signed_live_qualification", Summary: "a current signed qualification with exact provider-reported model evidence is required; Codex doctor dispatch remains disabled", Evidence: report.Qualification.ReceiptSHA256, Remediation: "Run the explicit provider qualification suite after reviewing the pinned Codex runtime and policy"})
@@ -1394,7 +1509,7 @@ func diagnoseQualification(identity provider.Identity, transport, policySHA stri
 		result.TrustedCurrent = true
 		result.CheckStates = make(map[string]bool, len(receipt.Checks))
 		for _, check := range receipt.Checks {
-			result.CheckStates[check.Name] = check.Passed
+			result.CheckStates[check.Name] = providerqualification.AuthoritativePassedCheck(check)
 		}
 		result.ModelIdentityVerified = qualificationReceiptModelIdentityVerified(receipt, transport)
 	}
@@ -1598,8 +1713,8 @@ func providerDoctorPromotionForReport(report providerDoctorReport, requiredOpera
 		Scopes: []providerDoctorOperationScope{
 			{Operation: providerOperationObserve, Evidence: "live exact-identity completion"},
 			{Operation: providerOperationReview, Evidence: "bounded no-write provider operation"},
-			{Operation: providerOperationWorkspaceWrite, Evidence: "signed edit/test/denial qualification"},
-			{Operation: providerOperationLifecycle, Evidence: "signed crash/cancel/resume/cleanup qualification"},
+			{Operation: providerOperationWorkspaceWrite, Evidence: "signed edit/test/denial/cleanup qualification; Z.ai Codex also requires capacity accounting"},
+			{Operation: providerOperationLifecycle, Evidence: "signed local crash/cancel/resume/cleanup qualification; remote inference stop is separately reported"},
 		},
 	}
 
@@ -1679,13 +1794,9 @@ func providerDoctorReviewEvidence(report providerDoctorReport) bool {
 func providerDoctorWorkspaceEvidence(report providerDoctorReport) bool {
 	switch report.Transport {
 	case "xai_acp", "xai_headless_session":
-		return qualificationChecksPassed(report.Qualification,
-			providerqualification.CheckIdentity, providerqualification.CheckWorkspaceEdit, providerqualification.CheckTestCommand,
-			providerqualification.CheckSecretDenied, providerqualification.CheckPushDenied)
+		return qualificationChecksPassed(report.Qualification, providerOperationRequiredChecks(report.Transport, providerOperationWorkspaceWrite)...)
 	case "zai_codex_runtime":
-		return qualificationChecksPassed(report.Qualification,
-			providerqualification.CheckIdentity, providerqualification.CheckWorkspaceEdit, providerqualification.CheckTestCommand,
-			providerqualification.CheckSecretDenied, providerqualification.CheckPushDenied)
+		return qualificationChecksPassed(report.Qualification, providerOperationRequiredChecks(report.Transport, providerOperationWorkspaceWrite)...)
 	case "zai_native_api":
 		return report.Policy.Name == provider.NativeZAIToolsPolicyName && qualificationChecksPassed(report.Qualification,
 			"exact_model_request_id", "controller_tool_loop", "workspace_edit", "isolated_verification", "protected_path_denial", "shell_and_push_absent")
@@ -1696,9 +1807,7 @@ func providerDoctorWorkspaceEvidence(report providerDoctorReport) bool {
 }
 
 func providerDoctorLifecycleEvidence(report providerDoctorReport) bool {
-	if report.Capabilities.Cancellation != provider.EvidenceAuthoritative ||
-		report.Capabilities.Resume != provider.EvidenceAuthoritative ||
-		report.Capabilities.Cleanup != provider.EvidenceAuthoritative {
+	if !report.Capabilities.LocalLifecycleSupported() {
 		return false
 	}
 	switch report.Transport {

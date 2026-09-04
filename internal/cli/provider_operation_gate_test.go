@@ -207,7 +207,7 @@ func TestAuthorizeProviderOperationPromotesOnlyQualifiedGrokWorkspaceOperations(
 	runtimeSHA256 := strings.Repeat("c", 64)
 	receipt := providerqualification.Receipt{
 		Mode: providerqualification.ModeLive, Provider: "xai", Transport: "xai_acp",
-		IdentitySHA256: identity.Hash(), PolicySHA256: policySHA256, RuntimeVersion: profile.RuntimeVersion, RuntimeSHA256: runtimeSHA256,
+		IdentitySHA256: identity.Hash(), PolicySHA256: policySHA256, RuntimeVersion: "grok " + profile.RuntimeVersion + " (build) [stable]", RuntimeSHA256: runtimeSHA256,
 		StartedAt: now.Add(-time.Minute), CompletedAt: now, DisposableRepoHash: strings.Repeat("b", 64), Checks: checks,
 	}
 	if err := receipt.Finalize(); err != nil {
@@ -243,6 +243,11 @@ func TestAuthorizeProviderOperationPromotesOnlyQualifiedGrokWorkspaceOperations(
 			t.Fatalf("operation %q digest=%q err=%v", operation, digest, err)
 		}
 	}
+	input.RuntimeVersion = profile.RuntimeVersion + "0"
+	if _, err := authorizeProviderOperationWithDependencies(input, deps); err == nil {
+		t.Fatal("runtime banner matched a different version")
+	}
+	input.RuntimeVersion = profile.RuntimeVersion
 	input.Operation = providerOperationLifecycle
 	if digest, err := authorizeProviderOperationWithDependencies(input, deps); err == nil || digest != "" {
 		t.Fatalf("lifecycle accepted workspace-only receipt: digest=%q err=%v", digest, err)
@@ -278,7 +283,7 @@ func TestAuthorizeProviderOperationPromotesOnlyQualifiedGrokWorkspaceOperations(
 	}
 }
 
-func TestAuthorizeProviderOperationRejectsLifecycleWhenAuthorityIsOnlyLocal(t *testing.T) {
+func TestAuthorizeProviderOperationRequiresLocalSupportAndSignedEvidence(t *testing.T) {
 	for _, transport := range []string{"xai_acp", "xai_headless_session", "zai_codex_runtime"} {
 		t.Run(transport, func(t *testing.T) {
 			profile := providerTestGrokProfile(agent.GrokWorkspaceWritePolicyName)
@@ -299,11 +304,11 @@ func TestAuthorizeProviderOperationRejectsLifecycleWhenAuthorityIsOnlyLocal(t *t
 				},
 				now: time.Now,
 			})
-			if err == nil || !strings.Contains(err.Error(), "not provider-authoritative") {
+			if err == nil {
 				t.Fatalf("lifecycle authority error = %v", err)
 			}
-			if loaded {
-				t.Fatal("qualification receipt was consulted after the static authority boundary failed")
+			if loaded != (transport != "xai_acp") {
+				t.Fatal("supported local lifecycle must consult signed evidence; ACP without resume must stop first")
 			}
 		})
 	}

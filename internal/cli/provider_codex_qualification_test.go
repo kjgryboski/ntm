@@ -87,7 +87,7 @@ func TestProviderCodexQualificationProducesTenGateReceiptAndCleansGeneratedRoot(
 	var preflightStored providerqualification.Receipt
 	calls := 0
 	var preflightCWD string
-	deps := codexQualificationDepsForTest(profile, admission, func(ctx context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+	deps := codexQualificationDepsForTest(t, profile, admission, func(ctx context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		calls++
 		if spec.ManifestVerifier == nil || spec.ManifestVerifier(ctx) != nil {
 			t.Fatal("qualification turn omitted its manifest verifier")
@@ -197,7 +197,7 @@ func TestProviderCodexIdentityOnlyRunsExactlyOneSignedReadOnlyPreflight(t *testi
 	}
 	calls := 0
 	var stored providerqualification.Receipt
-	deps := codexQualificationDepsForTest(profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+	deps := codexQualificationDepsForTest(t, profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		calls++
 		if spec.WorkspaceWrite || spec.Resume || spec.ExpectedToolCommand != "" || spec.ExpectedFileChange != "" {
 			t.Fatalf("identity-only preflight received mutating/lifecycle spec: %+v", spec)
@@ -372,7 +372,7 @@ func TestProviderCodexQualificationRejectsBridgeWithoutTurnSchemaBeforeAdmission
 		status:   ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared},
 	}
 	providerCalls := 0
-	deps := codexQualificationDepsForTest(profile, admission, func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+	deps := codexQualificationDepsForTest(t, profile, admission, func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		providerCalls++
 		return zai.CodexRunReceipt{}, nil
 	})
@@ -401,7 +401,7 @@ func TestProviderCodexQualificationRejectsSignerChangeOnFinalReceipt(t *testing.
 	var workspace providerCodexQualificationWorkspace
 	providerCalls, signCalls := 0, 0
 	finalStored := false
-	deps := codexQualificationDepsForTest(profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+	deps := codexQualificationDepsForTest(t, profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		providerCalls++
 		if spec.ExpectedFileChange != "" {
 			if err := os.WriteFile(filepath.Join(spec.CWD, spec.ExpectedFileChange), []byte(workspace.ExpectedContent), 0o600); err != nil {
@@ -441,6 +441,7 @@ func TestProviderCodexQualificationRejectsSignerChangeOnFinalReceipt(t *testing.
 	if err == nil || !strings.Contains(err.Error(), "signer changed after preflight") || providerCalls != 4 || signCalls != 8 || finalStored || !codexQualificationWorkspaceRemoved(workspace) {
 		t.Fatalf("err=%v provider_calls=%d sign_calls=%d final_stored=%t workspace=%+v", err, providerCalls, signCalls, finalStored, workspace)
 	}
+	assertCodexQualificationDiagnostics(t, identity.Hash(), 2)
 }
 
 func TestProviderCodexQualificationSkipsUnknownOutcomeLifecycleByDefault(t *testing.T) {
@@ -453,7 +454,7 @@ func TestProviderCodexQualificationSkipsUnknownOutcomeLifecycleByDefault(t *test
 	var workspace providerCodexQualificationWorkspace
 	var stored providerqualification.Receipt
 	calls := 0
-	deps := codexQualificationDepsForTest(profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+	deps := codexQualificationDepsForTest(t, profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		calls++
 		if calls == 2 {
 			if err := os.WriteFile(filepath.Join(spec.CWD, "qualification.go"), []byte(workspace.ExpectedContent), 0o600); err != nil {
@@ -524,7 +525,7 @@ func TestProviderCodexQualificationPreflightsBrokerBeforeWorkspace(t *testing.T)
 		t.Fatal(err)
 	}
 	prepared := false
-	deps := codexQualificationDepsForTest(profile, &codexQualificationAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}, func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+	deps := codexQualificationDepsForTest(t, profile, &codexQualificationAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}, func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		return zai.CodexRunReceipt{}, errors.New("not reached")
 	})
 	deps.credentialStatus = func(context.Context, config.ProviderProfileConfig) (providercredential.Status, error) {
@@ -548,7 +549,7 @@ func TestProviderCodexQualificationRejectsSignerChangeOnIdentityPreflight(t *tes
 	admission := &codexQualificationAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}
 	providerCalls, signCalls := 0, 0
 	prepared, stored := false, false
-	deps := codexQualificationDepsForTest(profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+	deps := codexQualificationDepsForTest(t, profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		providerCalls++
 		return successfulProviderCodexReceipt(spec), nil
 	})
@@ -574,6 +575,25 @@ func TestProviderCodexQualificationRejectsSignerChangeOnIdentityPreflight(t *tes
 	if err == nil || !strings.Contains(err.Error(), "signer changed after preflight") || providerCalls != 1 || signCalls != 4 || prepared || stored {
 		t.Fatalf("err=%v provider_calls=%d sign_calls=%d prepared=%t stored=%t", err, providerCalls, signCalls, prepared, stored)
 	}
+	assertCodexQualificationDiagnostics(t, identity.Hash(), 1)
+}
+
+func assertCodexQualificationDiagnostics(t *testing.T, identity string, count int) {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(os.Getenv("XDG_STATE_HOME"), "ntm", "provider-diagnostics", identity, "*.json"))
+	if err != nil || len(paths) != count {
+		t.Fatalf("diagnostics=%v want=%d err=%v", paths, count, err)
+	}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var record providerqualification.DiagnosticObservation
+		if json.Unmarshal(data, &record) != nil || record.Trust != "unsigned_diagnostic_only" || record.IdentitySHA256 != identity {
+			t.Fatal("missing redacted unsigned observation")
+		}
+	}
 }
 
 func TestProviderCodexQualificationAppliesSuiteTimeoutBeforeWorkspace(t *testing.T) {
@@ -583,7 +603,7 @@ func TestProviderCodexQualificationAppliesSuiteTimeoutBeforeWorkspace(t *testing
 		t.Fatal(err)
 	}
 	prepared := false
-	deps := codexQualificationDepsForTest(profile, &codexQualificationAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}, func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+	deps := codexQualificationDepsForTest(t, profile, &codexQualificationAdmissionFake{decision: ratelimit.SubscriptionDecision{Allowed: true, NoFailover: true}, status: ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared}}, func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		return zai.CodexRunReceipt{}, errors.New("not reached")
 	})
 	deps.attest = func(ctx context.Context, _ zai.CodexManifestExpectation) (zai.CodexManifestAttestation, error) {
@@ -611,7 +631,7 @@ func TestProviderCodexQualificationModelGapStopsBeforeWorkspace(t *testing.T) {
 	stored := false
 	var preflightStored providerqualification.Receipt
 	calls := 0
-	deps := codexQualificationDepsForTest(profile, admission, func(ctx context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+	deps := codexQualificationDepsForTest(t, profile, admission, func(ctx context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		calls++
 		if spec.ManifestVerifier == nil || spec.ManifestVerifier(ctx) != nil {
 			t.Fatal("missing manifest verifier")
@@ -671,7 +691,7 @@ func TestProviderCodexQualificationBindingFailureCancelsBeforeDispatch(t *testin
 		bindErr:  errors.New("binding unavailable"),
 	}
 	prepared, calls := false, 0
-	deps := codexQualificationDepsForTest(profile, admission, func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+	deps := codexQualificationDepsForTest(t, profile, admission, func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		calls++
 		return zai.CodexRunReceipt{}, nil
 	})
@@ -704,7 +724,7 @@ func TestProviderCodexQualificationRejectsPreflightToolActivityBeforeWorkspace(t
 		status:   ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared},
 	}
 	prepared, calls := false, 0
-	deps := codexQualificationDepsForTest(profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+	deps := codexQualificationDepsForTest(t, profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		calls++
 		receipt := successfulProviderCodexReceipt(spec)
 		receipt.ToolEventCount = 1
@@ -740,7 +760,7 @@ func TestProviderCodexQualificationRejectsContradictoryPreflightResidualsBeforeW
 		status:   ratelimit.CapacityStatus{Scope: provider.CapacityControlScopeLocalShared},
 	}
 	prepared, calls := false, 0
-	deps := codexQualificationDepsForTest(profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
+	deps := codexQualificationDepsForTest(t, profile, admission, func(_ context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {
 		calls++
 		receipt := successfulProviderCodexReceipt(spec)
 		receipt.ZeroResiduals = true
@@ -771,7 +791,9 @@ func TestProviderCodexQualificationRejectsContradictoryPreflightResidualsBeforeW
 	}
 }
 
-func codexQualificationDepsForTest(profile config.ProviderProfileConfig, admission providerCodexQualificationAdmission, run func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error)) providerCodexQualificationDependencies {
+func codexQualificationDepsForTest(t *testing.T, profile config.ProviderProfileConfig, admission providerCodexQualificationAdmission, run func(context.Context, zai.CodexRunSpec) (zai.CodexRunReceipt, error)) providerCodexQualificationDependencies {
+	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	ledger := &providerNativeLedgerFake{}
 	return providerCodexQualificationDependencies{
 		attest: func(context.Context, zai.CodexManifestExpectation) (zai.CodexManifestAttestation, error) {

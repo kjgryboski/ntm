@@ -422,6 +422,96 @@ func DefaultCodexIdentityPreflightStoreDir() string {
 	return filepath.Join(filepath.Dir(DefaultStoreDir()), "provider-codex-identity-preflights")
 }
 
+// DiagnosticObservation is deliberately not a Receipt. It cannot validate or
+// authorize work even if copied into the qualification store. Free-form text
+// is excluded; only fixed check names, closed reasons, and digests survive.
+type DiagnosticObservation struct {
+	SchemaVersion  string            `json:"schema_version"`
+	Trust          string            `json:"trust"`
+	Transport      string            `json:"transport"`
+	IdentitySHA256 string            `json:"identity_sha256"`
+	PolicySHA256   string            `json:"policy_sha256"`
+	RuntimeSHA256  string            `json:"runtime_sha256,omitempty"`
+	ReceiptSHA256  string            `json:"observed_receipt_sha256"`
+	StartedAt      time.Time         `json:"started_at"`
+	CompletedAt    time.Time         `json:"completed_at"`
+	Observations   []DiagnosticCheck `json:"observations"`
+}
+
+type DiagnosticCheck struct {
+	Name           string                         `json:"name"`
+	Passed         bool                           `json:"observed_pass"`
+	Provenance     string                         `json:"observed_provenance"`
+	EvidenceSHA256 string                         `json:"evidence_sha256,omitempty"`
+	FailureReason  provider.ProtocolFailureReason `json:"failure_reason,omitempty"`
+}
+
+// StoreDiagnostics flushes an unsigned redacted observation before signing.
+// A failed signature or process exit leaves this separate, non-promoting record.
+// Callers must stop if storage fails, rather than risk losing another paid run.
+func StoreDiagnostics(baseDir string, receipt Receipt) (string, error) {
+	if err := receipt.Validate(); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(baseDir) == "" {
+		baseDir = filepath.Join(filepath.Dir(DefaultStoreDir()), "provider-diagnostics")
+	}
+	required, err := requiredChecksForTransport(receipt.Transport)
+	if err != nil {
+		return "", err
+	}
+	allowed := make(map[string]bool, len(required))
+	for _, name := range required {
+		allowed[name] = true
+	}
+	record := DiagnosticObservation{
+		SchemaVersion: "ntm.provider-diagnostic.v1", Trust: "unsigned_diagnostic_only",
+		Transport: receipt.Transport, IdentitySHA256: receipt.IdentitySHA256,
+		PolicySHA256: receipt.PolicySHA256, RuntimeSHA256: receipt.RuntimeSHA256,
+		ReceiptSHA256: receipt.ReceiptSHA256, StartedAt: receipt.StartedAt, CompletedAt: receipt.CompletedAt,
+	}
+	for _, check := range receipt.Checks {
+		if !allowed[check.Name] {
+			continue
+		}
+		// Failed legacy receipts may validate without authoritative provenance
+		// or a well-formed evidence hash. Never serialize those free-form fields.
+		if !authoritativeProvenance(check.Provenance) {
+			check.Provenance = "unavailable"
+		}
+		if !isSHA256(check.EvidenceSHA256) {
+			check.EvidenceSHA256 = ""
+		}
+		record.Observations = append(record.Observations, DiagnosticCheck{
+			Name: check.Name, Passed: check.Passed, Provenance: check.Provenance,
+			EvidenceSHA256: check.EvidenceSHA256, FailureReason: check.FailureReason,
+		})
+	}
+	dir := filepath.Join(baseDir, receipt.IdentitySHA256)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create diagnostic store: %w", err)
+	}
+	f, err := os.CreateTemp(dir, receipt.CompletedAt.UTC().Format("20060102T150405.000000000Z")+"-*.json")
+	if err != nil {
+		return "", fmt.Errorf("create diagnostic observation: %w", err)
+	}
+	path := f.Name()
+	encoder := json.NewEncoder(f)
+	encoder.SetIndent("", "  ")
+	writeErr := encoder.Encode(record)
+	if writeErr == nil {
+		writeErr = f.Sync()
+	}
+	closeErr := f.Close()
+	if writeErr != nil {
+		return "", fmt.Errorf("flush diagnostic observation: %w", writeErr)
+	}
+	if closeErr != nil {
+		return "", fmt.Errorf("close diagnostic observation: %w", closeErr)
+	}
+	return path, nil
+}
+
 // Store writes a create-only local receipt under the exact identity.
 func Store(baseDir string, receipt Receipt) (string, error) {
 	if err := receipt.Validate(); err != nil {

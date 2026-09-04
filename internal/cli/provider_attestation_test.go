@@ -1,13 +1,73 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 )
+
+func TestQualificationDiagnosticsSurviveSignerFailure(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	payload, err := providerReceiptSignerPreflightPayloadFor(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt providerqualification.Receipt
+	if err := json.Unmarshal(payload, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	var savedPath string
+	err = signProviderQualificationReceiptWith(context.Background(), &receipt, func(context.Context, []byte) (providerattestation.SignatureMetadata, error) {
+		paths, globErr := filepath.Glob(filepath.Join(os.Getenv("XDG_STATE_HOME"), "ntm", "provider-diagnostics", receipt.IdentitySHA256, "*.json"))
+		if globErr != nil || len(paths) != 1 {
+			t.Fatal("signer ran before durable diagnostics")
+		}
+		savedPath = paths[0]
+		data, readErr := os.ReadFile(savedPath)
+		if readErr != nil || !strings.Contains(string(data), "other_protocol_error") {
+			t.Fatal("diagnostic unavailable at signing")
+		}
+		return providerattestation.SignatureMetadata{}, errors.New("simulated signer failure")
+	})
+	if err == nil || savedPath == "" || !strings.Contains(err.Error(), savedPath) || receipt.Attestation != nil {
+		t.Fatal("signing failure lost diagnostics or attached a signature")
+	}
+	if _, _, err := providerqualification.LoadLatest("", receipt.IdentitySHA256); err == nil {
+		t.Fatal("unsigned diagnostic promoted")
+	}
+}
+
+func TestQualificationDoesNotSignWhenDiagnosticsCannotBeSaved(t *testing.T) {
+	dir := t.TempDir()
+	blocked := filepath.Join(dir, "file")
+	if err := os.WriteFile(blocked, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", blocked)
+	payload, err := providerReceiptSignerPreflightPayloadFor(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt providerqualification.Receipt
+	if err := json.Unmarshal(payload, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	err = signProviderQualificationReceiptWith(context.Background(), &receipt, func(context.Context, []byte) (providerattestation.SignatureMetadata, error) {
+		t.Fatal("signer called after diagnostic storage failed")
+		return providerattestation.SignatureMetadata{}, nil
+	})
+	if err == nil {
+		t.Fatal("storage failure ignored")
+	}
+}
 
 func TestProviderReceiptSignerPreflightPayloadExercisesBinaryQualificationEnvelope(t *testing.T) {
 	payload, err := providerReceiptSignerPreflightPayload()

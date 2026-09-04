@@ -20,11 +20,23 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
   endpoint, account, model, credential id, bridge path/digest, policy, and
   model catalog before a brokered Coding Plan run. Legacy v1 profiles and
   self-consistent descriptor substitutions fail closed.
-- **Provider lifecycle promotion now requires provider-scope authority.** A
-  signed receipt cannot promote lifecycle work when cancellation or cleanup is
-  only local-process, local-client, or ACP-agent evidence. Current Grok and
-  Z.ai transports therefore remain lifecycle `NO_GO` without overstating local
-  process control as cloud acknowledgement.
+- **Provider lifecycle dispatch now uses explicit local guarantees.** Current
+  signed crash, cancellation, resume, and process-cleanup evidence is required
+  alongside workspace qualification. Remote inference termination remains a
+  separate authority report; local cleanup never proves remote billing stopped.
+- **Qualification observations survive receipt signing failures.** Before signing,
+  NTM flushes a separate unsigned diagnostic record containing fixed check names,
+  bounded failure reasons, and identity/evidence digests. Payloads and free-form
+  text are excluded. Diagnostic records cannot authorize provider operations.
+- Workspace promotion requires cleanup evidence, and Z.ai Codex additionally
+  requires capacity accounting. Partial signed model evidence no longer requires
+  unrelated lifecycle checks to pass the Z.ai doctor identity gate.
+- `provider baseline` inventories the same scenarios for all four providers,
+  with exact-profile receipt evidence and no provider calls. Codex and Claude
+  are not grandfathered into the new suite by ordinary pane usability. Missing
+  evidence, negative checks, and unsupported capabilities remain distinct.
+- Grok operation admission accepts its full signed runtime version banner when
+  the pinned version token and exact executable digest both match.
 - **Pinned Windows receipt signing is descriptor-executed.** WSL opens and
   hashes the root-owned bridge, verifies every parent directory, and executes
   that exact file descriptor, closing the path-replacement interval between
