@@ -75,14 +75,15 @@ func validatePrimaryComparisonProfile(p config.ProviderProfileConfig) (provider.
 }
 
 type primaryComparisonObservation struct {
-	Completed      bool   `json:"completed"`
-	NonceVerified  bool   `json:"nonce_verified"`
-	ServedModel    string `json:"served_model,omitempty"`
-	ModelConflict  bool   `json:"model_conflict"`
-	Malformed      bool   `json:"malformed"`
-	UnexpectedTool bool   `json:"unexpected_tool"`
-	EventCount     int    `json:"event_count"`
-	ExitOK         bool   `json:"exit_ok"`
+	TerminalCategory string `json:"terminal_category,omitempty"`
+	Completed        bool   `json:"completed"`
+	NonceVerified    bool   `json:"nonce_verified"`
+	ServedModel      string `json:"served_model,omitempty"`
+	ModelConflict    bool   `json:"model_conflict"`
+	Malformed        bool   `json:"malformed"`
+	UnexpectedTool   bool   `json:"unexpected_tool"`
+	EventCount       int    `json:"event_count"`
+	ExitOK           bool   `json:"exit_ok"`
 }
 
 // Only terminal assistant output can acknowledge work. Tool content, init
@@ -127,12 +128,14 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 			}
 			o.Completed = !e.IsError && e.Subtype == "success"
 			o.NonceVerified = o.Completed && strings.TrimSpace(e.Result) == nonce
+			o.TerminalCategory = primaryTerminalCategory(e.Result, nonce)
 		}
 	} else {
 		if e.Type == "item.completed" {
 			switch e.Item.Type {
 			case "agent_message":
 				o.NonceVerified = strings.TrimSpace(e.Item.Text) == nonce
+				o.TerminalCategory = primaryTerminalCategory(e.Item.Text, nonce)
 			case "command_execution", "file_change", "web_search":
 				o.UnexpectedTool = true
 			}
@@ -163,6 +166,29 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 			o.ModelConflict = true
 		}
 		o.ServedModel = model
+	}
+}
+
+// These are prose hints, not failure authority or readiness evidence. Only the
+// closed category survives; the explanation itself is never stored.
+func primaryTerminalCategory(text, nonce string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "empty"
+	}
+	if text == nonce {
+		return "acknowledged"
+	}
+	text = strings.ToLower(text)
+	switch {
+	case strings.Contains(text, "read-only") || strings.Contains(text, "read only"):
+		return "read_only_mentioned"
+	case strings.Contains(text, "tool") && (strings.Contains(text, "unavailable") || strings.Contains(text, "not available") || strings.Contains(text, "no access") || strings.Contains(text, "not exposed") || strings.Contains(text, "don't have") || strings.Contains(text, "do not have")):
+		return "tools_unavailable_mentioned"
+	case strings.Contains(text, "permission") || strings.Contains(text, "not allowed") || strings.Contains(text, "cannot write"):
+		return "permission_mentioned"
+	default:
+		return "other_text"
 	}
 }
 
@@ -358,6 +384,7 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	capacity := admission.ReleaseObserved(id, decision)
 	completed := time.Now().UTC()
 	diagnostic := providerqualification.PrimaryComparisonDiagnostic{Completed: observation.Completed, NonceVerified: observation.NonceVerified, ModelMatched: observation.ServedModel != "" && observation.ServedModel == id.Model(), ModelConflict: observation.ModelConflict, Malformed: observation.Malformed, UnexpectedTool: observation.UnexpectedTool, EventCount: observation.EventCount, ExitOK: observation.ExitOK}
+	diagnostic.TerminalCategory = observation.TerminalCategory
 	if observation.ServedModel != "" {
 		diagnostic.ModelSHA256 = sha256StringCLI(observation.ServedModel)
 	}
@@ -428,12 +455,12 @@ func primaryCodexComparisonSettings(model, command string, args []string) map[st
 	return map[string]any{
 		"model": model, "model_provider": "openai", "approval_policy": "never",
 		"sandbox_mode": "read-only", "check_for_update_on_startup": false,
-		"history": map[string]any{"persistence": "none"},
+		"history":  map[string]any{"persistence": "none"},
 		"features": map[string]any{"shell_tool": false, "multi_agent": false, "apps": false},
 		"mcp_servers": map[string]any{grok.WorkspaceBrokerMCPName: map[string]any{
 			"command": command, "args": append([]string(nil), args...), "required": true,
 			"default_tools_approval_mode": "approve",
-			"enabled_tools": []string{"read_file", "write_file", "verify_worktree"},
+			"enabled_tools":               []string{"read_file", "write_file", "verify_worktree"},
 		}},
 	}
 }

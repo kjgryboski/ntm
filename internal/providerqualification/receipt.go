@@ -510,18 +510,24 @@ func StoreWorkspaceDiagnostics(baseDir, transport, identity, policy, runtime str
 // PrimaryComparisonDiagnostic retains closed observations and a model digest,
 // never provider text, credentials, prompts, or a purported account identity.
 type PrimaryComparisonDiagnostic struct {
-	Completed      bool   `json:"completed"`
-	NonceVerified  bool   `json:"nonce_verified"`
-	ModelSHA256    string `json:"model_sha256,omitempty"`
-	ModelMatched   bool   `json:"model_matched"`
-	ModelConflict  bool   `json:"model_conflict"`
-	Malformed      bool   `json:"malformed"`
-	UnexpectedTool bool   `json:"unexpected_tool"`
-	EventCount     int    `json:"event_count"`
-	ExitOK         bool   `json:"exit_ok"`
+	TerminalCategory string `json:"terminal_category,omitempty"`
+	Completed        bool   `json:"completed"`
+	NonceVerified    bool   `json:"nonce_verified"`
+	ModelSHA256      string `json:"model_sha256,omitempty"`
+	ModelMatched     bool   `json:"model_matched"`
+	ModelConflict    bool   `json:"model_conflict"`
+	Malformed        bool   `json:"malformed"`
+	UnexpectedTool   bool   `json:"unexpected_tool"`
+	EventCount       int    `json:"event_count"`
+	ExitOK           bool   `json:"exit_ok"`
 }
 
 func StorePrimaryComparisonDiagnostics(baseDir, transport, identity, policy, runtime string, started, observed time.Time, phase string, observation PrimaryComparisonDiagnostic) (string, error) {
+	switch observation.TerminalCategory {
+	case "", "empty", "acknowledged", "read_only_mentioned", "tools_unavailable_mentioned", "permission_mentioned", "other_text":
+	default:
+		return "", errors.New("invalid primary terminal diagnostic category")
+	}
 	if (transport != "openai_codex_comparison" && transport != "anthropic_claude_comparison") || !isSHA256(identity) || !isSHA256(policy) || !isSHA256(runtime) || started.IsZero() || observed.Before(started) || (phase != "before_dispatch" && phase != "before_cleanup") || (observation.ModelSHA256 != "" && !isSHA256(observation.ModelSHA256)) || observation.EventCount < 0 {
 		return "", errors.New("invalid primary comparison diagnostic")
 	}

@@ -68,7 +68,7 @@ var providerGrokQualificationDeps = providerGrokQualificationDependencies{
 	prepareLineage:   prepareProviderGrokLineageWorkspace,
 	prepareWorkspace: prepareProviderGrokWorkspaceQualification,
 	cleanupLineage:   cleanupProviderGrokLineageWorkspace,
-	workspaceBroker:  providerWorkspaceBrokerDescriptorWithAudit,
+	workspaceBroker:  providerGrokControllerBrokerDescriptor,
 	workspaceRevision: func(ctx context.Context, worktree string) (string, error) {
 		return providerGrokQualificationGit(ctx, worktree, "rev-parse", "--verify", "HEAD")
 	},

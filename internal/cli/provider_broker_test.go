@@ -8,14 +8,92 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 )
 
 type providerBrokerVerifierFake struct {
 	manifests []provider.VerificationManifest
+}
+
+func TestProviderBrokerControllerUsesRealWorkspaceAndIsolatedVerifier(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux verifier")
+	}
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"token":"synthetic-controller-test"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := prepareProviderGrokWorkspaceQualification(t.Context(), home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanupProviderGrokLineageWorkspace(context.Background(), workspace)
+	revision, err := providerGrokQualificationGit(t.Context(), workspace.Worktree, "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditPath := filepath.Join(workspace.Root, providerGrokWorkspaceAuditFile)
+	guard, err := createProviderGrokWorkspaceAudit(auditPath, workspace.Worktree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer guard.Close()
+	descriptor, err := providerGrokControllerBrokerDescriptor(t.Context(), workspace.Worktree, auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers, err := (grok.Request{Broker: descriptor}).SessionMCPServers()
+	if err != nil || len(servers) != 0 {
+		t.Fatal("Grok controller descriptor still launches a child broker")
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := hashProviderSessionExecutable(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := openProviderBroker(t.Context(), providerBrokerOptions{worktree: workspace.Worktree, revision: revision, commands: []string{"go-test", "go-vet"}, auditFile: auditPath, ntmSHA256: digest}, providerBrokerDeps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer broker.Close()
+	requests := []string{
+		fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":%q}}}`, providerGrokWorkspaceTarget),
+		fmt.Sprintf(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_file","arguments":{"path":%q,"expected_sha256":%q,"content":%q}}}`, providerGrokWorkspaceTarget, sha256TextCLI(providerGrokWorkspaceBefore), string(providerGrokWorkspaceAfter)),
+		fmt.Sprintf(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":%q}}}`, providerGrokWorkspaceSecret),
+		`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"verify_worktree","arguments":{}}}`,
+	}
+	for index, request := range requests {
+		raw, err := broker.Call(t.Context(), json.RawMessage(request))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var response providerBrokerResponse
+		if json.Unmarshal(raw, &response) != nil || (response.Error != nil) != (index == 2) {
+			t.Fatalf("unexpected controller operation result at %d", index)
+		}
+	}
+	audit, err := readProviderGrokWorkspaceAudit(guard, auditPath, workspace.Worktree, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := evaluateProviderGrokWorkspaceAudit(audit, workspace.Worktree, revision)
+	if !checks.ReadObserved || !checks.EditObserved || !checks.SecretDenied || !checks.TestObserved {
+		t.Fatalf("controller evidence incomplete: %+v", checks)
+	}
+	if err := broker.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := broker.Call(t.Context(), json.RawMessage(requests[0])); err == nil {
+		t.Fatal("closed broker executed a request")
+	}
 }
 
 func (f *providerBrokerVerifierFake) Verify(_ context.Context, manifest provider.VerificationManifest) (provider.VerificationReceipt, error) {

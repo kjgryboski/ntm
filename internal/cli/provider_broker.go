@@ -114,7 +114,17 @@ func providerWorkspaceBrokerForPolicy(ctx context.Context, worktree, policy stri
 	if policy != agent.GrokWorkspaceWritePolicyName {
 		return nil, nil
 	}
-	return providerWorkspaceBrokerDescriptor(ctx, worktree)
+	return providerGrokControllerBrokerDescriptor(ctx, worktree, "")
+}
+
+func providerGrokControllerBrokerDescriptor(ctx context.Context, worktree, auditFile string) (*grok.WorkspaceBrokerDescriptor, error) {
+	descriptor, err := providerWorkspaceBrokerDescriptorWithAudit(ctx, worktree, auditFile)
+	if err != nil {
+		return nil, err
+	}
+	return descriptor.WithControllerBroker(func(ctx context.Context, binding grok.ControllerBrokerBinding) (grok.ControllerBroker, error) {
+		return openProviderBroker(ctx, providerBrokerOptions{worktree: binding.Worktree, revision: binding.Revision, commands: binding.Commands, auditFile: binding.AuditFile, ntmSHA256: binding.ExecutableSHA256}, providerBrokerDeps)
+	})
 }
 
 type providerBroker struct {
@@ -200,23 +210,32 @@ func newProviderBrokerCmd() *cobra.Command {
 }
 
 func runProviderBrokerStdio(cmd *cobra.Command, opts providerBrokerOptions, deps providerBrokerDependencies) error {
+	ctx := providerCommandContext(cmd)
+	broker, err := openProviderBroker(ctx, opts, deps)
+	if err != nil {
+		return err
+	}
+	defer broker.Close()
+	return broker.serve(ctx, cmd.InOrStdin(), cmd.OutOrStdout())
+}
+
+func openProviderBroker(ctx context.Context, opts providerBrokerOptions, deps providerBrokerDependencies) (*providerBroker, error) {
 	if strings.TrimSpace(opts.worktree) == "" || strings.TrimSpace(opts.revision) == "" || len(opts.commands) == 0 || !providerBrokerDigest(opts.ntmSHA256) {
-		return errors.New("provider broker stdio requires --worktree, --revision, --ntm-sha256, and at least one --commands ID")
+		return nil, errors.New("provider broker stdio requires --worktree, --revision, --ntm-sha256, and at least one --commands ID")
 	}
 	if runtime.GOOS != "linux" || !verifyProviderBrokerExecutableDigest(opts.ntmSHA256) {
-		return errors.New("provider broker executable digest binding did not verify")
+		return nil, errors.New("provider broker executable digest binding did not verify")
 	}
 	if deps.newWorkspace == nil || deps.newVerifier == nil {
-		return errors.New("provider broker dependencies are incomplete")
+		return nil, errors.New("provider broker dependencies are incomplete")
 	}
-	ctx := providerCommandContext(cmd)
 	workspace, err := deps.newWorkspace(ctx, opts.worktree, opts.revision)
 	if err != nil || workspace == nil {
-		return fmt.Errorf("initialize constrained workspace broker: %w", err)
+		return nil, fmt.Errorf("initialize constrained workspace broker: %w", err)
 	}
 	verifier, err := deps.newVerifier()
 	if err != nil || verifier == nil {
-		return fmt.Errorf("initialize isolated verifier: %w", err)
+		return nil, fmt.Errorf("initialize isolated verifier: %w", err)
 	}
 	broker := &providerBroker{workspace: workspace, verifier: verifier, manifest: provider.VerificationManifest{
 		Worktree: opts.worktree, Revision: opts.revision, CommandIDs: append([]string(nil), opts.commands...),
@@ -224,12 +243,37 @@ func runProviderBrokerStdio(cmd *cobra.Command, opts providerBrokerOptions, deps
 	if strings.TrimSpace(opts.auditFile) != "" {
 		audit, err := openProviderBrokerAudit(opts.worktree, opts.revision, opts.auditFile)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		broker.audit = audit
-		defer audit.file.Close()
 	}
-	return broker.serve(ctx, cmd.InOrStdin(), cmd.OutOrStdout())
+	return broker, nil
+}
+
+// Call uses the same closed MCP dispatcher as stdio. Grok's ACP reader invokes
+// it serially, so writes and verifier generations retain their existing order.
+func (b *providerBroker) Call(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+	if b == nil || b.workspace == nil || b.verifier == nil {
+		return nil, errors.New("controller broker is closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return json.Marshal(b.handle(ctx, raw))
+}
+
+func (b *providerBroker) Close() error {
+	if b == nil {
+		return nil
+	}
+	b.workspace = nil
+	b.verifier = nil
+	if b.audit != nil {
+		err := b.audit.file.Close()
+		b.audit = nil
+		return err
+	}
+	return nil
 }
 
 func verifyProviderBrokerExecutableDigest(expected string) bool {

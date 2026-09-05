@@ -248,8 +248,9 @@ type Request struct {
 // cannot substitute a shell, remote transport, environment, or arbitrary MCP
 // server after NTM has constructed the descriptor.
 type WorkspaceBrokerDescriptor struct {
-	command string
-	args    []string
+	command    string
+	args       []string
+	controller ControllerBrokerFactory
 }
 
 const WorkspaceBrokerMCPName = "ntm-controlled-workspace"
@@ -394,7 +395,11 @@ func (d WorkspaceBrokerDescriptor) BindingSHA256() string {
 	if err := d.validate(); err != nil {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(strings.Join(append([]string{d.command}, d.args...), "\x00")))
+	fields := append([]string{d.command}, d.args...)
+	if d.controller != nil {
+		fields = append(fields, "controller-acp-v1")
+	}
+	sum := sha256.Sum256([]byte(strings.Join(fields, "\x00")))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -407,6 +412,9 @@ func (r Request) SessionMCPServers() ([]WorkspaceBrokerDescriptor, error) {
 	}
 	if err := r.Broker.validate(); err != nil {
 		return nil, err
+	}
+	if r.Broker.controller != nil {
+		return []WorkspaceBrokerDescriptor{}, nil
 	}
 	copy := *r.Broker
 	copy.args = append([]string(nil), r.Broker.args...)
@@ -612,6 +620,32 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 		args = append(args, "--model", model)
 	}
 	args = append(args, "agent", "stdio")
+	var controller ControllerBroker
+	var controllerServers []controllerMCPRegistration
+	controllerID := ""
+	controllerToolsEnabled := false
+	if req.Broker != nil && req.Broker.controller != nil {
+		if req.RuntimeVersion != "1.0.13" {
+			return finishFailure(result, ErrInvalidRequest, errors.New("controller MCP requires the reviewed Grok 1.0.13 protocol"))
+		}
+		failureStage = "process_start"
+		controller, err = req.Broker.openController(ctx)
+		if err != nil || controller == nil {
+			return finishFailure(result, ErrDependencyMissing, errors.New("initialize controller workspace broker"))
+		}
+		defer func() {
+			if err := controller.Close(); err != nil {
+				result.Success = false
+				result.State = StateFailed
+				returnErr = errors.Join(returnErr, errors.New("close controller workspace broker"))
+			}
+		}()
+		controllerID, err = newControllerMCPID()
+		if err != nil {
+			return finishFailure(result, ErrDependencyMissing, err)
+		}
+		controllerServers = []controllerMCPRegistration{{Name: WorkspaceBrokerMCPName, ServerID: controllerID}}
+	}
 
 	failureStage = "process_start"
 	proc, err := runner.Start(ctx, StartSpec{
@@ -717,6 +751,12 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	updates.denyPermission = func(message rpcMessage) error {
 		return denyACPPermission(ctx, proc.Stdin(), updates.providerSessionID, message)
 	}
+	if controller != nil {
+		seen := make(map[string]bool)
+		updates.controllerMCP = func(message rpcMessage) error {
+			return replyControllerMCP(ctx, proc.Stdin(), controller, controllerID, controllerToolsEnabled, seen, message)
+		}
+	}
 	nextID := 1
 	call := func(method string, params any) (json.RawMessage, error) {
 		id := nextID
@@ -768,7 +808,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	failureStage = "session_new"
 	newRaw, err := call("session/new", sessionNewParams{
 		CWD: req.CWD, MCPServers: mcpServers,
-		Meta: sessionNewMeta{StartupHints: ntmStartupHints(), ModelID: strings.TrimSpace(req.Model)},
+		Meta: sessionNewMeta{StartupHints: ntmStartupHints(), ModelID: strings.TrimSpace(req.Model), MCPServers: controllerServers},
 	})
 	if err != nil {
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
@@ -793,6 +833,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
 	}
 	invokeAfterPromptWritten(req.AfterPromptWritten)
+	controllerToolsEnabled = true
 	failureStage = "prompt_response"
 	promptRaw, cancellation, err := waitPromptResponseOrCancellation(
 		ctx,
@@ -1305,8 +1346,9 @@ type sessionNewParams struct {
 }
 
 type sessionNewMeta struct {
-	StartupHints grokStartupHints `json:"startupHints"`
-	ModelID      string           `json:"modelId,omitempty"`
+	MCPServers   []controllerMCPRegistration `json:"x.ai/mcp/servers,omitempty"`
+	StartupHints grokStartupHints            `json:"startupHints"`
+	ModelID      string                      `json:"modelId,omitempty"`
 }
 
 type sessionNewResult struct {
@@ -1686,6 +1728,9 @@ func consumeResponseEvent(event rpcEvent, requestID int, updates *updateAccumula
 	if event.err != nil {
 		return nil, false, event.err
 	}
+	if event.message.Method == controllerMCPMethod && updates != nil && updates.controllerMCP != nil {
+		return nil, false, updates.controllerMCP(event.message)
+	}
 	if event.message.Method == "session/request_permission" && updates != nil && updates.denyPermission != nil {
 		if err := updates.denyPermission(event.message); err != nil {
 			return nil, false, err
@@ -1798,6 +1843,7 @@ func providerRPCErrorCode(err error) *int64 {
 
 type updateAccumulator struct {
 	denyPermission         func(rpcMessage) error
+	controllerMCP          func(rpcMessage) error
 	permissionDenials      int
 	protocolObservation    provider.ProtocolObservation
 	hasher                 io.Writer

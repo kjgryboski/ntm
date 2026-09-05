@@ -19,6 +19,29 @@ func TestPrimaryComparisonCommandRequiresExplicitBindingsBeforeDispatch(t *testi
 	}
 }
 
+func TestPrimaryComparisonTerminalHintsNeverRetainTextOrGrantAcknowledgement(t *testing.T) {
+	for _, tc := range []struct{ text, category string }{
+		{"This is read-only; secret-canary", "read_only_mentioned"},
+		{"I do not have the requested tool; secret-canary", "tools_unavailable_mentioned"},
+		{"Permission is missing; secret-canary", "permission_mentioned"},
+		{"secret-canary", "other_text"},
+		{"", "empty"},
+	} {
+		var observation primaryComparisonObservation
+		line, _ := json.Marshal(map[string]any{"type": "item.completed", "item": map[string]string{"type": "agent_message", "text": tc.text}})
+		observation.observe(line, "codex", "expected-nonce")
+		data, _ := json.Marshal(observation)
+		if observation.TerminalCategory != tc.category || observation.NonceVerified || strings.Contains(string(data), "secret-canary") {
+			t.Fatalf("unsafe terminal classification: %s", data)
+		}
+	}
+	var observation primaryComparisonObservation
+	observation.observe([]byte(`{"type":"item.completed","item":{"type":"mcp_tool_call","text":"read-only"}}`), "codex", "nonce")
+	if observation.TerminalCategory != "" {
+		t.Fatal("tool payload became a terminal explanation")
+	}
+}
+
 func TestPrimaryComparisonCodexApprovesOnlyRequiredConstrainedBroker(t *testing.T) {
 	settings := primaryCodexComparisonSettings("gpt-6-astra", "/bound/ntm", []string{"provider", "broker"})
 	servers := settings["mcp_servers"].(map[string]any)

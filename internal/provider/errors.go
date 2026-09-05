@@ -19,7 +19,7 @@ func (o ProtocolObservation) Redacted() ProtocolObservation {
 	// Reviewed ACP client methods and Grok 1.0.13 notifications. Recognition
 	// for diagnostics never implies permission to execute a reverse request.
 	switch o.Method {
-	case "session/update", "session/request_permission", "fs/read_text_file", "fs/write_text_file",
+	case "session/update", "session/request_permission", "_x.ai/mcp/sdk_call", "fs/read_text_file", "fs/write_text_file",
 		"terminal/create", "terminal/output", "terminal/release", "terminal/wait_for_exit", "terminal/kill",
 		"x.ai/announcements/update", "x.ai/git/worktree/status", "x.ai/git_head_changed",
 		"x.ai/mcp/init_progress", "x.ai/mcp/server_status", "x.ai/mcp/servers_updated", "x.ai/mcp/tools_changed",

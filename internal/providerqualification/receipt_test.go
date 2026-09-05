@@ -41,6 +41,11 @@ func TestPrimaryComparisonDiagnosticsSurviveWithoutGrantingReadiness(t *testing.
 	if _, _, err = LoadLatest(base, identity); err == nil {
 		t.Fatal("unsigned comparison granted qualification")
 	}
+	observation.TerminalCategory = "credential-canary"
+	if _, err = StorePrimaryComparisonDiagnostics(base, "openai_codex_comparison", identity, testHash("policy"), testHash("runtime"), now, now, "before_cleanup", observation); err == nil {
+		t.Fatal("arbitrary provider text accepted as terminal category")
+	}
+	observation.TerminalCategory = "read_only_mentioned"
 	observation.ModelSHA256 = "credential-canary"
 	if _, err = StorePrimaryComparisonDiagnostics(base, "openai_codex_comparison", identity, testHash("policy"), testHash("runtime"), now, now, "before_cleanup", observation); err == nil {
 		t.Fatal("provider text accepted as model digest")
