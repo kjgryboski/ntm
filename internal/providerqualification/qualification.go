@@ -191,18 +191,29 @@ func (LocalRunner) Run(ctx context.Context, in Invocation) (Outcome, error) {
 		terminateErr := terminateObservedTree(processes)
 		out.ResidualProcessIDs = waitForObservedProcessExit(processes, 250*time.Millisecond)
 		out.ResidualCheckPerformed = observed
-		out.ProcessTreeTerminated = observed && terminateErr == nil && len(out.ResidualProcessIDs) == 0 && cmd.ProcessState != nil && cmd.ProcessState.Exited()
+		out.ProcessTreeTerminated = observed && terminateErr == nil && len(out.ResidualProcessIDs) == 0 && cmd.ProcessState != nil
 	case <-ctx.Done():
 		processes, observed := observer.stopAndSnapshot()
 		terminateErr := terminateObservedTree(processes)
+		waitCompleted := false
 		select {
 		case err = <-wait:
+			waitCompleted = true
 		case <-time.After(5 * time.Second):
 			err = errors.New("process-tree termination wait timed out")
 		}
 		out.ResidualProcessIDs = waitForObservedProcessExit(processes, 250*time.Millisecond)
 		out.ResidualCheckPerformed = observed
-		out.ProcessTreeTerminated = observed && terminateErr == nil && len(out.ResidualProcessIDs) == 0 && cmd.ProcessState != nil && cmd.ProcessState.Exited()
+		if !waitCompleted {
+			// Wait may still be writing ProcessState and the output buffers.
+			// Preserve the observed residual set without claiming completed cleanup.
+			out.ExitCode = -1
+			return out, err
+		}
+		// Wait also reaps a process terminated by a signal. Exited() excludes
+		// that case on Unix; it is not the cleanup authority. The bound process
+		// tree, completed Wait, and empty residual set are required here.
+		out.ProcessTreeTerminated = observed && terminateErr == nil && len(out.ResidualProcessIDs) == 0 && cmd.ProcessState != nil
 		if err == nil {
 			err = ctx.Err()
 		}

@@ -130,11 +130,17 @@ func TestProviderRestartRequiresTerminalCleanupAndCapacityEvidence(t *testing.T)
 }
 
 func TestProviderControllerExitCannotReplayUnknownAssignment(t *testing.T) {
+	for _, phase := range []string{"reservation", "dispatch", "signing", "receipt"} {
+		t.Run(phase, func(t *testing.T) { testProviderControllerExitPhase(t, phase) })
+	}
+}
+
+func testProviderControllerExitPhase(t *testing.T, phase string) {
 	root := t.TempDir()
 	childCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	child := exec.CommandContext(childCtx, os.Args[0], "-test.run=^TestProviderControllerExitHelper$")
-	child.Env = append(os.Environ(), "NTM_PROVIDER_CONTROLLER_EXIT_HELPER="+root)
+	child.Env = append(os.Environ(), "NTM_PROVIDER_CONTROLLER_EXIT_HELPER="+root, "NTM_PROVIDER_CONTROLLER_EXIT_PHASE="+phase)
 	if output, err := child.CombinedOutput(); err != nil {
 		t.Fatalf("controller helper: %v %s", err, output)
 	}
@@ -149,7 +155,17 @@ func TestProviderControllerExitCannotReplayUnknownAssignment(t *testing.T) {
 		t.Fatalf("orphaned assignment replay: %v", err)
 	}
 	row, err := ledger.GetSendOperation(request.OperationID, providerAssignmentScope(identity))
-	if err != nil || row == nil || row.Status != state.SendOperationInProgress {
+	if phase == "reservation" {
+		if err != nil || row != nil {
+			t.Fatal("pre-dispatch crash created adapter receipt")
+		}
+		return
+	}
+	wantStatus := state.SendOperationInProgress
+	if phase == "receipt" {
+		wantStatus = state.SendOperationCompleted
+	}
+	if err != nil || row == nil || row.Status != wantStatus {
 		t.Fatalf("unknown adapter row changed: %+v %v", row, err)
 	}
 }
@@ -171,11 +187,33 @@ func TestProviderControllerExitHelper(t *testing.T) {
 	if _, _, err = beginProviderControl(context.Background(), ledger, identity, request); err != nil {
 		t.Fatal(err)
 	}
+	phase := os.Getenv("NTM_PROVIDER_CONTROLLER_EXIT_PHASE")
+	if phase == "reservation" {
+		os.Exit(0)
+	}
 	if _, _, err = ledger.ClaimSendOperation(&state.SendOperation{OperationID: request.OperationID, SessionName: providerAssignmentScope(identity), BindingHash: "uncertain-adapter-binding"}); err != nil {
 		t.Fatal(err)
 	}
+	if phase == "signing" || phase == "receipt" {
+		payload := []byte(`{"offline_crash_fixture":true}`)
+		signature, err := newProviderNativeTestSigner()(context.Background(), payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if phase == "receipt" {
+			encoded, err := json.Marshal(signature)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ledger.CompleteSendOperation(request.OperationID, providerAssignmentScope(identity), string(encoded), time.Now().UTC()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	// This subprocess exits without invoking the owner's finish callback.
-	// The parent must preserve both durable in-progress rows without replay.
+	// Even a signed/persisted adapter result cannot take over an unfinished
+	// controller or manufacture its missing capacity/cleanup observation.
+	os.Exit(0)
 }
 
 func TestProviderRestartSurfaceRejectsSameIDAndPaneOverrides(t *testing.T) {

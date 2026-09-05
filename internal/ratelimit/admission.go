@@ -434,7 +434,7 @@ func (c *SubscriptionAdmissionController) CancelReservation(identity provider.Id
 	if !c.plan.withAuthoritativeState(scope, c.plan.now(), func(state *admissionState) {
 		for index := range state.subscriptionUsage {
 			event := state.subscriptionUsage[index]
-			if event.LeaseID != decision.plan.leaseID || event.Reconciled {
+			if event.LeaseID != decision.plan.leaseID || event.Reconciled || event.Unknown {
 				continue
 			}
 			state.subscriptionUsage = append(state.subscriptionUsage[:index], state.subscriptionUsage[index+1:]...)
@@ -636,6 +636,7 @@ func (c *SubscriptionAdmissionController) acquirePlan(scope provider.CapacitySco
 			return
 		}
 		pruneSubscriptionUsage(state, now, c.config.WeeklyWindow)
+		c.reserveOrphanedUsage(state)
 		fiveUsed, fiveReset := subscriptionUsageTotal(state.subscriptionUsage, now, c.config.FiveHourWindow)
 		weeklyUsed, weeklyReset := subscriptionUsageTotal(state.subscriptionUsage, now, c.config.WeeklyWindow)
 		if state.running >= c.config.MaxConcurrent {
@@ -728,6 +729,7 @@ func (c *SubscriptionAdmissionController) Snapshot(identity provider.Identity) S
 	}
 	now := c.plan.now()
 	pruneSubscriptionUsage(&state, now, c.config.WeeklyWindow)
+	c.reserveOrphanedUsage(&state)
 	fiveUsed, fiveReset := subscriptionUsageTotal(state.subscriptionUsage, now, c.config.FiveHourWindow)
 	weeklyUsed, weeklyReset := subscriptionUsageTotal(state.subscriptionUsage, now, c.config.WeeklyWindow)
 	snapshot.PlanRunning, snapshot.FiveHourCreditsUsed, snapshot.WeeklyCreditsUsed = state.running, fiveUsed, weeklyUsed
@@ -744,6 +746,30 @@ func (c *SubscriptionAdmissionController) Snapshot(identity provider.Identity) S
 		}
 	}
 	return snapshot
+}
+
+// A dead controller may have dispatched before it recorded usage or signed a
+// receipt. Reclaiming its local slot is not permission to refund its usage.
+// Preserve the original rolling-window timestamp and exact reservation binding.
+// Snapshot applies this conservatively to its copy; admission persists it.
+func (c *SubscriptionAdmissionController) reserveOrphanedUsage(state *admissionState) {
+	for i := range state.subscriptionUsage {
+		event := &state.subscriptionUsage[i]
+		if event.Reconciled {
+			continue
+		}
+		if _, alive := state.leases[event.LeaseID]; alive {
+			continue
+		}
+		var other float64
+		for j, usage := range state.subscriptionUsage {
+			if j != i {
+				other += usage.Credits
+			}
+		}
+		event.Credits = math.Max(0, c.config.WeeklyCreditLimit-other)
+		event.Unknown = true
+	}
 }
 
 // AdmissionController isolates budgets by provider.Identity.CapacityScope.

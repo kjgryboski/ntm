@@ -248,6 +248,7 @@ type providerDoctorSubscriptionCapacity struct {
 }
 
 type providerDoctorReport struct {
+	Readiness     providerDoctorReadiness        `json:"readiness"`
 	SchemaVersion string                         `json:"schema_version"`
 	GeneratedAt   time.Time                      `json:"generated_at"`
 	DurationMS    int64                          `json:"duration_ms"`
@@ -262,6 +263,41 @@ type providerDoctorReport struct {
 	Capacity      providerDoctorCapacity         `json:"capacity"`
 	Capabilities  provider.OperationCapabilities `json:"capabilities"`
 	Checks        []providerDoctorCheck          `json:"checks"`
+}
+
+// Evidence readiness is independent of fresh online admission. This view does
+// not authorize dispatch or upgrade untrusted/stale receipts.
+type providerDoctorReadiness struct {
+	WorkspaceEvidence  string            `json:"workspace_evidence"`
+	WorkspaceAdmission bool              `json:"workspace_admitted"`
+	Lifecycle          map[string]string `json:"lifecycle"`
+	RemoteTermination  string            `json:"remote_generation_termination"`
+}
+
+func providerReadinessForReport(report providerDoctorReport) providerDoctorReadiness {
+	out := providerDoctorReadiness{WorkspaceEvidence: "unqualified", Lifecycle: map[string]string{}, RemoteTermination: "unverified"}
+	if providerDoctorWorkspaceEvidence(report) {
+		out.WorkspaceEvidence = "qualified"
+	}
+	for _, scope := range report.Promotion.Scopes {
+		if scope.Operation == providerOperationWorkspaceWrite {
+			out.WorkspaceAdmission = scope.Admitted
+		}
+	}
+	for _, name := range []string{providerqualification.CheckCrashRecovery, providerqualification.CheckCancellation, providerqualification.CheckResume} {
+		state := "untested"
+		if report.Qualification.TrustedCurrent {
+			switch report.Qualification.CheckOutcomes[name] {
+			case "passed", "failed", "unsupported":
+				state = report.Qualification.CheckOutcomes[name]
+			}
+		}
+		if name == providerqualification.CheckResume && report.Capabilities.Resume == provider.EvidenceUnavailable {
+			state = "unsupported"
+		}
+		out.Lifecycle[name] = state
+	}
+	return out
 }
 
 type providerDoctorLiveEvidence struct {
@@ -404,7 +440,7 @@ func newProviderCmd() *cobra.Command {
 		Short: "Inspect and qualify exact AI provider lanes",
 	}
 	cmd.AddCommand(newProviderDoctorCmd(), newProviderBaselineCmd(), newProviderQualifyCmd(), newProviderSessionCmd(), newProviderNativeRunCmd(), newProviderCodexCmd(), newProviderVerifyCmd(), newProviderCredentialCmd(), newProviderAttestationCmd(), newProviderCapabilitiesCmd(), newProviderPolicyCmd(), newProviderTelemetryCmd(), newProviderBrokerCmd(), newProviderRoutingCmd())
-	cmd.AddCommand(newProviderPrimaryComparisonCmd())
+	cmd.AddCommand(newProviderPrimaryComparisonCmd(), newProviderAcceptanceCmd())
 	return cmd
 }
 
@@ -1202,6 +1238,7 @@ func buildProviderDoctorReport(ctx context.Context, cfg *config.Config, opts pro
 	report.Checks = append(report.Checks, diagnoseLifecycleAuthority(capability))
 
 	report.Promotion = providerDoctorPromotionForReport(report, report.Promotion.RequiredOperation)
+	report.Readiness = providerReadinessForReport(report)
 	return report, nil
 }
 
@@ -2195,6 +2232,8 @@ func encodeIndentedJSON(w io.Writer, value any) error {
 }
 
 func printProviderDoctorHuman(w io.Writer, report providerDoctorReport) {
+	fmt.Fprintf(w, "Workspace evidence: %s; current admission: %t\n", report.Readiness.WorkspaceEvidence, report.Readiness.WorkspaceAdmission)
+	fmt.Fprintf(w, "Lifecycle evidence: crash recovery=%s; cancellation=%s; resume=%s\nRemote generation termination: %s\n", report.Readiness.Lifecycle[providerqualification.CheckCrashRecovery], report.Readiness.Lifecycle[providerqualification.CheckCancellation], report.Readiness.Lifecycle[providerqualification.CheckResume], report.Readiness.RemoteTermination)
 	fmt.Fprintf(w, "Provider promotion: %s\n", report.Promotion.Level)
 	fmt.Fprintf(w, "Required operation: %s (admitted=%t)\n", report.Promotion.RequiredOperation, report.Promotion.RequiredOperationAdmitted)
 	for _, scope := range report.Promotion.Scopes {

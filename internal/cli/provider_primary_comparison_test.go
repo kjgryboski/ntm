@@ -2,12 +2,74 @@ package cli
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/grok"
 )
+
+func TestPrimaryCodexCompanionRequiredBeforePaidComparison(t *testing.T) {
+	root := t.TempDir()
+	binary := filepath.Join(root, "codex")
+	path := filepath.Join(root, "codex-code-mode-host")
+	content := []byte("offline-companion-fixture")
+	pin := sha256TextCLI(content)
+	if _, err := primaryCodexCompanionDigest(binary, pin); err == nil {
+		t.Fatal("missing Code Mode host accepted despite successful inventory")
+	}
+	if err := os.WriteFile(path, content, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if digest, err := primaryCodexCompanionDigest(binary, pin); err != nil || digest != pin {
+		t.Fatalf("bound companion: %s %v", digest, err)
+	}
+	for _, bad := range []string{"", strings.Repeat("a", 64)} {
+		if _, err := primaryCodexCompanionDigest(binary, bad); err == nil {
+			t.Fatal("unreviewed companion accepted")
+		}
+	}
+	if err := os.WriteFile(path, []byte("changed-companion"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := primaryCodexCompanionDigest(binary, pin); err == nil {
+		t.Fatal("changed companion accepted")
+	}
+}
+
+func TestPrimaryRuntimeDiagnosticsAreClosedAndPayloadFree(t *testing.T) {
+	var o primaryComparisonObservation
+	o.observeWarnings([]byte("Code Mode is unavailable because /private/credential-canary. Defaulting to fallback metadata"))
+	o.observe([]byte(`{"type":"item.started","item":{"type":"mcp_tool_call","server":"ntm-controlled-workspace","arguments":{"credential":"credential-canary"}}}`), "codex", "nonce")
+	o.observe([]byte(`{"type":"item.completed","item":{"type":"mcp_tool_call","status":"failed","error":{"message":"credential-canary"}}}`), "codex", "nonce")
+	data, err := json.Marshal(o)
+	if err != nil || !o.CodeModeUnavailable || !o.MetadataFallback || o.MCPStarted != 1 || o.MCPFailed != 1 || strings.Contains(string(data), "credential-canary") {
+		t.Fatalf("unsafe diagnostics: %s %v", data, err)
+	}
+}
+
+func TestPrimaryClaudeStreamDecodesOnlyAssistantMessageShape(t *testing.T) {
+	var o primaryComparisonObservation
+	// Anthropic SDKUserMessage uses MessageParam, whose content may be text.
+	o.observe([]byte(`{"type":"user","message":{"role":"user","content":"private-canary"}}`), "claude", "nonce")
+	o.observe([]byte(`{"type":"system","subtype":"notification","message":"private-canary"}`), "claude", "nonce")
+	o.observe([]byte(`{"type":"assistant","message":{"model":"claude-fable-5","content":[{"type":"text"}]}}`), "claude", "nonce")
+	o.observe([]byte(`{"type":"result","subtype":"success","result":"nonce"}`), "claude", "nonce")
+	o.ExitOK = true
+	if !o.exactModelVerified("claude-fable-5") {
+		t.Fatalf("valid union stream rejected: %+v", o)
+	}
+	data, _ := json.Marshal(o)
+	if strings.Contains(string(data), "private-canary") {
+		t.Fatal("message payload retained")
+	}
+	o.observe([]byte(`{"type":"assistant","message":"private-canary"}`), "claude", "nonce")
+	if !o.Malformed || o.FailureCategory != "invalid_assistant_envelope" {
+		t.Fatal("invalid assistant shape accepted")
+	}
+}
 
 func TestPrimaryComparisonCommandRequiresExplicitBindingsBeforeDispatch(t *testing.T) {
 	for _, args := range [][]string{{}, {"--live"}, {"--profile", "primary", "--signer-profile", "signer"}, {"--live", "--profile", "primary", "--signer-profile", "signer", "--timeout", "6m"}} {

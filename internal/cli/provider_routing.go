@@ -100,6 +100,8 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 		scope = "provider:xai-acp"
 	case identity.Provider() == "zai" && identity.Runtime() == "codex":
 		scope = providerCodexOperationScope
+	case identity.Provider() == "anthropic" && identity.Runtime() == "claude":
+		scope = primaryAssignmentScope
 	default:
 		return errors.New("selected provider has no structured assignment status adapter")
 	}
@@ -138,6 +140,14 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 			out.State, out.ServedModel = receipt.State, receipt.ResolvedModel
 			out.CompletionConfirmed = receipt.CompletionConfirmed && receipt.AcknowledgementVerified
 			out.LocalCleanupVerified = receipt.Cleanup.Reaped && receipt.Cleanup.ResidualPIDs != nil && len(receipt.Cleanup.ResidualPIDs) == 0 && !receipt.Cleanup.ObservedAt.IsZero()
+		} else if identity.Provider() == "anthropic" {
+			var receipt primaryAssignmentOutput
+			if json.Unmarshal([]byte(row.OutcomeJSON), &receipt) != nil || !validPrimaryAssignment(receipt, row, identity, trusted.KeyMetadata) {
+				return errors.New("primary assignment signature or operation binding is invalid")
+			}
+			out.State, out.ServedModel = receipt.State, receipt.Observation.ServedModel
+			out.CompletionConfirmed = receipt.State == "completed" && primaryAssignmentCompleted(receipt)
+			out.LocalCleanupVerified = receipt.CleanupVerified
 		} else {
 			var receipt providerCodexRunOutput
 			if json.Unmarshal([]byte(row.OutcomeJSON), &receipt) != nil || !validProviderCodexStatusReceipt(receipt, row, profileName, identity, trusted.KeyMetadata) {
@@ -220,6 +230,8 @@ func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest
 	cmd.SetContext(ctx)
 	defer cmd.SetContext(previousContext)
 	switch {
+	case identity.Provider() == "anthropic" && identity.Runtime() == "claude":
+		return runPrimaryAssignment(cmd, request, profile, ledger)
 	case identity.Provider() == "zai" && identity.Runtime() == "codex":
 		return runProviderCodex(cmd, providerCodexRunOptions{profile: request.Profile, operationID: request.OperationID, prompt: request.Prompt, cwd: request.CWD, parentSession: request.ParentSession, timeout: request.Timeout, live: true, workspaceWrite: true, workloadClass: providerCodexWorkloadImplementation}, providerCodexRunDeps)
 	case identity.Provider() == "xai" && identity.Runtime() == "grok":

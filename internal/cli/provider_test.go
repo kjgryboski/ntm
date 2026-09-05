@@ -27,6 +27,27 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 )
 
+func TestProviderReadinessSeparatesOfflineWorkspaceEvidenceFromAdmission(t *testing.T) {
+	report := providerDoctorReport{Mode: "offline", Transport: "xai_acp", Capabilities: provider.CapabilityMatrix()["xai_acp"], Qualification: providerDoctorQualification{TrustedCurrent: true, CheckStates: map[string]bool{}, CheckOutcomes: map[string]string{providerqualification.CheckCancellation: "failed"}}}
+	for _, name := range providerOperationRequiredChecks("xai_acp", providerOperationWorkspaceWrite) {
+		report.Qualification.CheckStates[name] = true
+	}
+	report.Promotion = providerDoctorPromotionForReport(report, providerOperationWorkspaceWrite)
+	report.Readiness = providerReadinessForReport(report)
+	if report.Readiness.WorkspaceEvidence != "qualified" || report.Readiness.WorkspaceAdmission || report.Readiness.Lifecycle[providerqualification.CheckResume] != "unsupported" || report.Readiness.Lifecycle[providerqualification.CheckCrashRecovery] != "untested" || report.Readiness.Lifecycle[providerqualification.CheckCancellation] != "failed" {
+		t.Fatalf("readiness conflates evidence and admission: %+v", report.Readiness)
+	}
+	var out bytes.Buffer
+	printProviderDoctorHuman(&out, report)
+	if !strings.Contains(out.String(), "Workspace evidence: qualified; current admission: false") {
+		t.Fatal(out.String())
+	}
+	report.Qualification.TrustedCurrent = false
+	if providerReadinessForReport(report).WorkspaceEvidence == "qualified" {
+		t.Fatal("stale/untrusted evidence granted readiness")
+	}
+}
+
 func providerTestHash(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])

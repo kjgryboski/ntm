@@ -18,6 +18,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/spf13/cobra"
 )
 
@@ -27,17 +28,20 @@ const primaryComparisonPolicy = "primary-controlled-workspace-comparison-v1"
 // Unavailable account/remote-lifecycle authority remains explicit even if a
 // primary runtime is already usable through its ordinary pane workflow.
 func newProviderPrimaryComparisonCmd() *cobra.Command {
-	var profileName, signerName string
+	var profileName, signerName, codeModeHostSHA256, experimentID, changeEvidence string
 	var live bool
 	var timeout time.Duration
 	cmd := &cobra.Command{Use: "compare", Short: "Compare a pinned primary runtime using the common workspace scenario", Args: cobra.NoArgs}
 	cmd.Flags().StringVar(&profileName, "profile", "", "Exact primary runtime profile")
 	cmd.Flags().StringVar(&signerName, "signer-profile", "", "Profile supplying only the pinned local receipt signer")
+	cmd.Flags().StringVar(&codeModeHostSHA256, "code-mode-host-sha256", "", "Reviewed companion executable SHA-256 (required for Codex comparison)")
+	cmd.Flags().StringVar(&experimentID, "experiment-id", "", "Unique durable experiment ID; at most one live attempt")
+	cmd.Flags().StringVar(&changeEvidence, "change-evidence-sha256", "", "Digest of the relevant fix or new diagnostic evidence permitting this attempt")
 	cmd.Flags().BoolVar(&live, "live", false, "Authorize one bounded primary provider call")
 	cmd.Flags().DurationVar(&timeout, "timeout", 90*time.Second, "Maximum provider run duration (at most five minutes)")
 	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
-		if !live || profileName == "" || signerName == "" || timeout <= 0 || timeout > 5*time.Minute {
-			return errors.New("comparison requires --live, exact --profile and --signer-profile, and a timeout between zero and five minutes")
+		if !live || profileName == "" || signerName == "" || timeout <= 0 || timeout > 5*time.Minute || !validProviderNativeOperationID(experimentID) || !validProviderNativeDigest(changeEvidence) {
+			return errors.New("comparison requires --live, exact profiles, --experiment-id, --change-evidence-sha256, and a timeout between zero and five minutes")
 		}
 		loaded := loadSelectedConfigOrDefault()
 		if loaded == nil {
@@ -51,7 +55,7 @@ func newProviderPrimaryComparisonCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		return runProviderPrimaryComparison(cmd, profileName, profile, signer, timeout)
+		return runProviderPrimaryComparison(cmd, profileName, profile, signer, timeout, codeModeHostSHA256, experimentID, changeEvidence)
 	}
 	return cmd
 }
@@ -75,53 +79,75 @@ func validatePrimaryComparisonProfile(p config.ProviderProfileConfig) (provider.
 }
 
 type primaryComparisonObservation struct {
-	TerminalCategory string `json:"terminal_category,omitempty"`
-	Completed        bool   `json:"completed"`
-	NonceVerified    bool   `json:"nonce_verified"`
-	ServedModel      string `json:"served_model,omitempty"`
-	ModelConflict    bool   `json:"model_conflict"`
-	Malformed        bool   `json:"malformed"`
-	UnexpectedTool   bool   `json:"unexpected_tool"`
-	EventCount       int    `json:"event_count"`
-	ExitOK           bool   `json:"exit_ok"`
+	FailureCategory     string `json:"failure_category,omitempty"`
+	CodeModeUnavailable bool   `json:"code_mode_unavailable,omitempty"`
+	MetadataFallback    bool   `json:"model_metadata_fallback,omitempty"`
+	MCPStarted          int    `json:"mcp_calls_started,omitempty"`
+	MCPCompleted        int    `json:"mcp_calls_completed,omitempty"`
+	MCPFailed           int    `json:"mcp_calls_failed,omitempty"`
+	TerminalCategory    string `json:"terminal_category,omitempty"`
+	Completed           bool   `json:"completed"`
+	NonceVerified       bool   `json:"nonce_verified"`
+	ServedModel         string `json:"served_model,omitempty"`
+	ModelConflict       bool   `json:"model_conflict"`
+	Malformed           bool   `json:"malformed"`
+	UnexpectedTool      bool   `json:"unexpected_tool"`
+	EventCount          int    `json:"event_count"`
+	ExitOK              bool   `json:"exit_ok"`
 }
 
 func (o primaryComparisonObservation) exactModelVerified(requested string) bool {
-	return requested != "" && o.ServedModel == requested && o.Completed && o.NonceVerified &&
-		o.ExitOK && !o.ModelConflict && !o.Malformed && !o.UnexpectedTool
+	return o.terminalModelVerified(requested) && o.NonceVerified
+}
+
+func (o primaryComparisonObservation) terminalModelVerified(requested string) bool {
+	return requested != "" && o.ServedModel == requested && o.Completed &&
+		o.ExitOK && !o.ModelConflict && !o.Malformed && !o.UnexpectedTool && !o.CodeModeUnavailable
 }
 
 // Only terminal assistant output can acknowledge work. Tool content, init
 // configuration, and echoed requests cannot prove completion or served model.
 func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce string) {
 	var e struct {
-		Type        string `json:"type"`
-		Subtype     string `json:"subtype"`
-		IsError     bool   `json:"is_error"`
-		Result      string `json:"result"`
-		ServerModel string `json:"server_model"`
-		Message     struct {
-			Model   string `json:"model"`
-			Content []struct {
-				Type string `json:"type"`
-				Name string `json:"name"`
-			} `json:"content"`
-		} `json:"message"`
-		Item struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+		Type        string          `json:"type"`
+		Subtype     string          `json:"subtype"`
+		IsError     bool            `json:"is_error"`
+		Result      string          `json:"result"`
+		ServerModel string          `json:"server_model"`
+		Message     json.RawMessage `json:"message"`
+		Item        struct {
+			Type   string `json:"type"`
+			Text   string `json:"text"`
+			Status string `json:"status"`
+			Server string `json:"server"`
+			Tool   string `json:"tool"`
 		} `json:"item"`
 	}
 	o.EventCount++
 	if json.Unmarshal(line, &e) != nil {
 		o.Malformed = true
+		o.FailureCategory = "invalid_event_envelope"
 		return
 	}
 	model := ""
 	if runtime == "claude" {
 		if e.Type == "assistant" {
-			model = e.Message.Model
-			for _, c := range e.Message.Content {
+			// SDKMessage is a tagged union. User and system message fields
+			// need not have the assistant's BetaMessage shape.
+			var message struct {
+				Model   string `json:"model"`
+				Content []struct {
+					Type string `json:"type"`
+					Name string `json:"name"`
+				} `json:"content"`
+			}
+			if json.Unmarshal(e.Message, &message) != nil {
+				o.Malformed = true
+				o.FailureCategory = "invalid_assistant_envelope"
+				return
+			}
+			model = message.Model
+			for _, c := range message.Content {
 				if c.Type == "tool_use" && !strings.HasPrefix(c.Name, "mcp__ntm-controlled-workspace__") {
 					o.UnexpectedTool = true
 				}
@@ -130,12 +156,27 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 		if e.Type == "result" {
 			if o.Completed {
 				o.Malformed = true
+				o.FailureCategory = "duplicate_terminal"
 			}
 			o.Completed = !e.IsError && e.Subtype == "success"
 			o.NonceVerified = o.Completed && strings.TrimSpace(e.Result) == nonce
 			o.TerminalCategory = primaryTerminalCategory(e.Result, nonce)
 		}
 	} else {
+		if e.Item.Type == "mcp_tool_call" {
+			if e.Type == "item.started" {
+				o.MCPStarted++
+			}
+			if e.Type == "item.completed" {
+				o.MCPCompleted++
+				if e.Item.Status != "completed" {
+					o.MCPFailed++
+				}
+			}
+			if e.Item.Server != "" && e.Item.Server != grok.WorkspaceBrokerMCPName {
+				o.UnexpectedTool = true
+			}
+		}
 		if e.Type == "item.completed" {
 			switch e.Item.Type {
 			case "agent_message":
@@ -148,12 +189,14 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 		if e.Type == "turn.completed" {
 			if o.Completed {
 				o.Malformed = true
+				o.FailureCategory = "duplicate_terminal"
 			}
 			o.Completed = true
 			model = e.ServerModel
 		}
 		if e.Type == "turn.failed" || e.Type == "error" {
 			o.Malformed = true
+			o.FailureCategory = "runtime_error"
 		}
 	}
 	if model != "" {
@@ -165,6 +208,7 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 			return !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '.' || r == '_')
 		}) >= 0 {
 			o.Malformed = true
+			o.FailureCategory = "invalid_model_label"
 			return
 		}
 		if o.ServedModel != "" && o.ServedModel != model {
@@ -172,6 +216,31 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 		}
 		o.ServedModel = model
 	}
+}
+
+// Match only source-defined runtime warning categories. Never retain stderr,
+// provider explanations, paths, arbitrary tool names, or error payloads.
+func (o *primaryComparisonObservation) observeWarnings(data []byte) {
+	o.CodeModeUnavailable = bytes.Contains(data, []byte("Code Mode is unavailable because"))
+	o.MetadataFallback = bytes.Contains(data, []byte("Defaulting to fallback metadata"))
+}
+
+// The reviewed 0.153.0 standalone install resolves this companion beside the
+// main executable. MCP inventory alone does not check Code Mode execution.
+func primaryCodexCompanionDigest(binary, expected string) (string, error) {
+	if !filepath.IsAbs(binary) || !validProviderNativeDigest(expected) {
+		return "", errors.New("Codex comparison requires a reviewed code-mode-host SHA-256 before dispatch")
+	}
+	path := filepath.Join(filepath.Dir(binary), "codex-code-mode-host")
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+		return "", errors.New("Codex code-mode companion is missing or not a regular executable; tool inventory is insufficient")
+	}
+	digest, err := hashProviderSessionExecutable(path)
+	if err != nil || digest != expected {
+		return "", errors.New("Codex code-mode companion digest differs from the reviewed pin")
+	}
+	return digest, nil
 }
 
 // These are prose hints, not failure authority or readiness evidence. Only the
@@ -230,7 +299,7 @@ func primaryComparisonCredentialValid(data []byte, runtime string) bool {
 	return runtime == "claude" && credential.ClaudeOAuth.AccessToken != ""
 }
 
-func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profile, signer config.ProviderProfileConfig, timeout time.Duration) error {
+func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profile, signer config.ProviderProfileConfig, timeout time.Duration, codeModeHostSHA256, experimentID, changeEvidence string) error {
 	id, transport, err := validatePrimaryComparisonProfile(profile)
 	if err != nil {
 		return err
@@ -258,6 +327,13 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	if versionErr != nil || hashErr != nil || !versionMatches(version, profile.RuntimeVersion) || digest != profile.RuntimeSHA256 {
 		return errors.New("primary runtime version or executable pin mismatch")
 	}
+	if id.Runtime() == "codex" {
+		if _, err := primaryCodexCompanionDigest(profile.Command, codeModeHostSHA256); err != nil {
+			return err
+		}
+	} else if codeModeHostSHA256 != "" {
+		return errors.New("code-mode companion pin is only valid for Codex")
+	}
 	sign, err := providerProfilePinnedSigner(signer)
 	if err != nil {
 		return err
@@ -271,6 +347,9 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	}
 	started := time.Now().UTC()
 	policy := sha256StringCLI(primaryComparisonPolicy + "\x00" + transport)
+	if codeModeHostSHA256 != "" {
+		policy = sha256StringCLI(primaryComparisonPolicy + "\x00" + transport + "\x00" + codeModeHostSHA256)
+	}
 	if _, err := providerqualification.StorePrimaryComparisonDiagnostics("", transport, id.Hash(), policy, digest, started, started, "before_dispatch", providerqualification.PrimaryComparisonDiagnostic{}); err != nil {
 		return err
 	}
@@ -286,32 +365,7 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 		defer cancel()
 		_ = cleanupProviderGrokLineageWorkspace(cleanupCtx, workspace)
 	}()
-	// Copy only one bounded cached credential file from the explicitly selected
-	// account home. No global configuration, hooks, MCP servers, or API-key env.
-	authName := "auth.json"
-	if id.Runtime() == "claude" {
-		authName = ".credentials.json"
-	}
-	source := filepath.Join(profile.RuntimeHome, authName)
-	info, err := os.Lstat(source)
-	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 1<<20 {
-		return errors.New("primary comparison requires a bounded regular account credential file")
-	}
-	auth, err := os.ReadFile(source)
-	if err != nil {
-		return errors.New("primary credential file could not be read")
-	}
-	if !primaryComparisonCredentialValid(auth, id.Runtime()) {
-		for i := range auth {
-			auth[i] = 0
-		}
-		return errors.New("primary comparison requires subscription OAuth credentials; API-key substitution is prohibited")
-	}
-	err = os.WriteFile(filepath.Join(workspace.RuntimeHome, authName), auth, 0600)
-	for i := range auth {
-		auth[i] = 0
-	}
-	if err != nil {
+	if err = copyPrimaryCredential(profile, workspace.RuntimeHome); err != nil {
 		return err
 	}
 	revision, err := providerGrokQualificationGit(ctx, workspace.Worktree, "rev-parse", "HEAD")
@@ -346,13 +400,10 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	prompt := providerWorkspaceQualificationPrompt(nonce)
 	var args []string
 	if id.Runtime() == "claude" {
-		mcp := map[string]any{"mcpServers": map[string]any{grok.WorkspaceBrokerMCPName: map[string]any{"command": descriptor.Command, "args": descriptor.Args, "env": map[string]string{}}}}
-		data, _ := json.Marshal(mcp)
-		mcpPath := filepath.Join(workspace.RuntimeHome, "mcp.json")
-		if err = os.WriteFile(mcpPath, data, 0600); err != nil {
+		args, err = primaryClaudeArguments(workspace.RuntimeHome, id.Model(), prompt, nonce, broker)
+		if err != nil {
 			return err
 		}
-		args = []string{"--print", "--verbose", "--output-format", "stream-json", "--tools", "", "--permission-mode", "dontAsk", "--setting-sources", "", "--settings", `{"disableAllHooks":true}`, "--strict-mcp-config", "--mcp-config", mcpPath, "--allowedTools", "mcp__ntm-controlled-workspace__read_file,mcp__ntm-controlled-workspace__write_file,mcp__ntm-controlled-workspace__verify_worktree", "--model", id.Model(), prompt}
 	} else {
 		settings := primaryCodexComparisonSettings(id.Model(), descriptor.Command, descriptor.Args)
 		var b bytes.Buffer
@@ -366,6 +417,14 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	ledger, closeLedger, err := openProviderNativeLedger()
+	if err != nil {
+		return err
+	}
+	defer closeLedger()
+	if err := claimPrimaryComparisonExperiment(ledger, experimentID, id.Hash(), changeEvidence); err != nil {
+		return err
+	}
 	decision, err := acquireProviderGrokQualificationTurn(runCtx, admission, id)
 	if err != nil {
 		return err
@@ -378,7 +437,11 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 		observation.observe(scanner.Bytes(), id.Runtime(), nonce)
 	}
 	observation.Malformed = observation.Malformed || scanner.Err() != nil || outcome.OutputTruncated
+	if scanner.Err() != nil || outcome.OutputTruncated {
+		observation.FailureCategory = "output_incomplete"
+	}
 	observation.ExitOK = runErr == nil && outcome.ExitCode == 0
+	observation.observeWarnings(outcome.Stderr)
 	// Raw streams remain memory-only and are never embedded in diagnostic or
 	// signed evidence. Reuse the common continuously observed process runner.
 	for i := range outcome.Stdout {
@@ -392,7 +455,10 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	capacity := admission.ReleaseObserved(id, decision)
 	completed := time.Now().UTC()
 	diagnostic := providerqualification.PrimaryComparisonDiagnostic{Completed: observation.Completed, NonceVerified: observation.NonceVerified, ModelMatched: observation.ServedModel != "" && observation.ServedModel == id.Model(), ModelConflict: observation.ModelConflict, Malformed: observation.Malformed, UnexpectedTool: observation.UnexpectedTool, EventCount: observation.EventCount, ExitOK: observation.ExitOK}
+	diagnostic.FailureCategory = observation.FailureCategory
 	diagnostic.TerminalCategory = observation.TerminalCategory
+	diagnostic.CodeModeUnavailable, diagnostic.MetadataFallback = observation.CodeModeUnavailable, observation.MetadataFallback
+	diagnostic.MCPStarted, diagnostic.MCPCompleted, diagnostic.MCPFailed = observation.MCPStarted, observation.MCPCompleted, observation.MCPFailed
 	if observation.ServedModel != "" {
 		diagnostic.ModelSHA256 = sha256StringCLI(observation.ServedModel)
 	}
@@ -454,6 +520,20 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 		return err
 	}
 	return &providerQualificationExitError{}
+}
+
+func claimPrimaryComparisonExperiment(ledger providerNativeOperationLedger, experimentID, identity, evidence string) error {
+	if ledger == nil || !validProviderNativeOperationID(experimentID) || !validProviderNativeDigest(identity) || !validProviderNativeDigest(evidence) {
+		return errors.New("comparison experiment binding is incomplete")
+	}
+	_, won, err := ledger.ClaimSendOperation(&state.SendOperation{OperationID: experimentID, SessionName: "provider:comparison-experiment", BindingHash: sha256StringCLI(identity + "\x00" + evidence), PayloadSHA256: evidence, CreatedAt: time.Now().UTC()})
+	if err != nil {
+		return err
+	}
+	if !won {
+		return errors.New("comparison experiment already attempted; a new attempt requires a relevant change or new diagnostic evidence and a distinct experiment ID")
+	}
+	return nil
 }
 
 func primaryCodexComparisonSettings(model, command string, args []string) map[string]any {

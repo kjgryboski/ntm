@@ -510,19 +510,33 @@ func StoreWorkspaceDiagnostics(baseDir, transport, identity, policy, runtime str
 // PrimaryComparisonDiagnostic retains closed observations and a model digest,
 // never provider text, credentials, prompts, or a purported account identity.
 type PrimaryComparisonDiagnostic struct {
-	TerminalCategory string `json:"terminal_category,omitempty"`
-	Completed        bool   `json:"completed"`
-	NonceVerified    bool   `json:"nonce_verified"`
-	ModelSHA256      string `json:"model_sha256,omitempty"`
-	ModelMatched     bool   `json:"model_matched"`
-	ModelConflict    bool   `json:"model_conflict"`
-	Malformed        bool   `json:"malformed"`
-	UnexpectedTool   bool   `json:"unexpected_tool"`
-	EventCount       int    `json:"event_count"`
-	ExitOK           bool   `json:"exit_ok"`
+	FailureCategory     string `json:"failure_category,omitempty"`
+	CodeModeUnavailable bool   `json:"code_mode_unavailable,omitempty"`
+	MetadataFallback    bool   `json:"model_metadata_fallback,omitempty"`
+	MCPStarted          int    `json:"mcp_calls_started,omitempty"`
+	MCPCompleted        int    `json:"mcp_calls_completed,omitempty"`
+	MCPFailed           int    `json:"mcp_calls_failed,omitempty"`
+	TerminalCategory    string `json:"terminal_category,omitempty"`
+	Completed           bool   `json:"completed"`
+	NonceVerified       bool   `json:"nonce_verified"`
+	ModelSHA256         string `json:"model_sha256,omitempty"`
+	ModelMatched        bool   `json:"model_matched"`
+	ModelConflict       bool   `json:"model_conflict"`
+	Malformed           bool   `json:"malformed"`
+	UnexpectedTool      bool   `json:"unexpected_tool"`
+	EventCount          int    `json:"event_count"`
+	ExitOK              bool   `json:"exit_ok"`
 }
 
 func StorePrimaryComparisonDiagnostics(baseDir, transport, identity, policy, runtime string, started, observed time.Time, phase string, observation PrimaryComparisonDiagnostic) (string, error) {
+	switch observation.FailureCategory {
+	case "", "invalid_event_envelope", "invalid_assistant_envelope", "duplicate_terminal", "runtime_error", "invalid_model_label", "output_incomplete":
+	default:
+		return "", errors.New("invalid primary failure category")
+	}
+	if observation.MCPStarted < 0 || observation.MCPCompleted < 0 || observation.MCPFailed < 0 || observation.MCPFailed > observation.MCPCompleted {
+		return "", errors.New("invalid primary tool counters")
+	}
 	switch observation.TerminalCategory {
 	case "", "empty", "acknowledged", "read_only_mentioned", "tools_unavailable_mentioned", "permission_mentioned", "other_text":
 	default:

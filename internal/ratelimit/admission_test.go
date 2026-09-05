@@ -1,9 +1,11 @@
 package ratelimit
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,6 +15,65 @@ import (
 )
 
 const admissionConfigHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+func TestSubscriptionCrashRetainsUncertainUsageAcrossControllerRestart(t *testing.T) {
+	for _, phase := range []string{"reservation", "dispatch"} {
+		t.Run(phase, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "capacity.json")
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestSubscriptionCrashHelper$")
+			child.Env = append(os.Environ(), "NTM_SUBSCRIPTION_CRASH_PATH="+path, "NTM_SUBSCRIPTION_CRASH_PHASE="+phase)
+			if data, err := child.CombinedOutput(); err != nil {
+				t.Fatalf("crash helper: %v %s", err, data)
+			}
+			cfg := DefaultSubscriptionAdmissionConfig()
+			controller, err := NewSubscriptionAdmissionController(cfg, path, time.Now, func() float64 { return 0.5 })
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := subscriptionIdentity(t, "crash-fixture", "glm-5.3", "https://api.z.ai/api/v1")
+			before := controller.Snapshot(id)
+			if before.PlanRunning != 0 || before.Exact.Running != 0 {
+				t.Fatalf("dead owner retained local slot: %+v", before)
+			}
+			if !before.UnknownUsageReserved || before.WeeklyCreditsUsed < cfg.WeeklyCreditLimit {
+				t.Fatalf("uncertain usage refunded after %s: %+v", phase, before)
+			}
+			if got := controller.Acquire(id); got.Allowed {
+				t.Fatal("orphaned usage permitted new paid dispatch")
+			}
+			after := controller.Snapshot(id)
+			if !after.UnknownUsageReserved || after.WeeklyCreditsUsed != before.WeeklyCreditsUsed {
+				t.Fatal("admission changed the uncertain charge")
+			}
+		})
+	}
+}
+
+func TestSubscriptionCrashHelper(t *testing.T) {
+	path := os.Getenv("NTM_SUBSCRIPTION_CRASH_PATH")
+	if path == "" {
+		t.Skip("subprocess helper")
+	}
+	controller, err := NewSubscriptionAdmissionController(DefaultSubscriptionAdmissionConfig(), path, time.Now, func() float64 { return 0.5 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := subscriptionIdentity(t, "crash-fixture", "glm-5.3", "https://api.z.ai/api/v1")
+	decision := controller.Acquire(id)
+	if !decision.Allowed {
+		t.Fatal("fixture reservation failed")
+	}
+	if os.Getenv("NTM_SUBSCRIPTION_CRASH_PHASE") != "reservation" {
+		if err := controller.BindReservation(id, decision, strings.Repeat("b", 64), strings.Repeat("c", 64)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Receipt persistence/signing are outside the capacity store. Until a
+	// verified result reconciles it, every such interruption retains uncertainty.
+	os.Exit(0)
+}
 
 func TestObservedReleaseKeepsOtherLeaseAndUnknownUsage(t *testing.T) {
 	now := time.Now().UTC()
@@ -105,6 +166,9 @@ func TestSubscriptionAdmissionSharesPlanCreditsAcrossModelsButNotProviders(t *te
 	if !first.Allowed || !first.NoFailover {
 		t.Fatalf("first plan admission = %+v", first)
 	}
+	if err := controller.recordUsageCredits(flash, first, 1, now, false); err != nil {
+		t.Fatal(err)
+	}
 	controller.Release(flash, first)
 	blocked := controller.Acquire(hard)
 	if blocked.Allowed || blocked.Reason != ErrorLongPeriodQuota || blocked.RetryAt == nil || !blocked.RetryAt.Equal(now.Add(5*time.Hour)) || !blocked.NoFailover {
@@ -135,11 +199,17 @@ func TestSubscriptionAdmissionEnforcesWeeklyWindowAfterFiveHourReset(t *testing.
 	if !first.Allowed {
 		t.Fatalf("first = %+v", first)
 	}
+	if err := controller.recordUsageCredits(id, first, 1, now, false); err != nil {
+		t.Fatal(err)
+	}
 	controller.Release(id, first)
 	now = now.Add(5 * time.Hour)
 	second := controller.Acquire(id)
 	if !second.Allowed {
 		t.Fatalf("second after five-hour reset = %+v", second)
+	}
+	if err := controller.recordUsageCredits(id, second, 1, now, false); err != nil {
+		t.Fatal(err)
 	}
 	controller.Release(id, second)
 	now = now.Add(5 * time.Hour)
@@ -517,11 +587,11 @@ func TestSubscriptionAdmissionMultipleUnknownTurnsReserveOneWeeklyCeiling(t *tes
 	if !first.Allowed {
 		t.Fatalf("first admission=%+v", first)
 	}
-	controller.Release(id, first)
 	second := controller.Acquire(id)
 	if !second.Allowed {
 		t.Fatalf("second admission=%+v", second)
 	}
+	controller.Release(id, first)
 	controller.Release(id, second)
 	if err := controller.RecordUnknownUsage(id, first); err != nil {
 		t.Fatal(err)

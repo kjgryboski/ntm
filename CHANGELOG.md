@@ -15,6 +15,32 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
 
 ### Security
 
+- **Primary provider comparisons check executable tool prerequisites before
+  dispatch.** Standalone Codex comparisons require a pinned code-mode companion;
+  safe warning categories and MCP counters survive failed runs. Durable
+  experiment IDs prevent replay and require a digest of the relevant change or
+  new diagnostic evidence. `provider acceptance` creates the common isolated
+  coding fixture without calling a provider.
+
+- **Qualified Claude workspace assignments use the shared provider controls.**
+  Completion requires the controller-owned verifier and signed exact-identity
+  evidence. Local cancellation, cleanup, and capacity release permit guarded
+  restart; remote generation termination and resume remain unproven. Ordinary
+  operation attestations cannot grant workspace qualification. Doctor output
+  separates workspace evidence and admission from lifecycle capabilities.
+  Expired Claude credential snapshots fail before dispatch. The stream parser
+  handles message variants independently, retains closed rejection categories,
+  and binds the exact completion instruction through the system-prompt option.
+  Ordinary completion combines the runtime's successful terminal event with
+  independent workspace verification; echoed nonces remain diagnostic there
+  and mandatory in identity qualification. Earlier failed receipts stay failed.
+
+- **Controller crashes preserve uncertain subscription usage.** Reclaiming a
+  dead local lease conservatively reserves unreconciled weekly credits. Offline
+  crash tests cover reservation, dispatch, signing, and receipt persistence;
+  uncertain operations cannot be replayed. Cleanup recognizes processes reaped
+  after termination by a signal.
+
 - **Ordinary Grok diagnostics bind the verified executable digest.** Missing
   optional profile hashes cannot break finalization; invalid bindings and
   unavailable diagnostic storage are rejected before dispatch.

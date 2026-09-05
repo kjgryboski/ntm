@@ -32,6 +32,8 @@ func providerAssignmentScope(identity provider.Identity) string {
 		return "provider:xai-acp"
 	case identity.Provider() == "zai" && identity.Runtime() == "codex":
 		return providerCodexOperationScope
+	case identity.Provider() == "anthropic" && identity.Runtime() == "claude":
+		return primaryAssignmentScope
 	default:
 		return ""
 	}
@@ -192,7 +194,8 @@ func runProviderInterrupt(cmd *cobra.Command, profileName, operationID string) e
 func providerRestartAllowed(status providerAssignmentStatus) bool {
 	c := status.CapacityObservation
 	cancelled := (status.Provider == "xai" && status.State == grok.StateCancelled) ||
-		(status.Provider == "zai" && status.State == "cancelled")
+		(status.Provider == "zai" && status.State == "cancelled") ||
+		(status.Provider == "anthropic" && status.State == "cancelled_local")
 	return status.IdentityBindingVerified && status.LocalCleanupVerified &&
 		(status.CompletionConfirmed || cancelled) &&
 		c != nil && c.IdentitySHA256 == status.IdentitySHA256 && c.Scope == provider.CapacityControlScopeLocalShared &&

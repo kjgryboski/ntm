@@ -28,6 +28,18 @@ func TestLocalRunnerCleansObservedDescendantsAfterNormalExit(t *testing.T) {
 	}
 }
 
+func TestLocalRunnerCancellationReapsSignalledProcessWithoutClaimingCompletion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX signal fixture")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	out, err := (LocalRunner{}).Run(ctx, Invocation{Binary: "/bin/sleep", Args: []string{"30"}, Env: []string{"PATH=/usr/bin:/bin"}, Dir: t.TempDir(), OutputLimit: 1024})
+	if err == nil || out.ExitCode == 0 || !out.ProcessStarted || !out.ProcessTreeTerminated || !out.ResidualCheckPerformed || len(out.ResidualProcessIDs) != 0 {
+		t.Fatalf("signalled child was not reaped, or claimed success: %+v %v", out, err)
+	}
+}
+
 func TestObservedProcessStatusDoesNotTreatReusedPIDAsResidual(t *testing.T) {
 	observed, err := observeProcess(int32(os.Getpid()))
 	if err != nil {
