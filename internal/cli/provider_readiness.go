@@ -24,21 +24,34 @@ type providerReadinessEvidence struct {
 }
 
 type providerReadinessLane struct {
-	Profile                string                      `json:"profile"`
-	Identity               providerDoctorIdentity      `json:"identity"`
-	AccountSHA256          string                      `json:"account_sha256"`
-	Transport              string                      `json:"transport"`
-	WorkspaceEvidence      string                      `json:"workspace_evidence"`
-	AdmissionState         string                      `json:"admission_state"`
-	Blockers               []string                    `json:"blockers"`
-	DispatchAuthorized     bool                        `json:"dispatch_authorized"`
-	Credential             map[string]any              `json:"credential"`
-	Qualification          providerDoctorQualification `json:"qualification"`
-	QualificationExpiresAt *time.Time                  `json:"qualification_expires_at,omitempty"`
-	Capacity               map[string]any              `json:"capacity"`
-	Checks                 []providerReadinessEvidence `json:"checks"`
-	Operations             []providerAssignmentStatus  `json:"operations"`
-	RemoteTermination      string                      `json:"remote_generation_termination"`
+	Profile                string                        `json:"profile"`
+	Identity               providerDoctorIdentity        `json:"identity"`
+	AccountSHA256          string                        `json:"account_sha256"`
+	Transport              string                        `json:"transport"`
+	WorkspaceEvidence      string                        `json:"workspace_evidence"`
+	AdmissionState         string                        `json:"admission_state"`
+	Blockers               []string                      `json:"blockers"`
+	DispatchAuthorized     bool                          `json:"dispatch_authorized"`
+	Credential             map[string]any                `json:"credential"`
+	Qualification          providerDoctorQualification   `json:"qualification"`
+	QualificationExpiresAt *time.Time                    `json:"qualification_expires_at,omitempty"`
+	UsableUntil            *time.Time                    `json:"usable_until,omitempty"`
+	RequestedDuration      time.Duration                 `json:"requested_duration_ns"`
+	DurationFits           bool                          `json:"duration_fits"`
+	CapabilitySummary      []providerReadinessCapability `json:"capability_summary"`
+	EvidenceDiscoveryLimit int                           `json:"evidence_discovery_limit"`
+	EvidenceTruncated      bool                          `json:"evidence_truncated"`
+	EvidenceErrors         []string                      `json:"evidence_errors,omitempty"`
+	Capacity               map[string]any                `json:"capacity"`
+	Checks                 []providerReadinessEvidence   `json:"checks"`
+	Operations             []providerAssignmentStatus    `json:"operations"`
+	RemoteTermination      string                        `json:"remote_generation_termination"`
+}
+
+type providerReadinessCapability struct {
+	Operation          string `json:"operation"`
+	State              string `json:"state"`
+	ObservationIndexes []int  `json:"observation_indexes"`
 }
 
 // This is a single read surface over existing admission and receipt owners.
@@ -46,13 +59,18 @@ type providerReadinessLane struct {
 func newProviderReadinessCmd() *cobra.Command {
 	var profiles, operations []string
 	var cwd string
+	var duration time.Duration
 	cmd := &cobra.Command{Use: "readiness", Short: "Compare exact provider readiness, capability evidence and separate capacity units without generation", Args: cobra.NoArgs}
 	cmd.Flags().StringSliceVar(&profiles, "profile", nil, "Exact provider profiles; repeat to compare providers")
 	cmd.Flags().StringSliceVar(&operations, "operation", nil, "Existing task evidence as PROFILE=OPERATION_ID; repeat for completion and cancellation")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "Absolute intended workspace for local policy inspection; defaults to current directory")
+	cmd.Flags().DurationVar(&duration, "task-timeout", 5*time.Minute, "Intended task duration for credential and qualification window checks")
 	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
 		if len(profiles) == 0 || len(profiles) > 16 {
 			return errors.New("readiness requires 1-16 exact profiles")
+		}
+		if duration <= 0 {
+			return errors.New("readiness task timeout must be positive")
 		}
 		if cwd != "" && !filepath.IsAbs(cwd) {
 			return errors.New("readiness workspace must be absolute")
@@ -71,15 +89,40 @@ func newProviderReadinessCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			store, err := state.Open("")
+			if err != nil {
+				return err
+			}
+			automatic, truncated, discoverErr := discoverProviderReadinessOperations(store, lane.Identity.SHA256)
+			closeErr := store.Close()
+			if err = errors.Join(discoverErr, closeErr); err != nil {
+				return err
+			}
+			lane.EvidenceDiscoveryLimit, lane.EvidenceTruncated = 64, truncated
+			selected := append(append([]string{}, bindings[name]...), automatic...)
+			seen := map[string]bool{}
+			explicit := map[string]bool{}
 			for _, operation := range bindings[name] {
+				explicit[operation] = true
+			}
+			for _, operation := range selected {
+				if seen[operation] {
+					continue
+				}
+				seen[operation] = true
 				if err = withProviderAssignmentStatus(cmd, name, operation, func(status providerAssignmentStatus) error {
 					lane.Operations = append(lane.Operations, status)
 					return nil
 				}); err != nil {
-					return err
+					if explicit[operation] {
+						return err
+					}
+					lane.EvidenceErrors = append(lane.EvidenceErrors, "unverifiable_task_reference:"+sha256StringCLI(operation))
 				}
 			}
 			lane.Checks = append(lane.Checks, providerTaskEvidence(lane.Operations)...)
+			lane.CapabilitySummary = summarizeProviderReadiness(lane.Checks)
+			applyProviderReadinessWindow(&lane, duration, time.Now().UTC())
 			lanes = append(lanes, lane)
 		}
 		if IsJSONOutput() {
@@ -88,14 +131,89 @@ func newProviderReadinessCmd() *cobra.Command {
 		for _, lane := range lanes {
 			fmt.Fprintf(cmd.OutOrStdout(), "%s (%s / %s): workspace evidence %s; admission %s\n", lane.Profile, lane.Identity.Provider, lane.Identity.Model, lane.WorkspaceEvidence, lane.AdmissionState)
 			fmt.Fprintf(cmd.OutOrStdout(), "Credential: %v; blockers: %s\n", lane.Credential["state"], strings.Join(lane.Blockers, ", "))
-			for _, check := range lane.Checks {
-				fmt.Fprintf(cmd.OutOrStdout(), "  %s: %s (%s)\n", check.Operation, check.State, check.Source)
+			fmt.Fprintf(cmd.OutOrStdout(), "Usable until: %v; task duration fits: %t\n", lane.UsableUntil, lane.DurationFits)
+			if lane.EvidenceTruncated || len(lane.EvidenceErrors) > 0 {
+				fmt.Fprintf(cmd.OutOrStdout(), "Task evidence: history truncated=%t; unverifiable references=%d (see JSON details)\n", lane.EvidenceTruncated, len(lane.EvidenceErrors))
+			}
+			for _, check := range lane.CapabilitySummary {
+				fmt.Fprintf(cmd.OutOrStdout(), "  %s: %s (%d retained observations)\n", check.Operation, check.State, len(check.ObservationIndexes))
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), "Execution slots, experiment attempts and billing usage are separate. This inspection grants no dispatch.")
 		}
 		return nil
 	}
 	return cmd
+}
+
+// Candidate discovery is not verification. Every selected row is subsequently
+// verified by withProviderAssignmentStatus against the exact configured identity
+// and currently trusted signer. Never discover by account alias or model alone.
+func discoverProviderReadinessOperations(store *state.Store, identity string) ([]string, bool, error) {
+	if store == nil || !validProviderNativeDigest(identity) {
+		return nil, false, errors.New("task evidence discovery requires an exact identity and store")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rows, err := store.DB().QueryContext(ctx, `SELECT operation_id FROM send_operations
+		WHERE payload_sha256 = ? AND session_name IN (?, ?)
+		GROUP BY operation_id ORDER BY MAX(created_at) DESC, operation_id LIMIT 65`, identity, providerControlScope, primaryAssignmentScope)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	result := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, false, err
+		}
+		if !validProviderNativeOperationID(id) {
+			return nil, false, errors.New("invalid task evidence reference")
+		}
+		result = append(result, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	if len(result) > 64 {
+		return result[:64], true, nil
+	}
+	return result, false, nil
+}
+
+func summarizeProviderReadiness(observations []providerReadinessEvidence) []providerReadinessCapability {
+	result := []providerReadinessCapability{}
+	positions := map[string]int{}
+	// Passed means demonstrated at least once. All failed and untested
+	// observations remain referenced; this summary never authorizes dispatch.
+	rank := map[string]int{"untested": 0, "unsupported": 1, "failed": 2, "passed": 3}
+	for i, observation := range observations {
+		position, exists := positions[observation.Operation]
+		if !exists {
+			position = len(result)
+			positions[observation.Operation] = position
+			result = append(result, providerReadinessCapability{Operation: observation.Operation, State: observation.State})
+		}
+		entry := &result[position]
+		entry.ObservationIndexes = append(entry.ObservationIndexes, i)
+		if rank[observation.State] > rank[entry.State] {
+			entry.State = observation.State
+		}
+	}
+	return result
+}
+
+func applyProviderReadinessWindow(lane *providerReadinessLane, duration time.Duration, now time.Time) {
+	lane.RequestedDuration = duration
+	lane.UsableUntil = lane.QualificationExpiresAt
+	if expires, ok := lane.Credential["expires_at"].(time.Time); ok && (lane.UsableUntil == nil || expires.Before(*lane.UsableUntil)) {
+		lane.UsableUntil = &expires
+	}
+	lane.DurationFits = duration > 0 && lane.UsableUntil != nil && now.Add(duration).Before(*lane.UsableUntil)
+	if !lane.DurationFits {
+		lane.Blockers = append(lane.Blockers, "task_timeout_exceeds_known_validity_window")
+		lane.AdmissionState = "blocked"
+	}
 }
 
 func providerReadinessOperationBindings(profiles, operations []string) (map[string][]string, error) {

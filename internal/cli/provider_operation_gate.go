@@ -23,6 +23,7 @@ type providerOperationAuthorization struct {
 	Operation           string
 	QualificationDir    string
 	MaxQualificationAge time.Duration
+	RequiredValidity    time.Duration
 	TrustedSigner       providerattestation.KeyMetadata
 }
 
@@ -74,6 +75,9 @@ func authorizeProviderOperationWithDependencies(input providerOperationAuthoriza
 	now := deps.now().UTC()
 	if receipt.CompletedAt.After(now) || now.Sub(receipt.CompletedAt) > input.MaxQualificationAge {
 		return "", errors.New("provider operation qualification is future-dated or stale")
+	}
+	if input.RequiredValidity < 0 || !now.Add(input.RequiredValidity).Before(receipt.CompletedAt.Add(input.MaxQualificationAge)) {
+		return "", errors.New("provider operation timeout does not fit the qualification validity window")
 	}
 	checks := make(map[string]providerqualification.Check, len(receipt.Checks))
 	for _, check := range receipt.Checks {

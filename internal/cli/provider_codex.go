@@ -200,6 +200,7 @@ OpenAI, Anthropic, or native API billing.`,
 }
 
 func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps providerCodexRunDependencies) (returnErr error) {
+	clockStarted := time.Now()
 	if strings.TrimSpace(opts.profile) == "" || strings.TrimSpace(opts.prompt) == "" || strings.TrimSpace(opts.cwd) == "" {
 		return errors.New("provider codex run requires exact --profile, --prompt, and --cwd values")
 	}
@@ -284,7 +285,8 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 	qualificationSHA256, err := deps.authorizeOperation(providerOperationAuthorization{
 		Identity: identity, Transport: "zai_codex_runtime", PolicySHA256: providerCodexPolicySHA256(), RuntimeVersion: manifest.RuntimeVersion, RuntimeSHA256: manifest.BinarySHA256,
 		Operation: requiredOperation, QualificationDir: opts.qualificationDir, MaxQualificationAge: opts.qualificationAge,
-		TrustedSigner: signerPreflight.KeyMetadata,
+		RequiredValidity: opts.timeout,
+		TrustedSigner:    signerPreflight.KeyMetadata,
 	})
 	if err != nil {
 		return fmt.Errorf("provider codex operation gate denied dispatch: %w", err)
@@ -325,6 +327,12 @@ func runProviderCodex(cmd *cobra.Command, opts providerCodexRunOptions, deps pro
 		return replayProviderCodex(cmd, output, claimed, identity, signerPreflight.KeyMetadata)
 	}
 	output.ReceiptState, output.State = "claimed", "admission_pending"
+	if err := checkProviderDispatchClock(clockStarted); err != nil {
+		return err
+	}
+	if err := commandCtx.Err(); err != nil {
+		return &providerEnvironmentError{reason: "prerequisite_deadline_expired"}
+	}
 	decision := deps.admission.Acquire(identity)
 	output.Admission = providerCodexSubscriptionAdmissionEvidence{
 		Allowed: decision.Allowed, Reason: decision.Reason, RetryAt: decision.RetryAt, NoFailover: decision.NoFailover,

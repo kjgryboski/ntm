@@ -32,6 +32,7 @@ func newProviderPrimaryComparisonCmd() *cobra.Command {
 	var timeout time.Duration
 	cmd := &cobra.Command{Use: "compare", Short: "Compare a pinned primary runtime using the common workspace scenario", Args: cobra.NoArgs}
 	cmd.Flags().StringVar(&profileName, "profile", "", "Exact primary runtime profile")
+	cmd.Flags().String("scope", "full", "Requested qualification scope: full or workspace")
 	cmd.Flags().StringVar(&signerName, "signer-profile", "", "Profile supplying only the pinned local receipt signer")
 	cmd.Flags().StringVar(&codeModeHostSHA256, "code-mode-host-sha256", "", "Reviewed companion executable SHA-256 (required for Codex comparison)")
 	cmd.Flags().StringVar(&experimentID, "experiment-id", "", "Unique durable experiment ID; at most one live attempt")
@@ -39,6 +40,9 @@ func newProviderPrimaryComparisonCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&live, "live", false, "Authorize one bounded primary provider call")
 	cmd.Flags().DurationVar(&timeout, "timeout", 90*time.Second, "Maximum provider run duration (at most five minutes)")
 	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		if err := validateProviderQualificationScope(cmd); err != nil {
+			return err
+		}
 		if !live || profileName == "" || signerName == "" || timeout <= 0 || timeout > 5*time.Minute || !validProviderNativeOperationID(experimentID) || !validProviderNativeDigest(changeEvidence) {
 			return errors.New("comparison requires --live, exact profiles, --experiment-id, --change-evidence-sha256, and a timeout between zero and five minutes")
 		}
@@ -307,6 +311,7 @@ func primaryComparisonCredentialValid(data []byte, runtime string) bool {
 }
 
 func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profile, signer config.ProviderProfileConfig, timeout time.Duration, codeModeHostSHA256, experimentID, changeEvidence string) error {
+	clockStarted := time.Now()
 	id, transport, err := validatePrimaryComparisonProfile(profile)
 	if err != nil {
 		return err
@@ -402,6 +407,12 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 		return err
 	}
 	defer closeLedger()
+	if err := checkProviderDispatchClock(clockStarted); err != nil {
+		return err
+	}
+	if err := runCtx.Err(); err != nil {
+		return &providerEnvironmentError{reason: "prerequisite_deadline_expired"}
+	}
 	if err := claimPrimaryComparisonExperiment(ledger, experimentID, id.Hash(), changeEvidence); err != nil {
 		return err
 	}
@@ -427,6 +438,9 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	observation.observeWarnings(outcome.Stderr)
 	if !observation.ExitOK && observation.EventCount == 0 && observation.FailureCategory == "" {
 		observation.FailureCategory = "runtime_error"
+	}
+	if errors.Is(runErr, providerqualification.ErrProcessStart) {
+		observation.FailureCategory = "environment_start_failed"
 	}
 	// Raw streams remain memory-only and are never embedded in diagnostic or
 	// signed evidence. Reuse the common continuously observed process runner.
@@ -502,10 +516,10 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	if err != nil {
 		return err
 	}
-	if err = encodeIndentedJSON(cmd.OutOrStdout(), map[string]any{"profile": profileName, "provider": id.Provider(), "runtime": id.Runtime(), "account_sha256": sha256StringCLI(id.AccountAlias()), "account_identity_evidence": provider.IdentityEvidenceProfileAttested, "billing_class": id.BillingClass(), "requested_model": id.Model(), "receipt_path": path, "receipt": receipt, "runtime_observation": observation, "local_capacity_observation": capacity}); err != nil {
+	if err = encodeIndentedJSON(cmd.OutOrStdout(), map[string]any{"requested_scope": providerQualificationScope(cmd), "scope_passed": providerQualificationScopePassed(cmd, receipt), "profile": profileName, "provider": id.Provider(), "runtime": id.Runtime(), "account_sha256": sha256StringCLI(id.AccountAlias()), "account_identity_evidence": provider.IdentityEvidenceProfileAttested, "billing_class": id.BillingClass(), "requested_model": id.Model(), "receipt_path": path, "receipt": receipt, "runtime_observation": observation, "local_capacity_observation": capacity}); err != nil {
 		return err
 	}
-	return &providerQualificationExitError{}
+	return providerQualificationScopeExit(cmd, receipt)
 }
 
 // Hash before invoking even --version: readiness must not execute a replacement
@@ -516,7 +530,10 @@ func primaryPinnedRuntimeVersion(ctx context.Context, profile config.ProviderPro
 		return "", errors.New("primary executable pin mismatch")
 	}
 	version, err := providerRuntimeVersion(ctx, profile.Command)
-	if err != nil || !versionMatches(version, profile.RuntimeVersion) {
+	if err != nil {
+		return "", err
+	}
+	if !versionMatches(version, profile.RuntimeVersion) {
 		return "", errors.New("primary runtime version mismatch")
 	}
 	return version, nil

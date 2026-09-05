@@ -248,6 +248,11 @@ func inspectPrimaryReadiness(cmd *cobra.Command, name string, visit func(map[str
 	ctx, cancel := context.WithTimeout(providerCommandContext(cmd), 5*time.Second)
 	defer cancel()
 	version, versionErr := primaryPinnedRuntimeVersion(ctx, p)
+	var environmentFailure *providerEnvironmentError
+	if errors.As(versionErr, &environmentFailure) {
+		out["reason"] = "environment_" + environmentFailure.reason
+		return visit(out)
+	}
 	if hashErr != nil || versionErr != nil || digest != p.RuntimeSHA256 || !versionMatches(version, p.RuntimeVersion) {
 		out["reason"] = "runtime_pin_mismatch"
 		return visit(out)

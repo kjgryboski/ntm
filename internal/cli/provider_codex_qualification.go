@@ -185,7 +185,7 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 			Receipt:        preflightReceipt,
 		}
 		if IsJSONOutput() {
-			if err := encodeIndentedJSON(cmd.OutOrStdout(), output); err != nil {
+			if err := encodeIndentedJSON(cmd.OutOrStdout(), output.withScope(cmd)); err != nil {
 				return err
 			}
 		} else {
@@ -351,13 +351,13 @@ func runProviderCodexQualification(cmd *cobra.Command, opts providerQualificatio
 	}
 	output := providerQualificationRunOutput{SchemaVersion: providerqualification.SchemaVersion, Profile: opts.profile, Transport: "zai_codex_runtime", IdentitySHA256: identity.Hash(), RuntimeVersion: manifest.RuntimeVersion, PolicySHA256: receipt.PolicySHA256, ReceiptPath: path, Receipt: receipt}
 	if IsJSONOutput() {
-		if err := encodeIndentedJSON(cmd.OutOrStdout(), output); err != nil {
+		if err := encodeIndentedJSON(cmd.OutOrStdout(), output.withScope(cmd)); err != nil {
 			return err
 		}
 	} else {
 		fmt.Fprintf(cmd.OutOrStdout(), "Z.ai Codex qualification: %s (%d/%d checks)\nReceipt: %s\n", qualificationResult(receipt), countPassedQualificationChecks(receipt), len(receipt.Checks), path)
 	}
-	if !receipt.Passed {
+	if !providerQualificationScopePassed(cmd, receipt) {
 		if IsJSONOutput() {
 			return errJSONFailure
 		}

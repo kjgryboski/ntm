@@ -504,6 +504,14 @@ func markCLIInvalidInput(err error) error {
 }
 
 func classifyRobotExecuteError(err error) (string, string) {
+	var environmentFailure *providerEnvironmentError
+	if errors.As(err, &environmentFailure) {
+		return robot.ErrCodeInternalError, "Verify the execution environment and clock before dispatch; no automatic paid retry"
+	}
+	var qualificationFailure *providerQualificationExitError
+	if errors.As(err, &qualificationFailure) {
+		return robot.ErrCodeInternalError, "Inspect saved qualification evidence; another paid attempt requires a relevant change or new diagnostic evidence"
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return robot.ErrCodeTimeout, "Retry the command after cancellation"
 	}

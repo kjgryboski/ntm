@@ -198,6 +198,8 @@ type providerDoctorPromotion struct {
 }
 
 type providerQualificationRunOutput struct {
+	RequestedScope string                        `json:"requested_scope"`
+	ScopePassed    bool                          `json:"scope_passed"`
 	SchemaVersion  string                        `json:"schema_version"`
 	Profile        string                        `json:"profile"`
 	Transport      string                        `json:"transport"`
@@ -469,6 +471,7 @@ requires the controller-owned tools policy and OS-protected credential broker.`,
 		},
 	}
 	cmd.Flags().StringVar(&opts.profile, "profile", "", "Exact configured provider profile (required)")
+	cmd.Flags().String("scope", "full", "Requested qualification scope: full or workspace; does not change signed receipts")
 	cmd.Flags().BoolVar(&opts.live, "live", false, "Explicitly authorize real provider calls in a disposable repository")
 	cmd.Flags().BoolVar(&opts.identityOnly, "identity-only", false, "Run exactly one signed read-only Codex identity/model preflight and stop")
 	cmd.Flags().BoolVar(&opts.grokHeadlessLineage, "grok-headless-lineage", false, "Run the isolated ACP bootstrap plus headless fork/resume lineage qualification")
@@ -481,6 +484,12 @@ requires the controller-owned tools policy and OS-protected credential broker.`,
 }
 
 func runProviderQualification(cmd *cobra.Command, opts providerQualificationOptions, deps providerQualificationDependencies) error {
+	if err := validateProviderQualificationScope(cmd); err != nil {
+		return err
+	}
+	if providerQualificationScope(cmd) == "workspace" && (opts.identityOnly || opts.grokHeadlessLineage) {
+		return errors.New("workspace scope cannot be combined with identity-only or headless-lineage qualification")
+	}
 	if strings.TrimSpace(opts.profile) == "" {
 		return errors.New("provider qualification requires an exact --profile")
 	}
@@ -606,7 +615,7 @@ func runProviderQualification(cmd *cobra.Command, opts providerQualificationOpti
 		RuntimeVersion: runtimeVersion, PolicySHA256: policySHA, ReceiptPath: path, Receipt: receipt,
 	}
 	if IsJSONOutput() {
-		if err := encodeIndentedJSON(cmd.OutOrStdout(), output); err != nil {
+		if err := encodeIndentedJSON(cmd.OutOrStdout(), output.withScope(cmd)); err != nil {
 			return err
 		}
 	} else {
@@ -616,7 +625,7 @@ func runProviderQualification(cmd *cobra.Command, opts providerQualificationOpti
 			fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", qualificationCheckStatus(check.Passed), check.Name, check.Detail)
 		}
 	}
-	if !receipt.Passed {
+	if !providerQualificationScopePassed(cmd, receipt) {
 		if IsJSONOutput() {
 			return errJSONFailure
 		}
@@ -629,7 +638,7 @@ func runProviderQualification(cmd *cobra.Command, opts providerQualificationOpti
 type providerQualificationExitError struct{}
 
 func (*providerQualificationExitError) Error() string {
-	return "provider qualification did not pass every mandatory live check"
+	return "provider qualification did not pass the requested scope; inspect the saved receipt before another paid attempt"
 }
 func (*providerQualificationExitError) ExitCode() int { return 1 }
 
@@ -2168,7 +2177,7 @@ func providerRuntimeVersion(ctx context.Context, binary string) (string, error) 
 	cmd := exec.CommandContext(ctx, binary, "--version")
 	output, err := cmd.Output()
 	if err != nil {
-		return "", err
+		return "", &providerEnvironmentError{reason: "runtime_version_probe_failed"}
 	}
 	if len(output) > 4096 {
 		return "", errors.New("provider runtime version output exceeded limit")

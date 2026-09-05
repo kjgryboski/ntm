@@ -101,8 +101,10 @@ until the required admission evidence is available.
 `provider readiness --profile NAME` supports the exact Codex, Claude, Grok and
 Z.ai profiles. Repeat `--profile` to compare them. Use `--cwd ABSOLUTE_WORKSPACE`
 for Grok policy discovery in the intended workspace. Optional repeated
-`--operation PROFILE=OPERATION_ID` adds existing verified task evidence; it makes
-no generation calls. Use the ordinary global `--campaign-id` to inspect that
+`--operation PROFILE=OPERATION_ID` adds explicit existing task references. The
+view also discovers up to 64 recent references bound to each exact identity in
+the selected local ledger, verifies them through the status owner, and reports
+truncation or unverifiable references. It makes no generation calls. Use the ordinary global `--campaign-id` to inspect that
 budget alongside the profiles without consuming an attempt.
 
 The shared response separates workspace evidence, credential freshness, local
@@ -118,8 +120,34 @@ unsupported or untested observation. Qualification checks include their expiry;
 historical task results do not renew it. Ordinary task completion, local
 cancellation, guarded fresh restart, provider session resume, remote generation
 termination and billing settlement remain distinct. A later failed task does
-not erase an independently successful earlier task. Select both task IDs to
-inspect both outcomes.
+not erase an independently successful earlier task. `capability_summary` contains
+one row per capability and indexes every contributing observation in `checks`.
+Its passed state means demonstrated at least once; admission remains independent.
+
+Use `--task-timeout 180s` to compare the intended duration with the earliest known
+credential or qualification expiry in `usable_until`. A task ending at or after
+that expiry fails the duration check. Dispatch enforces its qualification window;
+primary tasks are bounded to five minutes and require a Claude credential snapshot
+valid beyond the five-minute freshness margin. Unknown provider authentication
+and historical task success cannot extend those windows.
+
+## Explicit qualification scope and environmental failures
+
+`provider qualify --scope workspace` and `provider compare --scope workspace`
+return success when the signed authoritative workspace subset passes. The default
+`--scope full` still requires the full suite. JSON includes `requested_scope` and
+`scope_passed` beside the unchanged signed receipt; a six-gate workspace success
+never rewrites its full nine-gate result. Workspace scope cannot be combined with
+identity-only or headless-lineage qualification. A qualification failure directs
+the operator to saved evidence, not to an automatic paid retry.
+
+Runtime version-probe failures are reported as closed environmental reasons,
+without process output or credential-bearing paths. A canceled prerequisite
+cannot start a local provider process. Primary terminal diagnostics distinguish
+`environment_start_failed` from a provider runtime error. Managed assignment
+preparation compares wall-clock change with monotonic elapsed time before spending
+an attempt; an unexplained clock step requires fresh prerequisites. Startup
+failure does not establish cleanup, completion, remote termination, or settlement.
 
 Capacity has three separate dimensions: local process slots, durable experiment
 dispatch attempts, and provider billing usage. Runtime adapters may make several

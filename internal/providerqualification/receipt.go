@@ -530,7 +530,7 @@ type PrimaryComparisonDiagnostic struct {
 
 func StorePrimaryComparisonDiagnostics(baseDir, transport, identity, policy, runtime string, started, observed time.Time, phase string, observation PrimaryComparisonDiagnostic) (string, error) {
 	switch observation.FailureCategory {
-	case "", "invalid_event_envelope", "invalid_assistant_envelope", "duplicate_terminal", "runtime_error", "invalid_model_label", "output_incomplete":
+	case "", "invalid_event_envelope", "invalid_assistant_envelope", "duplicate_terminal", "runtime_error", "invalid_model_label", "output_incomplete", "environment_start_failed":
 	default:
 		return "", errors.New("invalid primary failure category")
 	}

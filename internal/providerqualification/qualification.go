@@ -169,7 +169,12 @@ type Runner interface {
 // a process that escaped the tree before any local observation.
 type LocalRunner struct{}
 
+var ErrProcessStart = errors.New("provider environment process start failed")
+
 func (LocalRunner) Run(ctx context.Context, in Invocation) (Outcome, error) {
+	if err := ctx.Err(); err != nil {
+		return Outcome{ExitCode: -1}, err
+	}
 	cmd := exec.Command(in.Binary, in.Args...)
 	cmd.Dir, cmd.Env = in.Dir, in.Env
 	if len(in.Stdin) > 0 {
@@ -178,7 +183,7 @@ func (LocalRunner) Run(ctx context.Context, in Invocation) (Outcome, error) {
 	stdout, stderr := &limitedBuffer{limit: in.OutputLimit}, &limitedBuffer{limit: in.OutputLimit}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	if err := cmd.Start(); err != nil {
-		return Outcome{ExitCode: -1}, err
+		return Outcome{ExitCode: -1}, ErrProcessStart
 	}
 	observer := startObservedProcessTree(cmd.Process.Pid)
 	wait := make(chan error, 1)

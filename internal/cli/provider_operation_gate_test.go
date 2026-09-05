@@ -61,6 +61,25 @@ func TestAuthorizeProviderOperationUsesSignedPartialPromotion(t *testing.T) {
 	if digest, err := authorizeProviderOperationWithDependencies(input, deps); err != nil || digest != receipt.ReceiptSHA256 {
 		t.Fatalf("review authorization digest=%q err=%v", digest, err)
 	}
+	// A receipt can be current yet too close to expiry to cover the task.
+	input.RequiredValidity = 59 * time.Minute
+	if _, err := authorizeProviderOperationWithDependencies(input, deps); err == nil {
+		t.Fatal("task ending at qualification expiry was admitted")
+	}
+	input.RequiredValidity = 58 * time.Minute
+	if _, err := authorizeProviderOperationWithDependencies(input, deps); err != nil {
+		t.Fatal(err)
+	}
+	deps.now = func() time.Time { return now.Add(-time.Second) }
+	if _, err := authorizeProviderOperationWithDependencies(input, deps); err == nil {
+		t.Fatal("clock rollback accepted future receipt")
+	}
+	deps.now = func() time.Time { return now.Add(2 * time.Hour) }
+	if _, err := authorizeProviderOperationWithDependencies(input, deps); err == nil {
+		t.Fatal("clock advance accepted expired receipt")
+	}
+	deps.now = func() time.Time { return now.Add(time.Minute) }
+	input.RequiredValidity = 0
 	input.RuntimeSHA256 = strings.Repeat("d", 64)
 	if _, err := authorizeProviderOperationWithDependencies(input, deps); err == nil {
 		t.Fatal("review authorization reused a same-version qualification across a runtime digest change")

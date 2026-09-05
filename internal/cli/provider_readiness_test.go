@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +11,73 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 )
+
+func TestReadinessDiscoversOnlyExactIdentityWithBoundedHistory(t *testing.T) {
+	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	identity, other := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	for i := 0; i < 67; i++ {
+		payload := identity
+		if i == 66 {
+			payload = other
+		}
+		_, _, err := store.ClaimSendOperation(&state.SendOperation{OperationID: fmt.Sprintf("task-%03d", i), SessionName: providerControlScope, BindingHash: strings.Repeat("c", 64), PayloadSHA256: payload, CreatedAt: time.Unix(int64(1800000000+i), 0)})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids, truncated, err := discoverProviderReadinessOperations(store, identity)
+	if err != nil || !truncated || len(ids) != 64 || ids[0] != "task-065" {
+		t.Fatalf("wrong discovery: %v %t %v", ids, truncated, err)
+	}
+	for _, id := range ids {
+		if id == "task-066" {
+			t.Fatal("cross identity evidence discovered")
+		}
+	}
+	ids, truncated, err = discoverProviderReadinessOperations(store, other)
+	if err != nil || truncated || len(ids) != 1 || ids[0] != "task-066" {
+		t.Fatal("exact identity missing")
+	}
+}
+
+func TestReadinessSummaryRetainsConflictingObservationsWithoutPromotingAdmission(t *testing.T) {
+	checks := []providerReadinessEvidence{{Operation: "ordinary_task", State: "untested"}, {Operation: "ordinary_task", State: "passed"}, {Operation: "ordinary_task", State: "failed"}, {Operation: "resume", State: "unsupported"}}
+	summary := summarizeProviderReadiness(checks)
+	if len(summary) != 2 || summary[0].State != "passed" || len(summary[0].ObservationIndexes) != 3 || summary[1].State != "unsupported" {
+		t.Fatalf("summary lost observations: %+v", summary)
+	}
+	if len(checks) != 4 || checks[2].State != "failed" {
+		t.Fatal("summary erased failure")
+	}
+}
+
+func TestReadinessUsesEarliestExpiryAndRequiresTaskToFit(t *testing.T) {
+	now := time.Unix(1800000000, 0)
+	qualification := now.Add(time.Hour)
+	credential := now.Add(10 * time.Minute)
+	lane := providerReadinessLane{QualificationExpiresAt: &qualification, Credential: map[string]any{"expires_at": credential}, AdmissionState: "ready_for_dispatch_checks"}
+	applyProviderReadinessWindow(&lane, 5*time.Minute, now)
+	if !lane.DurationFits || !lane.UsableUntil.Equal(credential) || lane.DispatchAuthorized {
+		t.Fatal("earliest expiry not used")
+	}
+	applyProviderReadinessWindow(&lane, 10*time.Minute, now)
+	if lane.DurationFits || lane.AdmissionState != "blocked" {
+		t.Fatal("timeout extending to expiry admitted")
+	}
+	lane.Credential = nil
+	qualification = now.Add(-time.Second)
+	applyProviderReadinessWindow(&lane, time.Second, now)
+	if lane.DurationFits {
+		t.Fatal("expired qualification admitted")
+	}
+}
 
 func TestSharedReadinessKeepsQualifiedEvidenceSeparateFromCredentialsAndAdmission(t *testing.T) {
 	for _, vendor := range []string{"openai", "anthropic", "xai", "zai"} {

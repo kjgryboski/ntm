@@ -145,7 +145,7 @@ func runProviderNativeQualification(cmd *cobra.Command, opts providerQualificati
 	}
 	output := providerQualificationRunOutput{SchemaVersion: providerqualification.SchemaVersion, Profile: opts.profile, Transport: "zai_native_api", IdentitySHA256: identity.Hash(), RuntimeVersion: providerNativeAdapterVersion, PolicySHA256: receipt.PolicySHA256, ReceiptPath: path, Receipt: receipt}
 	if IsJSONOutput() {
-		if err := encodeIndentedJSON(cmd.OutOrStdout(), output); err != nil {
+		if err := encodeIndentedJSON(cmd.OutOrStdout(), output.withScope(cmd)); err != nil {
 			return err
 		}
 	} else {
@@ -154,7 +154,7 @@ func runProviderNativeQualification(cmd *cobra.Command, opts providerQualificati
 			fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", qualificationCheckStatus(check.Passed), check.Name, check.Detail)
 		}
 	}
-	if !receipt.Passed {
+	if !providerQualificationScopePassed(cmd, receipt) {
 		if IsJSONOutput() {
 			return errJSONFailure
 		}

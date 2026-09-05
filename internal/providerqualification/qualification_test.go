@@ -2,6 +2,7 @@ package providerqualification
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,20 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 )
+
+func TestLocalRunnerEnvironmentStartFailureAndCancelledPrerequisite(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "private-runtime-name")
+	out, err := (LocalRunner{}).Run(context.Background(), Invocation{Binary: missing})
+	if !errors.Is(err, ErrProcessStart) || out.ProcessStarted || out.ProcessTreeTerminated || strings.Contains(err.Error(), "private-runtime-name") {
+		t.Fatalf("start failure leaked or granted cleanup: %+v %v", out, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	out, err = (LocalRunner{}).Run(ctx, Invocation{Binary: missing})
+	if !errors.Is(err, context.Canceled) || out.ProcessStarted {
+		t.Fatal("cancelled prerequisite reached process start")
+	}
+}
 
 func TestLocalRunnerCleansObservedDescendantsAfterNormalExit(t *testing.T) {
 	if runtime.GOOS == "windows" {

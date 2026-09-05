@@ -337,6 +337,7 @@ func createPrimaryAssignmentAudit(cwd, operationID string) (string, *os.File, er
 }
 
 func runPrimaryAssignment(cmd *cobra.Command, request providerAssignmentRequest, profile config.ProviderProfileConfig, ledger providerNativeOperationLedger) (returnErr error) {
+	clockStarted := time.Now()
 	id, transport, err := validatePrimaryComparisonProfile(profile)
 	if err != nil {
 		return err
@@ -351,7 +352,10 @@ func runPrimaryAssignment(cmd *cobra.Command, request providerAssignmentRequest,
 		return errors.New("primary executable pin mismatch")
 	}
 	version, err := providerRuntimeVersion(ctx, profile.Command)
-	if err != nil || !versionMatches(version, profile.RuntimeVersion) {
+	if err != nil {
+		return err
+	}
+	if !versionMatches(version, profile.RuntimeVersion) {
 		return errors.New("primary runtime version mismatch")
 	}
 	sign, err := providerProfilePinnedSigner(profile)
@@ -373,7 +377,7 @@ func runPrimaryAssignment(cmd *cobra.Command, request providerAssignmentRequest,
 		}
 	}
 	policy := primaryWorkspacePolicySHA(transport, companion)
-	if _, err = authorizeProviderOperation(providerOperationAuthorization{Identity: id, Transport: transport, PolicySHA256: policy, RuntimeVersion: version, RuntimeSHA256: digest, Operation: providerOperationWorkspaceWrite, MaxQualificationAge: 24 * time.Hour, TrustedSigner: preflight.KeyMetadata}); err != nil {
+	if _, err = authorizeProviderOperation(providerOperationAuthorization{Identity: id, Transport: transport, PolicySHA256: policy, RuntimeVersion: version, RuntimeSHA256: digest, Operation: providerOperationWorkspaceWrite, MaxQualificationAge: 24 * time.Hour, RequiredValidity: request.Timeout, TrustedSigner: preflight.KeyMetadata}); err != nil {
 		return err
 	}
 	cwd, err := filepath.Abs(request.CWD)
@@ -449,6 +453,12 @@ func runPrimaryAssignment(cmd *cobra.Command, request providerAssignmentRequest,
 	if admission.CapacityStatus().Scope != provider.CapacityControlScopeLocalShared {
 		return errors.New("shared local capacity is unavailable")
 	}
+	if err := checkProviderDispatchClock(clockStarted); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return &providerEnvironmentError{reason: "prerequisite_deadline_expired"}
+	}
 	if err := reserveProviderExperiment(request.OperationID, id.Hash(), binding); err != nil {
 		return err
 	}
@@ -472,6 +482,9 @@ func runPrimaryAssignment(cmd *cobra.Command, request providerAssignmentRequest,
 	out.Observation.observeWarnings(result.Stderr)
 	if !out.Observation.ExitOK && out.Observation.EventCount == 0 && out.Observation.FailureCategory == "" {
 		out.Observation.FailureCategory = "runtime_error"
+	}
+	if errors.Is(runErr, providerqualification.ErrProcessStart) {
+		out.Observation.FailureCategory = "environment_start_failed"
 	}
 	for i := range result.Stdout {
 		result.Stdout[i] = 0

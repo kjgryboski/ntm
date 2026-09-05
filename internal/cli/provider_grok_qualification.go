@@ -242,7 +242,7 @@ func runProviderGrokQualification(cmd *cobra.Command, opts providerQualification
 	}
 	output := providerQualificationRunOutput{SchemaVersion: providerqualification.SchemaVersion, Profile: opts.profile, Transport: "xai_acp", IdentitySHA256: identity.Hash(), RuntimeVersion: runtimeVersion, PolicySHA256: receipt.PolicySHA256, ReceiptPath: path, Receipt: receipt}
 	if IsJSONOutput() {
-		if err := encodeIndentedJSON(cmd.OutOrStdout(), output); err != nil {
+		if err := encodeIndentedJSON(cmd.OutOrStdout(), output.withScope(cmd)); err != nil {
 			return err
 		}
 	} else {
@@ -251,7 +251,7 @@ func runProviderGrokQualification(cmd *cobra.Command, opts providerQualification
 			fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", qualificationCheckStatus(check.Passed), check.Name, check.Detail)
 		}
 	}
-	if !receipt.Passed {
+	if !providerQualificationScopePassed(cmd, receipt) {
 		if IsJSONOutput() {
 			return errJSONFailure
 		}
@@ -461,16 +461,16 @@ func runProviderGrokWorkspaceQualification(commandCtx context.Context, cmd *cobr
 	}
 	output := providerQualificationRunOutput{SchemaVersion: providerqualification.SchemaVersion, Profile: opts.profile, Transport: receipt.Transport, IdentitySHA256: identity.Hash(), RuntimeVersion: runtimeVersion, PolicySHA256: receipt.PolicySHA256, ReceiptPath: path, Receipt: receipt}
 	if IsJSONOutput() {
-		if err := encodeIndentedJSON(cmd.OutOrStdout(), output); err != nil {
+		if err := encodeIndentedJSON(cmd.OutOrStdout(), output.withScope(cmd)); err != nil {
 			return err
 		}
-		return errJSONFailure
+		return providerQualificationScopeExit(cmd, receipt)
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "Grok workspace-write qualification: partial (%d/%d checks)\nReceipt: %s\n", countPassedQualificationChecks(receipt), len(receipt.Checks), path)
+	fmt.Fprintf(cmd.OutOrStdout(), "Grok qualification scope %s: passed=%t; full suite %s (%d/%d checks)\nReceipt: %s\n", providerQualificationScope(cmd), providerQualificationScopePassed(cmd, receipt), qualificationResult(receipt), countPassedQualificationChecks(receipt), len(receipt.Checks), path)
 	for _, check := range receipt.Checks {
 		fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", check.EvidenceState(), check.Name, check.Detail)
 	}
-	return &providerQualificationExitError{}
+	return providerQualificationScopeExit(cmd, receipt)
 }
 
 func providerWorkspaceQualificationPrompt(nonce string) string {
@@ -789,7 +789,7 @@ func runProviderGrokHeadlessLineageQualification(commandCtx context.Context, cmd
 	}
 	output := providerQualificationRunOutput{SchemaVersion: providerqualification.SchemaVersion, Profile: opts.profile, Transport: receipt.Transport, IdentitySHA256: identity.Hash(), RuntimeVersion: runtimeVersion, PolicySHA256: receipt.PolicySHA256, ReceiptPath: path, Receipt: receipt}
 	if IsJSONOutput() {
-		if err := encodeIndentedJSON(cmd.OutOrStdout(), output); err != nil {
+		if err := encodeIndentedJSON(cmd.OutOrStdout(), output.withScope(cmd)); err != nil {
 			return err
 		}
 		return errJSONFailure

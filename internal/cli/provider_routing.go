@@ -230,6 +230,7 @@ func validateProviderControlFlags(cmd *cobra.Command, allowed ...string) error {
 }
 
 func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest) (returnErr error) {
+	clockStarted := time.Now()
 	if strings.TrimSpace(request.Profile) == "" || strings.TrimSpace(request.OperationID) == "" || strings.TrimSpace(request.Prompt) == "" || strings.TrimSpace(request.CWD) == "" || request.Timeout <= 0 {
 		return errors.New("provider assignment requires exact profile, operation ID, prompt, worktree, and positive timeout")
 	}
@@ -291,6 +292,12 @@ func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest
 			return err
 		}
 		opts.Prompt, opts.OperationID = request.Prompt, request.OperationID
+		if err := checkProviderDispatchClock(clockStarted); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return &providerEnvironmentError{reason: "prerequisite_deadline_expired"}
+		}
 		if err := reserveProviderExperiment(request.OperationID, identity.Hash(), sha256StringCLI(request.Prompt)); err != nil {
 			return err
 		}
@@ -355,7 +362,11 @@ func prepareGrokACPDispatch(ctx context.Context, cwd string, resolved grokACPPro
 			if identity.Hash() != resolved.Identity.Hash() || string(scope) != operation {
 				return robot.GrokACPOperationAuthorization{}, errors.New("Grok dispatch changed identity or operation scope")
 			}
-			digest, err := authorizeProviderOperation(providerOperationAuthorization{Identity: identity, Transport: "xai_acp", PolicySHA256: agent.GrokAutomationPolicySHA256(resolved.AutomationPolicy), RuntimeVersion: resolved.Profile.RuntimeVersion, RuntimeSHA256: runtimeHash, Operation: operation, MaxQualificationAge: 24 * time.Hour, TrustedSigner: preflight.KeyMetadata})
+			remaining := time.Duration(0)
+			if deadline, ok := ctx.Deadline(); ok {
+				remaining = time.Until(deadline)
+			}
+			digest, err := authorizeProviderOperation(providerOperationAuthorization{Identity: identity, Transport: "xai_acp", PolicySHA256: agent.GrokAutomationPolicySHA256(resolved.AutomationPolicy), RuntimeVersion: resolved.Profile.RuntimeVersion, RuntimeSHA256: runtimeHash, Operation: operation, MaxQualificationAge: 24 * time.Hour, RequiredValidity: remaining, TrustedSigner: preflight.KeyMetadata})
 			return robot.GrokACPOperationAuthorization{QualificationReceiptSHA256: digest}, err
 		})
 	}
