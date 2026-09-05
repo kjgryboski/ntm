@@ -1270,6 +1270,10 @@ func TestProviderDoctorRejectsCodexQualificationFromDifferentValidSigner(t *test
 			return receipt, "/redacted/attacker-signed.json", nil
 		},
 	}
+	unavailable, unavailableChecks := diagnoseQualification(identity, "zai_codex_runtime", providerCodexPolicySHA256(), nil, providerCommandOptions{qualificationAge: time.Hour}, deps, nil)
+	if unavailable.State != "signer_unavailable" || unavailable.TrustedCurrent || len(unavailableChecks) != 1 || unavailableChecks[0].Status != providerDoctorFail {
+		t.Fatalf("unavailable signer was promoted or described as a key change: %+v %+v", unavailable, unavailableChecks)
+	}
 	result, checks := diagnoseQualification(identity, "zai_codex_runtime", providerCodexPolicySHA256(), &otherSignature.KeyMetadata, providerCommandOptions{qualificationAge: time.Hour}, deps, nil)
 	if result.State != "signer_mismatch" || len(checks) != 1 || checks[0].Status != providerDoctorFail {
 		t.Fatalf("different valid signer was accepted: result=%+v checks=%+v", result, checks)

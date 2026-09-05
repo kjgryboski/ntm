@@ -15,6 +15,10 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
 
 ### Security
 
+- **Offline qualification distinguishes an unavailable signer from a key mismatch.**
+  A failed local signer lookup keeps admission closed and recommends restoring
+  the signer and repeating the offline check, rather than another paid run.
+
 - **Workspace comparisons retain redacted broker observations before cleanup.**
   Per-tool outcomes and error digests survive failed runs without retaining
   arguments or content. MCP request metadata is accepted without changing tool

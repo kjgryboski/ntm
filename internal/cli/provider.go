@@ -1534,7 +1534,10 @@ func diagnoseQualification(identity provider.Identity, transport, policySHA stri
 	case receipt.Attestation == nil:
 		result.State = "unsigned"
 		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "live_receipt", Summary: "qualification receipt is not cryptographically attested", Evidence: receipt.ReceiptSHA256, Remediation: "Initialize provider receipt signing and run a fresh live qualification"})
-	case trustedSigner == nil || receipt.Attestation.KeyMetadata != *trustedSigner:
+	case trustedSigner == nil:
+		result.State = "signer_unavailable"
+		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "unavailable", Summary: "qualification signer could not be checked because the pinned local signer is unavailable", Evidence: receipt.ReceiptSHA256, Remediation: "Restore the pinned local signer and rerun the offline doctor; do not repeat a paid qualification solely for this lookup failure"})
+	case receipt.Attestation.KeyMetadata != *trustedSigner:
 		result.State = "signer_mismatch"
 		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorFail, Provenance: "live_receipt", Summary: "qualification receipt was not signed by the profile-pinned local attestation key", Evidence: receipt.ReceiptSHA256, Remediation: "Run a fresh live qualification with the currently pinned receipt signer"})
 	case receipt.Transport != transport || receipt.IdentitySHA256 != identity.Hash() || receipt.PolicySHA256 != policySHA:
