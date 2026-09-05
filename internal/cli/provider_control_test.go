@@ -114,6 +114,19 @@ func TestProviderRestartRequiresTerminalCleanupAndCapacityEvidence(t *testing.T)
 	if providerRestartAllowed(status) {
 		t.Fatal("unknown terminal outcome permitted restart")
 	}
+	status.Provider = "xai"
+	status.State = "cancelled_acknowledged"
+	if !providerRestartAllowed(status) {
+		t.Fatal("signed Grok ACP cancellation with cleanup and capacity release cannot restart")
+	}
+	status.State = "outcome_unknown"
+	if providerRestartAllowed(status) {
+		t.Fatal("unconfirmed Grok cancellation permitted replay")
+	}
+	status.State = "cancelled"
+	if providerRestartAllowed(status) {
+		t.Fatal("another provider's terminal vocabulary permitted Grok restart")
+	}
 }
 
 func TestProviderControllerExitCannotReplayUnknownAssignment(t *testing.T) {

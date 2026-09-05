@@ -121,10 +121,11 @@ func TestPrimaryComparisonStreamsDoNotInferModelOrAcknowledgement(t *testing.T) 
 
 func TestPrimaryComparisonEnvironmentExcludesAmbientCredentials(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "credential-canary")
+	t.Setenv("PATH", "/mnt/c/ambient-windows-helper-canary")
 	t.Setenv("ANTHROPIC_BASE_URL", "https://unexpected.invalid")
 	for _, runtime := range []string{"claude", "codex"} {
 		env := strings.Join(primaryComparisonEnvironment("/isolated", runtime), "\n")
-		if strings.Contains(env, "credential-canary") || strings.Contains(env, "unexpected.invalid") {
+		if strings.Contains(env, "credential-canary") || strings.Contains(env, "unexpected.invalid") || strings.Contains(env, "ambient-windows-helper-canary") {
 			t.Fatal("ambient provider identity leaked into primary child")
 		}
 		if runtime == "claude" && !strings.Contains(env, "CLAUDE_CODE_DISABLE_AGENT_VIEW=1") {

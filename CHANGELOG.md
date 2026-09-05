@@ -15,6 +15,14 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
 
 ### Security
 
+- **Grok acknowledgement candidates respect response and tool boundaries.**
+  Earlier commentary cannot be concatenated with the final nonce, and an early
+  acknowledgement cannot authorize later work. Redacted text counters survive
+  failures. Guarded restart recognizes Grok's signed ACP cancellation state
+  while still requiring verified cleanup and exact local capacity release.
+  Primary comparisons use native system search paths for their pinned runtimes
+  and broker, excluding inherited Windows interop helpers.
+
 - **Grok workspace tools execute in the controller through the reviewed ACP
   reverse MCP channel.** Qualification and ordinary dispatch share the same
   constrained broker and isolated verifier. A per-run server binding, bounded

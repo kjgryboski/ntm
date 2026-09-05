@@ -676,6 +676,10 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 		observation.ToolRequests = updates.toolRequestCount
 		observation.ToolCompletions = updates.toolCompleteCount
 		observation.PermissionDenials = updates.permissionDenials
+		observation.AssistantTextChunks = updates.chunks
+		observation.AssistantTextBytes = updates.bytes
+		observation.ReplyBoundaries = updates.replyBoundaries
+		observation.AcknowledgementVerified = updates.nonce.verified
 		result.ProtocolObservation = observation.Redacted()
 		// Preserve counters on every exit, including a protocol failure before
 		// the successful-result construction below.
@@ -1850,6 +1854,7 @@ type updateAccumulator struct {
 	chunks                 int
 	bytes                  int64
 	nonce                  nonceMatcher
+	replyBoundaries        int
 	toolEventHasher        hash.Hash
 	toolEventCount         int
 	toolRequestCount       int
@@ -2031,6 +2036,11 @@ func (a *updateAccumulator) observeVendorNotification(method string, params json
 		if a.providerSessionID == "" || notification.SessionID != a.providerSessionID {
 			return nil
 		}
+		// Reviewed sampling_events.rs emits this marker before the response's
+		// first text chunk. Clearing a candidate cannot manufacture an ACK.
+		if notification.Update.SessionUpdate == "response_started" {
+			a.resetReplyCandidate()
+		}
 		// xAI's SessionUpdate is distinct from the standard ACP update enum.
 		// Retain only its redacted name; this carrier must never manufacture
 		// assistant acknowledgements or authoritative tool lifecycle events.
@@ -2169,6 +2179,7 @@ func (a *updateAccumulator) recordToolEvent(name, toolCallID string, rawStatus j
 			return protocolError(provider.ProtocolInvalidToolLifecycle)
 		}
 		a.toolRequestCount++
+		a.resetReplyCandidate()
 		ref := fmt.Sprintf("tool-%06d", a.toolRequestCount)
 		a.toolCalls[key] = acpToolCall{ref: ref}
 		a.runtimeToolEvents = append(a.runtimeToolEvents, provider.RuntimeEvent{
@@ -2190,6 +2201,7 @@ func (a *updateAccumulator) recordToolEvent(name, toolCallID string, rawStatus j
 			return protocolError(provider.ProtocolInvalidToolLifecycle)
 		}
 		call.terminal = true
+		a.resetReplyCandidate()
 		a.toolCalls[key] = call
 		// EventToolCompleted means the requested tool reached a terminal state,
 		// not that it succeeded. Provider-specific evidence retains the outcome;
@@ -2204,6 +2216,15 @@ func (a *updateAccumulator) recordToolEvent(name, toolCallID string, rawStatus j
 	}
 	a.recordUpdateName(a.toolEventHasher, &a.toolEventCount, name)
 	return nil
+}
+
+// ACP chunks from separate model responses need not contain a separating
+// newline. A tool transition ends the earlier reply; only subsequent assistant
+// text may acknowledge the finished assignment. Output hashes still cover all
+// text, and tool contents never enter this candidate.
+func (a *updateAccumulator) resetReplyCandidate() {
+	a.nonce = newNonceMatcher(a.nonce.needle)
+	a.replyBoundaries++
 }
 
 func acpToolCallKey(toolCallID string) (string, error) {

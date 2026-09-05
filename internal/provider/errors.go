@@ -4,15 +4,19 @@ package provider
 // Redacted must be applied at persistence boundaries, including for test runners.
 // No request IDs, session IDs, parameters, or provider error text are retained.
 type ProtocolObservation struct {
-	Method            string                `json:"method"`
-	RequestIDKind     string                `json:"request_id_kind"`
-	SessionMatch      string                `json:"session_match"`
-	Stage             string                `json:"stage"`
-	Reason            ProtocolFailureReason `json:"reason,omitempty"`
-	ToolEvents        int                   `json:"tool_events"`
-	ToolRequests      int                   `json:"tool_requests"`
-	ToolCompletions   int                   `json:"tool_completions"`
-	PermissionDenials int                   `json:"permission_denials"`
+	Method                  string                `json:"method"`
+	RequestIDKind           string                `json:"request_id_kind"`
+	SessionMatch            string                `json:"session_match"`
+	Stage                   string                `json:"stage"`
+	Reason                  ProtocolFailureReason `json:"reason,omitempty"`
+	ToolEvents              int                   `json:"tool_events"`
+	ToolRequests            int                   `json:"tool_requests"`
+	ToolCompletions         int                   `json:"tool_completions"`
+	PermissionDenials       int                   `json:"permission_denials"`
+	AssistantTextChunks     int                   `json:"assistant_text_chunks,omitempty"`
+	AssistantTextBytes      int64                 `json:"assistant_text_bytes,omitempty"`
+	ReplyBoundaries         int                   `json:"reply_boundaries,omitempty"`
+	AcknowledgementVerified bool                  `json:"acknowledgement_verified,omitempty"`
 }
 
 func (o ProtocolObservation) Redacted() ProtocolObservation {
@@ -55,6 +59,9 @@ func (o ProtocolObservation) Redacted() ProtocolObservation {
 	o.ToolRequests = max(0, o.ToolRequests)
 	o.ToolCompletions = max(0, o.ToolCompletions)
 	o.PermissionDenials = max(0, o.PermissionDenials)
+	o.AssistantTextChunks = max(0, o.AssistantTextChunks)
+	o.AssistantTextBytes = max(0, o.AssistantTextBytes)
+	o.ReplyBoundaries = max(0, o.ReplyBoundaries)
 	return o
 }
 

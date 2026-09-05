@@ -193,7 +193,10 @@ func primaryTerminalCategory(text, nonce string) string {
 }
 
 func primaryComparisonEnvironment(home, runtime string) []string {
-	env := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + home, "LANG=C", "TERM=dumb"}
+	// Both runtime and broker commands are absolute and pinned. A WSL host's
+	// inherited PATH may resolve a Windows helper back through interop instead
+	// of the native executable, so primary comparisons use only system paths.
+	env := []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=" + home, "LANG=C", "TERM=dumb"}
 	if runtime == "codex" {
 		env = append(env, "CODEX_HOME="+home)
 	} else {

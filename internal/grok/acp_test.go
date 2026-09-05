@@ -21,6 +21,57 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 )
 
+func TestAcknowledgementUsesAssistantReplyAfterFinalToolBoundary(t *testing.T) {
+	const nonce = "NTM_ACK_0123456789abcdef0123456789abcdef"
+	for _, prelude := range []string{"I will make the edit now.", strings.Repeat("x", 300), nonce + "\n"} {
+		a := newUpdateAccumulator(io.Discard, nonce, "grok-4.6")
+		a.providerSessionID = "bound"
+		chunk := func(text string) {
+			payload, _ := json.Marshal(map[string]any{"sessionId": "bound", "update": map[string]any{"sessionUpdate": "agent_message_chunk", "content": map[string]string{"text": text}}})
+			if err := a.observe(payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+		chunk(prelude)
+		for _, payload := range []string{
+			`{"sessionId":"bound","update":{"sessionUpdate":"tool_call","toolCallId":"one"}}`,
+			`{"sessionId":"bound","update":{"sessionUpdate":"tool_call_update","toolCallId":"one","status":"completed","content":[{"type":"content","content":{"type":"text","text":"` + nonce + `"}}]}}`,
+		} {
+			if err := a.observe(json.RawMessage(payload)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		a.nonce.Finalize()
+		if a.nonce.verified {
+			t.Fatal("earlier assistant or tool text acknowledged later work")
+		}
+		chunk(nonce[:12])
+		chunk(nonce[12:])
+		a.nonce.Finalize()
+		if !a.nonce.verified || a.replyBoundaries != 2 {
+			t.Fatal("separate final reply was joined to pre-tool commentary")
+		}
+	}
+}
+
+func TestResponseBoundaryIsBoundAndCannotManufactureAcknowledgement(t *testing.T) {
+	a := newUpdateAccumulator(io.Discard, "nonce", "grok-4.6")
+	a.providerSessionID = "bound"
+	a.nonce.WriteString("nonce\n")
+	if err := a.observeVendorNotification("_x.ai/session_notification", json.RawMessage(`{"sessionId":"other","update":{"sessionUpdate":"response_started"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if !a.nonce.verified {
+		t.Fatal("foreign session reset the reply")
+	}
+	if err := a.observeVendorNotification("_x.ai/session_notification", json.RawMessage(`{"sessionId":"bound","update":{"sessionUpdate":"response_started","message_id":"do-not-retain","model":"do-not-promote"}}`)); err != nil {
+		t.Fatal(err)
+	}
+	if a.nonce.verified || a.replyBoundaries != 1 || a.sessionModelObserved {
+		t.Fatal("response boundary manufactured identity or acknowledgement")
+	}
+}
+
 func TestToolContentArraysPreserveTerminalLifecycleWithoutAcknowledgement(t *testing.T) {
 	// Pinned ACP schema 0.11.4 ToolCallUpdateFields.content is an array;
 	// Grok bb7f39d5 acp_conversion.rs emits it with terminal status. Tool

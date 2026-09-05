@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/spf13/cobra"
@@ -190,8 +191,10 @@ func runProviderInterrupt(cmd *cobra.Command, profileName, operationID string) e
 
 func providerRestartAllowed(status providerAssignmentStatus) bool {
 	c := status.CapacityObservation
+	cancelled := (status.Provider == "xai" && status.State == grok.StateCancelled) ||
+		(status.Provider == "zai" && status.State == "cancelled")
 	return status.IdentityBindingVerified && status.LocalCleanupVerified &&
-		(status.CompletionConfirmed || status.State == "cancelled") &&
+		(status.CompletionConfirmed || cancelled) &&
 		c != nil && c.IdentitySHA256 == status.IdentitySHA256 && c.Scope == provider.CapacityControlScopeLocalShared &&
 		c.LocalSlotReleased && !c.ObservedAt.IsZero() &&
 		(status.Provider != "zai" || (c.PlanSlotReleased && c.UsageState == "reconciled"))
