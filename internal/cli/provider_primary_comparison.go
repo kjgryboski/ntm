@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -172,7 +171,7 @@ func primaryComparisonEnvironment(home, runtime string) []string {
 	if runtime == "codex" {
 		env = append(env, "CODEX_HOME="+home)
 	} else {
-		env = append(env, "CLAUDE_CONFIG_DIR="+home, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1")
+		env = append(env, "CLAUDE_CONFIG_DIR="+home, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1", "CLAUDE_CODE_DISABLE_AGENT_VIEW=1")
 	}
 	return env
 }
@@ -310,7 +309,7 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	if err != nil {
 		return err
 	}
-	prompt := fmt.Sprintf("Use only ntm-controlled-workspace MCP tools. Perform exactly four calls in order: read_file path %q; write_file path %q expected_sha256 %q content %q; read_file path %q (expect protected synthetic sentinel rejection and continue); verify_worktree {}. Then reply with exactly %s and no other text.", providerGrokWorkspaceTarget, providerGrokWorkspaceTarget, sha256TextCLI(providerGrokWorkspaceBefore), string(providerGrokWorkspaceAfter), providerGrokWorkspaceSecret, nonce)
+	prompt := providerWorkspaceQualificationPrompt(nonce)
 	var args []string
 	if id.Runtime() == "claude" {
 		mcp := map[string]any{"mcpServers": map[string]any{grok.WorkspaceBrokerMCPName: map[string]any{"command": descriptor.Command, "args": descriptor.Args, "env": map[string]string{}}}}
@@ -321,7 +320,7 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 		}
 		args = []string{"--print", "--verbose", "--output-format", "stream-json", "--tools", "", "--permission-mode", "dontAsk", "--setting-sources", "", "--settings", `{"disableAllHooks":true}`, "--strict-mcp-config", "--mcp-config", mcpPath, "--allowedTools", "mcp__ntm-controlled-workspace__read_file,mcp__ntm-controlled-workspace__write_file,mcp__ntm-controlled-workspace__verify_worktree", "--model", id.Model(), prompt}
 	} else {
-		settings := map[string]any{"model": id.Model(), "model_provider": "openai", "approval_policy": "never", "sandbox_mode": "read-only", "check_for_update_on_startup": false, "history": map[string]any{"persistence": "none"}, "features": map[string]any{"shell_tool": false, "multi_agent": false, "apps": false}, "mcp_servers": map[string]any{grok.WorkspaceBrokerMCPName: map[string]any{"command": descriptor.Command, "args": descriptor.Args, "enabled_tools": []string{"read_file", "write_file", "verify_worktree"}}}}
+		settings := primaryCodexComparisonSettings(id.Model(), descriptor.Command, descriptor.Args)
 		var b bytes.Buffer
 		if err = toml.NewEncoder(&b).Encode(settings); err != nil {
 			return err
@@ -369,6 +368,9 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	assertions := evaluateProviderGrokWorkspaceAudit(audit, workspace.Worktree, revision, started, completed)
 	content, contentErr := os.ReadFile(filepath.Join(workspace.Worktree, providerGrokWorkspaceTarget))
 	edit := contentErr == nil && bytes.Equal(content, providerGrokWorkspaceAfter)
+	if _, err = providerqualification.StoreWorkspaceDiagnostics("", transport, id.Hash(), policy, digest, started, completed, providerWorkspaceDiagnostic(audit, auditErr, assertions, edit)); err != nil {
+		return err
+	}
 	receipt := providerqualification.Receipt{Mode: providerqualification.ModeLive, Provider: id.Provider(), Transport: transport, IdentitySHA256: id.Hash(), PolicySHA256: policy, RuntimeVersion: version, RuntimeSHA256: digest, StartedAt: started, CompletedAt: completed, DisposableRepoHash: sha256StringCLI(filepath.Clean(workspace.Worktree)), Checks: grokQualificationChecksForProducer("primary-comparison")}
 	for i := range receipt.Checks {
 		receipt.Checks[i].Detail = "untested: not exercised by this workspace comparison"
@@ -417,4 +419,21 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 		return err
 	}
 	return &providerQualificationExitError{}
+}
+
+func primaryCodexComparisonSettings(model, command string, args []string) map[string]any {
+	// Codex's Auto MCP policy requests approval when safety annotations are
+	// absent. Explicit approval applies only to this controller-bound broker's
+	// three exposed tools; their file and execution boundaries remain in NTM.
+	return map[string]any{
+		"model": model, "model_provider": "openai", "approval_policy": "never",
+		"sandbox_mode": "read-only", "check_for_update_on_startup": false,
+		"history": map[string]any{"persistence": "none"},
+		"features": map[string]any{"shell_tool": false, "multi_agent": false, "apps": false},
+		"mcp_servers": map[string]any{grok.WorkspaceBrokerMCPName: map[string]any{
+			"command": command, "args": append([]string(nil), args...), "required": true,
+			"default_tools_approval_mode": "approve",
+			"enabled_tools": []string{"read_file", "write_file", "verify_worktree"},
+		}},
+	}
 }

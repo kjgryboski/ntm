@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/grok"
 )
 
 func TestPrimaryComparisonCommandRequiresExplicitBindingsBeforeDispatch(t *testing.T) {
@@ -15,6 +16,18 @@ func TestPrimaryComparisonCommandRequiresExplicitBindingsBeforeDispatch(t *testi
 		if err := cmd.Execute(); err == nil {
 			t.Fatalf("accepted incomplete live comparison: %v", args)
 		}
+	}
+}
+
+func TestPrimaryComparisonCodexApprovesOnlyRequiredConstrainedBroker(t *testing.T) {
+	settings := primaryCodexComparisonSettings("gpt-6-astra", "/bound/ntm", []string{"provider", "broker"})
+	servers := settings["mcp_servers"].(map[string]any)
+	if len(servers) != 1 || settings["approval_policy"] != "never" || settings["sandbox_mode"] != "read-only" {
+		t.Fatal("comparison broadened ambient permissions")
+	}
+	broker := servers[grok.WorkspaceBrokerMCPName].(map[string]any)
+	if broker["required"] != true || broker["default_tools_approval_mode"] != "approve" || strings.Join(broker["enabled_tools"].([]string), ",") != "read_file,write_file,verify_worktree" {
+		t.Fatal("comparison broker can be omitted or needs an unavailable approval prompt")
 	}
 }
 
@@ -90,6 +103,9 @@ func TestPrimaryComparisonEnvironmentExcludesAmbientCredentials(t *testing.T) {
 		env := strings.Join(primaryComparisonEnvironment("/isolated", runtime), "\n")
 		if strings.Contains(env, "credential-canary") || strings.Contains(env, "unexpected.invalid") {
 			t.Fatal("ambient provider identity leaked into primary child")
+		}
+		if runtime == "claude" && !strings.Contains(env, "CLAUDE_CODE_DISABLE_AGENT_VIEW=1") {
+			t.Fatal("shared Agent View supervisor can reconnect another account")
 		}
 	}
 }

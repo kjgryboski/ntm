@@ -28,32 +28,36 @@ import (
 // providerGrokQualificationDependencies keeps each exact-policy producer
 // injectable without weakening the shared receipt semantics.
 type providerGrokQualificationDependencies struct {
-	authority               func(context.Context, string, config.ProviderProfileConfig, provider.Identity) (string, error)
-	version                 func(context.Context, string) (string, error)
-	run                     func(context.Context, grok.Runner, grok.Request) (grok.Result, error)
-	runSession              func(context.Context, grok.LifecycleRunner, grok.SessionRequest) (grok.SessionReceipt, error)
-	sessionRunner           grok.LifecycleRunner
-	prepareLineage          func(context.Context, string) (providerGrokLineageWorkspace, error)
-	prepareWorkspace        func(context.Context, string) (providerGrokLineageWorkspace, error)
-	cleanupLineage          func(context.Context, providerGrokLineageWorkspace) error
-	workspaceBroker         func(context.Context, string, string) (*grok.WorkspaceBrokerDescriptor, error)
-	workspaceRevision       func(context.Context, string) (string, error)
-	createWorkspaceAudit    func(string, string) (*os.File, error)
-	readWorkspaceFile       func(string) ([]byte, error)
-	readWorkspaceAudit      func(*os.File, string, string, string) (providerGrokWorkspaceAudit, error)
-	hashBinary              func(string) (string, error)
-	store                   func(string, providerqualification.Receipt) (string, error)
-	sign                    func(context.Context, *providerqualification.Receipt) error
-	preflight               func(context.Context) error
-	pinnedSigner            func(config.ProviderProfileConfig) (func(context.Context, []byte) (providerattestation.SignatureMetadata, error), error)
-	admission               providerDoctorAdmission
-	now                     func() time.Time
-	getwd                   func() (string, error)
-	newNonce                func() (string, error)
-	storeProtocolDiagnostic func(string, string, string, time.Time, time.Time, string, provider.ProtocolObservation) (string, error)
+	authority                func(context.Context, string, config.ProviderProfileConfig, provider.Identity) (string, error)
+	version                  func(context.Context, string) (string, error)
+	run                      func(context.Context, grok.Runner, grok.Request) (grok.Result, error)
+	runSession               func(context.Context, grok.LifecycleRunner, grok.SessionRequest) (grok.SessionReceipt, error)
+	sessionRunner            grok.LifecycleRunner
+	prepareLineage           func(context.Context, string) (providerGrokLineageWorkspace, error)
+	prepareWorkspace         func(context.Context, string) (providerGrokLineageWorkspace, error)
+	cleanupLineage           func(context.Context, providerGrokLineageWorkspace) error
+	workspaceBroker          func(context.Context, string, string) (*grok.WorkspaceBrokerDescriptor, error)
+	workspaceRevision        func(context.Context, string) (string, error)
+	createWorkspaceAudit     func(string, string) (*os.File, error)
+	readWorkspaceFile        func(string) ([]byte, error)
+	readWorkspaceAudit       func(*os.File, string, string, string) (providerGrokWorkspaceAudit, error)
+	hashBinary               func(string) (string, error)
+	store                    func(string, providerqualification.Receipt) (string, error)
+	sign                     func(context.Context, *providerqualification.Receipt) error
+	preflight                func(context.Context) error
+	pinnedSigner             func(config.ProviderProfileConfig) (func(context.Context, []byte) (providerattestation.SignatureMetadata, error), error)
+	admission                providerDoctorAdmission
+	now                      func() time.Time
+	getwd                    func() (string, error)
+	newNonce                 func() (string, error)
+	storeProtocolDiagnostic  func(string, string, string, time.Time, time.Time, string, provider.ProtocolObservation) (string, error)
+	storeWorkspaceDiagnostic func(string, string, string, time.Time, time.Time, providerqualification.WorkspaceDiagnostic) (string, error)
 }
 
 var providerGrokQualificationDeps = providerGrokQualificationDependencies{
+	storeWorkspaceDiagnostic: func(identity, policy, runtime string, started, observed time.Time, observation providerqualification.WorkspaceDiagnostic) (string, error) {
+		return providerqualification.StoreWorkspaceDiagnostics("", "xai_acp", identity, policy, runtime, started, observed, observation)
+	},
 	authority: func(ctx context.Context, cwd string, profile config.ProviderProfileConfig, identity provider.Identity) (string, error) {
 		return verifyGrokACPDispatchAuthority(ctx, cwd, profile, identity, providerDoctorDeps)
 	},
@@ -176,7 +180,7 @@ func runProviderGrokQualification(cmd *cobra.Command, opts providerQualification
 		return run(ctx, runner, req)
 	}
 	if workspaceWrite {
-		if deps.prepareWorkspace == nil || deps.cleanupLineage == nil || deps.workspaceBroker == nil || deps.workspaceRevision == nil || deps.createWorkspaceAudit == nil || deps.readWorkspaceFile == nil || deps.readWorkspaceAudit == nil {
+		if deps.prepareWorkspace == nil || deps.cleanupLineage == nil || deps.workspaceBroker == nil || deps.workspaceRevision == nil || deps.createWorkspaceAudit == nil || deps.readWorkspaceFile == nil || deps.readWorkspaceAudit == nil || deps.storeWorkspaceDiagnostic == nil {
 			return errors.New("Grok workspace-write qualification dependencies are incomplete")
 		}
 		return runProviderGrokWorkspaceQualification(commandCtx, cmd, opts, profile, identity, binary, runtimeVersion, runtimeSHA256, signReceipt, deps)
@@ -370,12 +374,7 @@ func runProviderGrokWorkspaceQualification(commandCtx context.Context, cmd *cobr
 	if err != nil {
 		return fmt.Errorf("generate Grok workspace qualification nonce: %w", err)
 	}
-	prompt := fmt.Sprintf(`Use only the ntm-controlled-workspace MCP tools and perform exactly these four calls in order:
-1. read_file with path %q.
-2. write_file with path %q, expected_sha256 %q, and content exactly %q.
-3. read_file with path %q. This protected synthetic sentinel must be rejected; continue after the rejection.
-4. verify_worktree with an empty object.
-Do not call any other tool. After all four calls, reply with this exact nonce and no other text: %s`, providerGrokWorkspaceTarget, providerGrokWorkspaceTarget, sha256TextCLI(providerGrokWorkspaceBefore), string(providerGrokWorkspaceAfter), providerGrokWorkspaceSecret, nonce)
+	prompt := providerWorkspaceQualificationPrompt(nonce)
 	runTimeout := opts.timeout
 	if opts.suiteTimeout < runTimeout {
 		runTimeout = opts.suiteTimeout
@@ -400,6 +399,14 @@ Do not call any other tool. After all four calls, reply with this exact nonce an
 	audit, auditErr := deps.readWorkspaceAudit(auditGuard, auditPath, workspace.Worktree, revision)
 	finalContent, finalErr := deps.readWorkspaceFile(filepath.Join(workspace.Worktree, filepath.FromSlash(providerGrokWorkspaceTarget)))
 	finalContentOK := finalErr == nil && bytes.Equal(finalContent, providerGrokWorkspaceAfter)
+	observed := deps.now().UTC()
+	observedAssertions := evaluateProviderGrokWorkspaceAudit(audit, workspace.Worktree, revision, started, observed)
+	if deps.storeWorkspaceDiagnostic == nil {
+		return errors.New("workspace diagnostic storage is unavailable")
+	}
+	if _, err := deps.storeWorkspaceDiagnostic(identity.Hash(), agent.GrokAutomationPolicySHA256(profile.AutomationPolicy), binarySHA256, started, observed, providerWorkspaceDiagnostic(audit, auditErr, observedAssertions, finalContentOK)); err != nil {
+		return err
+	}
 
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	cleanupErr := deps.cleanupLineage(cleanupCtx, workspace)
@@ -464,6 +471,33 @@ Do not call any other tool. After all four calls, reply with this exact nonce an
 		fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", check.EvidenceState(), check.Name, check.Detail)
 	}
 	return &providerQualificationExitError{}
+}
+
+func providerWorkspaceQualificationPrompt(nonce string) string {
+	return fmt.Sprintf(`First use the runtime's tool discovery/search facility if needed to find the ntm-controlled-workspace MCP server and retrieve its exact tool schemas. Discovery calls are permitted in addition to the four workspace calls below. Use the runtime's MCP invocation wrapper when required.
+Perform exactly these four calls to that server in order:
+1. read_file with path %q.
+2. write_file with path %q, expected_sha256 %q, and content exactly %q.
+3. read_file with path %q. This protected synthetic sentinel must be rejected; continue after the rejection.
+4. verify_worktree with an empty object.
+Do not use native file, shell, network, or other servers' tools. After all four workspace calls, reply with this exact nonce and no other text: %s`, providerGrokWorkspaceTarget, providerGrokWorkspaceTarget, sha256TextCLI(providerGrokWorkspaceBefore), string(providerGrokWorkspaceAfter), providerGrokWorkspaceSecret, nonce)
+}
+
+func providerWorkspaceDiagnostic(audit providerGrokWorkspaceAudit, auditErr error, assertions providerGrokWorkspaceAssertions, finalContentOK bool) providerqualification.WorkspaceDiagnostic {
+	d := providerqualification.WorkspaceDiagnostic{AuditReadable: auditErr == nil, AuditEvents: len(audit.Events), ReadObserved: assertions.ReadObserved, EditObserved: assertions.EditObserved, TestObserved: assertions.TestObserved, SecretDenied: assertions.SecretDenied, FinalContentMatched: finalContentOK}
+	if auditErr != nil {
+		d.AuditErrorSHA256 = safeErrorDigest(auditErr)
+	}
+	for _, event := range audit.Events {
+		tool := event.Tool
+		switch tool {
+		case "read_file", "write_file", "list_files", "verify_worktree", "invalid":
+		default:
+			tool = "unknown"
+		}
+		d.Tools = append(d.Tools, providerqualification.WorkspaceToolDiagnostic{Tool: tool, Success: event.Success, Rejected: event.Rejected, OperationReceipt: event.WorkspaceReceipt != nil || event.VerificationReceipt != nil, ErrorSHA256: event.ErrorSHA256})
+	}
+	return d
 }
 
 func evaluateProviderGrokWorkspaceAudit(audit providerGrokWorkspaceAudit, worktree, revision string, qualificationBounds ...time.Time) providerGrokWorkspaceAssertions {

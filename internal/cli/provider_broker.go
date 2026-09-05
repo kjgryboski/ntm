@@ -447,6 +447,10 @@ func (b *providerBroker) call(ctx context.Context, raw json.RawMessage) (any, er
 	var request struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`
+		// MCP Request.params permits an optional metadata object (including
+		// progressToken). It cannot alter tool arguments or authorization and
+		// is never echoed or persisted. Unknown tool arguments remain rejected.
+		Meta map[string]json.RawMessage `json:"_meta,omitempty"`
 	}
 	if err := decodeProviderNativeToolArgs(raw, &request); err != nil {
 		if auditErr := b.recordToolEvent("invalid", "", false, true, nil, nil, err); auditErr != nil {

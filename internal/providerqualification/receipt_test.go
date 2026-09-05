@@ -351,6 +351,34 @@ func TestLoadLatestMissingIsNotExist(t *testing.T) {
 	}
 }
 
+func TestWorkspaceDiagnosticCannotQualifyOrRetainErrorText(t *testing.T) {
+	base, now := t.TempDir(), time.Now().UTC()
+	id := testHash("workspace-diagnostic-identity")
+	obs := WorkspaceDiagnostic{AuditEvents: 2, AuditReadable: true, EditObserved: true, AuditErrorSHA256: testHash("synthetic private error")}
+	path, err := StoreWorkspaceDiagnostics(base, "xai_acp", id, testHash("policy"), testHash("runtime"), now, now, obs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record DiagnosticObservation
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Workspace == nil || record.Workspace.AuditEvents != 2 || !record.Workspace.EditObserved || record.Trust != "unsigned_diagnostic_only" {
+		t.Fatal("workspace evidence lost")
+	}
+	if _, _, err := LoadLatest(base, id); err == nil {
+		t.Fatal("unsigned workspace observation qualified")
+	}
+	obs.AuditErrorSHA256 = "synthetic private error"
+	if _, err := StoreWorkspaceDiagnostics(base, "xai_acp", id, testHash("policy"), testHash("runtime"), now, now, obs); err == nil {
+		t.Fatal("raw error accepted")
+	}
+}
+
 func TestProtocolDiagnosticsRedactBeforePersistenceAndCannotQualify(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()

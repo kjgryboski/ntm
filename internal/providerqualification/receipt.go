@@ -449,6 +449,7 @@ func DefaultCodexIdentityPreflightStoreDir() string {
 // authorize work even if copied into the qualification store. Free-form text
 // is excluded; only fixed check names, closed reasons, and digests survive.
 type DiagnosticObservation struct {
+	Workspace      *WorkspaceDiagnostic          `json:"workspace,omitempty"`
 	Comparison     *PrimaryComparisonDiagnostic  `json:"comparison,omitempty"`
 	Phase          string                        `json:"phase,omitempty"`
 	Protocol       *provider.ProtocolObservation `json:"protocol,omitempty"`
@@ -462,6 +463,48 @@ type DiagnosticObservation struct {
 	StartedAt      time.Time                     `json:"started_at"`
 	CompletedAt    time.Time                     `json:"completed_at"`
 	Observations   []DiagnosticCheck             `json:"observations"`
+}
+
+// WorkspaceDiagnostic preserves controller observations before destructive
+// cleanup. It contains no file contents, paths, tool arguments or error text.
+type WorkspaceDiagnostic struct {
+	Tools               []WorkspaceToolDiagnostic `json:"tools,omitempty"`
+	AuditReadable       bool                      `json:"audit_readable"`
+	AuditEvents         int                       `json:"audit_events"`
+	ReadObserved        bool                      `json:"read_observed"`
+	EditObserved        bool                      `json:"edit_observed"`
+	TestObserved        bool                      `json:"test_observed"`
+	SecretDenied        bool                      `json:"secret_denied"`
+	FinalContentMatched bool                      `json:"final_content_matched"`
+	AuditErrorSHA256    string                    `json:"audit_error_sha256,omitempty"`
+}
+
+type WorkspaceToolDiagnostic struct {
+	Tool             string `json:"tool"`
+	Success          bool   `json:"success"`
+	Rejected         bool   `json:"rejected"`
+	OperationReceipt bool   `json:"operation_receipt"`
+	ErrorSHA256      string `json:"error_sha256,omitempty"`
+}
+
+func StoreWorkspaceDiagnostics(baseDir, transport, identity, policy, runtime string, started, observed time.Time, observation WorkspaceDiagnostic) (string, error) {
+	if len(observation.Tools) > 32 {
+		return "", errors.New("workspace diagnostic event limit exceeded")
+	}
+	for _, tool := range observation.Tools {
+		switch tool.Tool {
+		case "read_file", "write_file", "list_files", "verify_worktree", "invalid", "unknown":
+		default:
+			return "", errors.New("invalid workspace diagnostic tool")
+		}
+		if tool.ErrorSHA256 != "" && !isSHA256(tool.ErrorSHA256) {
+			return "", errors.New("invalid workspace tool error digest")
+		}
+	}
+	if (transport != "xai_acp" && transport != "openai_codex_comparison" && transport != "anthropic_claude_comparison") || !isSHA256(identity) || !isSHA256(policy) || !isSHA256(runtime) || started.IsZero() || observed.Before(started) || observation.AuditEvents < 0 || (observation.AuditErrorSHA256 != "" && !isSHA256(observation.AuditErrorSHA256)) {
+		return "", errors.New("invalid workspace diagnostic")
+	}
+	return storeDiagnosticRecord(baseDir, DiagnosticObservation{SchemaVersion: "ntm.provider-diagnostic.v1", Trust: "unsigned_diagnostic_only", Transport: transport, IdentitySHA256: identity, PolicySHA256: policy, RuntimeSHA256: runtime, StartedAt: started, CompletedAt: observed, Phase: "before_cleanup", Workspace: &observation})
 }
 
 // PrimaryComparisonDiagnostic retains closed observations and a model digest,

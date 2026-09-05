@@ -15,6 +15,15 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
 
 ### Security
 
+- **Workspace comparisons retain redacted broker observations before cleanup.**
+  Per-tool outcomes and error digests survive failed runs without retaining
+  arguments or content. MCP request metadata is accepted without changing tool
+  authorization or being echoed. Claude comparisons disable the shared Agent
+  View supervisor. Trimpath verifier builds require a bound Go toolchain root
+  instead of attempting to mount an empty path. The common scenario permits
+  runtime tool discovery before its four audited workspace operations. Codex
+  requires the bound MCP server and explicitly approves only its exposed tools.
+
 - **Grok failure diagnostics are saved before process cleanup.** Qualification
   checks storage before dispatch, then persists allowlisted method labels,
   request-ID shape, session matching, stage/reason, and counters without payloads.

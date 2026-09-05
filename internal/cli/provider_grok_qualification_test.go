@@ -37,6 +37,9 @@ func grokQualificationDepsForTest(t *testing.T, profile config.ProviderProfileCo
 	now := time.Date(2026, time.September, 3, 12, 0, 0, 0, time.UTC)
 	diagnosticDir := t.TempDir()
 	deps := providerGrokQualificationDependencies{
+		storeWorkspaceDiagnostic: func(identity, policy, runtime string, started, observed time.Time, observation providerqualification.WorkspaceDiagnostic) (string, error) {
+			return providerqualification.StoreWorkspaceDiagnostics(diagnosticDir, "xai_acp", identity, policy, runtime, started, observed, observation)
+		},
 		storeProtocolDiagnostic: func(identity, policy, runtime string, started, observed time.Time, phase string, observation provider.ProtocolObservation) (string, error) {
 			return providerqualification.StoreProtocolDiagnostics(diagnosticDir, identity, policy, runtime, started, observed, phase, observation)
 		},
@@ -261,7 +264,7 @@ func TestProviderGrokWorkspaceQualificationProducesOperationScopedReceipt(t *tes
 			if *calls != 1 || admission.acquires != 1 || admission.releases != 1 || admission.successes != wantSuccesses {
 				t.Fatalf("calls=%d admission=%+v", *calls, admission)
 			}
-			if request.Broker == nil || request.Broker.BindingSHA256() == "" || request.CWD != workspace.Worktree || request.ExpectedNonce == "" || !strings.Contains(request.Prompt, providerGrokWorkspaceSecret) || !strings.Contains(request.Prompt, providerGrokWorkspaceTarget) {
+			if request.Broker == nil || request.Broker.BindingSHA256() == "" || request.CWD != workspace.Worktree || request.ExpectedNonce == "" || !strings.Contains(request.Prompt, providerGrokWorkspaceSecret) || !strings.Contains(request.Prompt, providerGrokWorkspaceTarget) || !strings.Contains(request.Prompt, "Discovery calls are permitted") {
 				t.Fatalf("workspace request was incomplete: %+v", *request)
 			}
 			if stored.Passed || stored.Transport != "xai_acp" || stored.PolicySHA256 != agent.GrokAutomationPolicySHA256(agent.GrokWorkspaceWritePolicyName) || stored.Validate() != nil {
@@ -434,8 +437,23 @@ func TestProviderGrokWorkspaceBrokerProducesRealQualificationEvidence(t *testing
 	if err := json.Unmarshal(descriptorJSON, &commandSpec); err != nil {
 		t.Fatal(err)
 	}
+	helperEnv := append(os.Environ(), "NTM_PROVIDER_BROKER_TEST_HELPER=1")
+	if binary := os.Getenv("NTM_PROVIDER_BROKER_BINARY"); binary != "" {
+		// Exercise the actual release CLI, including trimpath/toolchain binding,
+		// instead of TestMain's broker helper. Still bind the executable digest.
+		if !filepath.IsAbs(binary) {
+			t.Fatal("production broker test binary must be absolute")
+		}
+		digest, err := hashProviderSessionExecutable(binary)
+		if err != nil {
+			t.Fatal(err)
+		}
+		commandSpec.Command = binary
+		commandSpec.Args[10] = digest
+		helperEnv = primaryComparisonEnvironment(workspace.RuntimeHome, "codex")
+	}
 	command := exec.CommandContext(t.Context(), commandSpec.Command, commandSpec.Args...)
-	command.Env = append(os.Environ(), "NTM_PROVIDER_BROKER_TEST_HELPER=1")
+	command.Env = helperEnv
 	command.Stdin = strings.NewReader(strings.Join(requests, "\n") + "\n")
 	var output bytes.Buffer
 	var stderr bytes.Buffer

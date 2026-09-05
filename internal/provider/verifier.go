@@ -35,6 +35,26 @@ const (
 var verifierID = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,63}$`)
 var gitRevision = regexp.MustCompile(`^[0-9a-f]{40,64}$`)
 
+// Release builds using -trimpath omit runtime.GOROOT. The build may bind the
+// exact controller toolchain with -X; it is never supplied by a provider.
+var verifierBuildGoRoot string
+
+func verifierGoRoot(runtimeRoot, buildRoot string) (string, error) {
+	root := buildRoot
+	if root == "" {
+		root = runtimeRoot
+	}
+	if !filepath.IsAbs(root) || filepath.Clean(root) == string(filepath.Separator) {
+		return "", errors.New("isolated verifier requires a build-bound Go toolchain root; trimpath builds must set provider.verifierBuildGoRoot")
+	}
+	for _, relative := range []string{"bin/go", "src/runtime", "pkg/tool"} {
+		if _, err := os.Stat(filepath.Join(root, relative)); err != nil {
+			return "", errors.New("isolated verifier Go toolchain root is incomplete")
+		}
+	}
+	return filepath.Clean(root), nil
+}
+
 // ApprovedCommand is controller-authored, immutable command metadata.  A
 // catalog must never be assembled from provider output or repository content.
 type ApprovedCommand struct {
@@ -148,6 +168,7 @@ type worktreeInspector interface {
 // empty environment and network namespace.  It fails closed when Bubblewrap
 // or disposable-worktree evidence is unavailable.
 type IsolatedVerifier struct {
+	goRoot    string
 	catalog   CommandCatalog
 	runner    verificationRunner
 	inspector worktreeInspector
@@ -164,7 +185,18 @@ func NewIsolatedVerifier(catalog CommandCatalog) (*IsolatedVerifier, error) {
 	if _, err := exec.LookPath("bwrap"); err != nil {
 		return nil, fmt.Errorf("isolated verifier requires Bubblewrap: %w", err)
 	}
-	return &IsolatedVerifier{catalog: catalog, runner: bwrapVerificationRunner{}, inspector: gitWorktreeInspector{}, now: time.Now}, nil
+	var root string
+	for _, command := range catalog.commands {
+		if command.Program == "go" {
+			var err error
+			root, err = verifierGoRoot(runtime.GOROOT(), verifierBuildGoRoot)
+			if err != nil {
+				return nil, err
+			}
+			break
+		}
+	}
+	return &IsolatedVerifier{catalog: catalog, runner: bwrapVerificationRunner{}, inspector: gitWorktreeInspector{}, now: time.Now, goRoot: root}, nil
 }
 
 // Verify rejects a non-disposable tree, a revision mismatch, duplicate or
@@ -208,7 +240,7 @@ func (v *IsolatedVerifier) Verify(ctx context.Context, manifest VerificationMani
 	for _, command := range commands {
 		commandStarted := v.now().UTC()
 		commandCtx, cancel := context.WithTimeout(ctx, command.Timeout)
-		outcome, runErr := v.runner.Run(commandCtx, bwrapPlan(resolved, command))
+		outcome, runErr := v.runner.Run(commandCtx, bwrapPlan(resolved, command, v.goRoot))
 		timedOut := errors.Is(commandCtx.Err(), context.DeadlineExceeded)
 		cancel()
 		completed := v.now().UTC()
@@ -233,7 +265,7 @@ func (v *IsolatedVerifier) Verify(ctx context.Context, manifest VerificationMani
 	return receipt, nil
 }
 
-func bwrapPlan(worktree string, command ApprovedCommand) verificationPlan {
+func bwrapPlan(worktree string, command ApprovedCommand, goRoot string) verificationPlan {
 	// Start from an empty tmpfs root. Read-only system runtime directories are
 	// mounted explicitly; the host home, root, configuration, credential, and
 	// cache trees are never visible. The linked worktree is mounted at a fixed
@@ -253,7 +285,7 @@ func bwrapPlan(worktree string, command ApprovedCommand) verificationPlan {
 		// Go's selected toolchain may live below GOPATH (for example after a
 		// toolchain directive download). Mount only that immutable runtime, not
 		// GOPATH or the surrounding home directory, and disable auto-downloads.
-		args = append(args, "--dir", "/opt", "--dir", "/opt/ntm", "--ro-bind", runtime.GOROOT(), "/opt/ntm/go")
+		args = append(args, "--dir", "/opt", "--dir", "/opt/ntm", "--ro-bind", goRoot, "/opt/ntm/go")
 		pathValue = "/opt/ntm/go/bin:" + pathValue
 	}
 	args = append(args,

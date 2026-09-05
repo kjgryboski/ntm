@@ -119,7 +119,7 @@ func TestProviderBrokerServeBindsLinkedWorktreeAndVerifier(t *testing.T) {
 		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
 		`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`,
 		`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`,
-		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"main.go"}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"main.go"},"_meta":{"progressToken":3,"private-extension":"PRIVATE_METADATA_CANARY"}}}`,
 		fmt.Sprintf(`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"main.go","expected_sha256":"%x","content":%q}}}`, initialSHA256, updated),
 		`{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"verify_worktree","arguments":{}}}`,
 	}
@@ -128,6 +128,9 @@ func TestProviderBrokerServeBindsLinkedWorktreeAndVerifier(t *testing.T) {
 		t.Fatal(err)
 	}
 	responses := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if strings.Contains(output.String(), "PRIVATE_METADATA_CANARY") {
+		t.Fatal("MCP metadata leaked into tool result")
+	}
 	if len(responses) != 5 {
 		t.Fatalf("responses = %d, want 5 (initialized notification must be silent): %s", len(responses), output.String())
 	}

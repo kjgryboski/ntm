@@ -61,7 +61,25 @@ func testVerifier(t *testing.T, runner *fakeVerifierRunner, inspector fakeVerifi
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &IsolatedVerifier{catalog: catalog, runner: runner, inspector: inspector, now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+	return &IsolatedVerifier{catalog: catalog, runner: runner, inspector: inspector, goRoot: runtime.GOROOT(), now: func() time.Time { return time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC) }}
+}
+
+func TestVerifierGoRootSurvivesTrimpathWithoutMountingAnUnboundRoot(t *testing.T) {
+	root := runtime.GOROOT()
+	if root == "" {
+		t.Skip("test toolchain has no GOROOT")
+	}
+	if got, err := verifierGoRoot("", root); err != nil || got != filepath.Clean(root) {
+		t.Fatalf("build-bound toolchain lost: %q %v", got, err)
+	}
+	for _, invalid := range []string{"", "/", t.TempDir()} {
+		if _, err := verifierGoRoot("", invalid); err == nil {
+			t.Fatalf("unbound toolchain root accepted: %q", invalid)
+		}
+	}
+	if _, err := verifierGoRoot(root, t.TempDir()); err == nil {
+		t.Fatal("broken build binding silently fell back to ambient toolchain")
+	}
 }
 
 func TestIsolatedVerifierBindsManifestAndBuildsCredentialFreeNetworkSandbox(t *testing.T) {
