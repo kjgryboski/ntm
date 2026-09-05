@@ -1,15 +1,92 @@
 package cli
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/grok"
 )
+
+// Loads the production-generated configuration in the reviewed executable.
+// features list does not authenticate or dispatch generation.
+func TestPrimaryCodexPinnedRuntimeLoadsControlledCatalogOffline(t *testing.T) {
+	binary := os.Getenv("NTM_PRIMARY_CODEX_OFFLINE_BINARY")
+	if binary == "" {
+		t.Skip("reviewed runtime not supplied")
+	}
+	home := t.TempDir()
+	catalog, err := writePrimaryCodexToolCatalog(home, "gpt-6-astra")
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := primaryCodexComparisonSettings("gpt-6-astra", "/bin/false", nil)
+	settings["model_catalog_json"] = catalog
+	var config bytes.Buffer
+	if err := toml.NewEncoder(&config).Encode(settings); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), config.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, "features", "list")
+	cmd.Env = primaryComparisonEnvironment(home, "codex")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("controlled runtime configuration rejected: %v\n%s", err, output)
+	}
+	for _, name := range []string{"shell_tool", "multi_agent", "apps", "plugins", "view_image"} {
+		found := false
+		for _, line := range strings.Split(string(output), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 && fields[0] == name {
+				found = fields[len(fields)-1] == "false"
+			}
+		}
+		if !found {
+			t.Fatalf("feature %s not disabled in runtime output: %s", name, output)
+		}
+	}
+}
+
+func TestPrimaryCodexBoundaryDisablesEveryUnboundedFileAndExecutionTool(t *testing.T) {
+	settings := primaryCodexComparisonSettings("gpt-6-astra", "/broker", []string{"controlled"})
+	features := settings["features"].(map[string]any)
+	for _, name := range []string{"shell_tool", "multi_agent", "apps", "plugins", "view_image", "image_generation", "request_permissions_tool"} {
+		if features[name] != false {
+			t.Fatalf("unsafe feature %s", name)
+		}
+	}
+	if settings["web_search"] != "disabled" || settings["sandbox_mode"] != "read-only" {
+		t.Fatal("unbounded network or write authority")
+	}
+	path, err := writePrimaryCodexToolCatalog(t.TempDir(), "gpt-6-astra")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(path)
+	var catalog struct{ Models []map[string]any }
+	if json.Unmarshal(data, &catalog) != nil || len(catalog.Models) != 1 {
+		t.Fatal("invalid static tool catalog")
+	}
+	entry := catalog.Models[0]
+	if entry["apply_patch_tool_type"] != nil || entry["shell_type"] != "disabled" || entry["slug"] != "gpt-6-astra" {
+		t.Fatal("static catalog changed model or exposes patch/shell")
+	}
+	if primaryWorkspacePolicySHA("openai_codex_comparison", strings.Repeat("a", 64)) == primaryWorkspacePolicySHA("openai_codex_comparison", strings.Repeat("b", 64)) {
+		t.Fatal("policy lost companion binding")
+	}
+}
 
 func TestPrimaryCodexCompanionRequiredBeforePaidComparison(t *testing.T) {
 	root := t.TempDir()
@@ -214,5 +291,21 @@ func TestPrimaryComparisonEnvironmentExcludesAmbientCredentials(t *testing.T) {
 		if runtime == "claude" && !strings.Contains(env, "CLAUDE_CODE_DISABLE_AGENT_VIEW=1") {
 			t.Fatal("shared Agent View supervisor can reconnect another account")
 		}
+	}
+}
+
+func TestPrimaryRuntimeMismatchDoesNotExecuteVersionCommand(t *testing.T) {
+	root := t.TempDir()
+	marker := filepath.Join(root, "executed")
+	binary := filepath.Join(root, "replacement")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\ntouch '"+marker+"'\nprintf 'codex-cli 0.153.0\\n'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	p := config.ProviderProfileConfig{Command: binary, RuntimeSHA256: strings.Repeat("a", 64), RuntimeVersion: "0.153.0"}
+	if _, err := primaryPinnedRuntimeVersion(t.Context(), p); err == nil {
+		t.Fatal("replacement executable accepted")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("untrusted version command was executed")
 	}
 }

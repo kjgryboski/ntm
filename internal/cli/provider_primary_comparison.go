@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/BurntSushi/toml"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
@@ -79,6 +78,7 @@ func validatePrimaryComparisonProfile(p config.ProviderProfileConfig) (provider.
 }
 
 type primaryComparisonObservation struct {
+	TerminalSeen        bool   `json:"terminal_seen,omitempty"`
 	FailureCategory     string `json:"failure_category,omitempty"`
 	CodeModeUnavailable bool   `json:"code_mode_unavailable,omitempty"`
 	MetadataFallback    bool   `json:"model_metadata_fallback,omitempty"`
@@ -130,6 +130,10 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 		return
 	}
 	model := ""
+	if o.TerminalSeen && (e.Type == "assistant" || e.Type == "item.started" || e.Type == "item.completed") {
+		o.Malformed = true
+		o.FailureCategory = "event_after_terminal"
+	}
 	if runtime == "claude" {
 		if e.Type == "assistant" {
 			// SDKMessage is a tagged union. User and system message fields
@@ -154,10 +158,11 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 			}
 		}
 		if e.Type == "result" {
-			if o.Completed {
+			if o.TerminalSeen {
 				o.Malformed = true
 				o.FailureCategory = "duplicate_terminal"
 			}
+			o.TerminalSeen = true
 			o.Completed = !e.IsError && e.Subtype == "success"
 			o.NonceVerified = o.Completed && strings.TrimSpace(e.Result) == nonce
 			o.TerminalCategory = primaryTerminalCategory(e.Result, nonce)
@@ -187,14 +192,16 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 			}
 		}
 		if e.Type == "turn.completed" {
-			if o.Completed {
+			if o.TerminalSeen {
 				o.Malformed = true
 				o.FailureCategory = "duplicate_terminal"
 			}
+			o.TerminalSeen = true
 			o.Completed = true
 			model = e.ServerModel
 		}
 		if e.Type == "turn.failed" || e.Type == "error" {
+			o.TerminalSeen = true
 			o.Malformed = true
 			o.FailureCategory = "runtime_error"
 		}
@@ -321,7 +328,7 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	}
 	ctx := providerCommandContext(cmd)
 	versionCtx, versionCancel := context.WithTimeout(ctx, 5*time.Second)
-	version, versionErr := providerRuntimeVersion(versionCtx, profile.Command)
+	version, versionErr := primaryPinnedRuntimeVersion(versionCtx, profile)
 	versionCancel()
 	digest, hashErr := hashProviderSessionExecutable(profile.Command)
 	if versionErr != nil || hashErr != nil || !versionMatches(version, profile.RuntimeVersion) || digest != profile.RuntimeSHA256 {
@@ -346,10 +353,7 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 		return errors.New("primary comparison requires shared local capacity admission")
 	}
 	started := time.Now().UTC()
-	policy := sha256StringCLI(primaryComparisonPolicy + "\x00" + transport)
-	if codeModeHostSHA256 != "" {
-		policy = sha256StringCLI(primaryComparisonPolicy + "\x00" + transport + "\x00" + codeModeHostSHA256)
-	}
+	policy := primaryWorkspacePolicySHA(transport, codeModeHostSHA256)
 	if _, err := providerqualification.StorePrimaryComparisonDiagnostics("", transport, id.Hash(), policy, digest, started, started, "before_dispatch", providerqualification.PrimaryComparisonDiagnostic{}); err != nil {
 		return err
 	}
@@ -382,38 +386,14 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	if err != nil {
 		return err
 	}
-	encoded, err := json.Marshal(broker)
-	if err != nil {
-		return err
-	}
-	var descriptor struct {
-		Command string   `json:"command"`
-		Args    []string `json:"args"`
-	}
-	if err = json.Unmarshal(encoded, &descriptor); err != nil {
-		return err
-	}
 	nonce, err := providerDoctorNonce()
 	if err != nil {
 		return err
 	}
 	prompt := providerWorkspaceQualificationPrompt(nonce)
-	var args []string
-	if id.Runtime() == "claude" {
-		args, err = primaryClaudeArguments(workspace.RuntimeHome, id.Model(), prompt, nonce, broker)
-		if err != nil {
-			return err
-		}
-	} else {
-		settings := primaryCodexComparisonSettings(id.Model(), descriptor.Command, descriptor.Args)
-		var b bytes.Buffer
-		if err = toml.NewEncoder(&b).Encode(settings); err != nil {
-			return err
-		}
-		if err = os.WriteFile(filepath.Join(workspace.RuntimeHome, "config.toml"), b.Bytes(), 0600); err != nil {
-			return err
-		}
-		args = []string{"exec", "--json", "--sandbox", "read-only", "--model", id.Model(), prompt}
+	args, err := primaryWorkspaceArguments(workspace.RuntimeHome, id.Model(), id.Runtime(), prompt, nonce, broker)
+	if err != nil {
+		return err
 	}
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -423,6 +403,9 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	}
 	defer closeLedger()
 	if err := claimPrimaryComparisonExperiment(ledger, experimentID, id.Hash(), changeEvidence); err != nil {
+		return err
+	}
+	if err := reserveProviderExperiment(experimentID, id.Hash(), changeEvidence); err != nil {
 		return err
 	}
 	decision, err := acquireProviderGrokQualificationTurn(runCtx, admission, id)
@@ -482,7 +465,7 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	setGrokQualificationCheck(&receipt, providerqualification.CheckIdentity, observation.exactModelVerified(id.Model()), "live", evidence, "exact served model, terminal acknowledgement and successful stream; account binding remains profile-attested")
 	setGrokQualificationCheck(&receipt, providerqualification.CheckWorkspaceEdit, auditErr == nil && assertions.EditObserved && assertions.ReadObserved && edit, "local_authoritative", assertions.EvidenceSHA256, "common broker edit audit and independent readback")
 	setGrokQualificationCheck(&receipt, providerqualification.CheckTestCommand, auditErr == nil && assertions.TestObserved && edit, "local_authoritative", assertions.EvidenceSHA256, "common isolated go-test/go-vet verifier")
-	boundary := id.Runtime() == "claude" && outcome.ProcessStarted && !observation.UnexpectedTool && !observation.Malformed
+	boundary := outcome.ProcessStarted && !observation.UnexpectedTool && !observation.Malformed && (id.Runtime() == "claude" || codeModeHostSHA256 != "")
 	setGrokQualificationCheck(&receipt, providerqualification.CheckSecretDenied, boundary && auditErr == nil && assertions.SecretDenied, "local_authoritative", assertions.EvidenceSHA256, "common protected-path broker rejection with built-in tools disabled")
 	setGrokQualificationCheck(&receipt, providerqualification.CheckPushDenied, boundary, "local_authoritative", broker.BindingSHA256(), "managed CLI disables built-in tools and exposes only the three bounded broker tools")
 	if !boundary {
@@ -522,6 +505,20 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	return &providerQualificationExitError{}
 }
 
+// Hash before invoking even --version: readiness must not execute a replacement
+// binary merely to discover that it no longer matches its profile pin.
+func primaryPinnedRuntimeVersion(ctx context.Context, profile config.ProviderProfileConfig) (string, error) {
+	digest, err := hashProviderSessionExecutable(profile.Command)
+	if err != nil || digest != profile.RuntimeSHA256 {
+		return "", errors.New("primary executable pin mismatch")
+	}
+	version, err := providerRuntimeVersion(ctx, profile.Command)
+	if err != nil || !versionMatches(version, profile.RuntimeVersion) {
+		return "", errors.New("primary runtime version mismatch")
+	}
+	return version, nil
+}
+
 func claimPrimaryComparisonExperiment(ledger providerNativeOperationLedger, experimentID, identity, evidence string) error {
 	if ledger == nil || !validProviderNativeOperationID(experimentID) || !validProviderNativeDigest(identity) || !validProviderNativeDigest(evidence) {
 		return errors.New("comparison experiment binding is incomplete")
@@ -543,12 +540,35 @@ func primaryCodexComparisonSettings(model, command string, args []string) map[st
 	return map[string]any{
 		"model": model, "model_provider": "openai", "approval_policy": "never",
 		"sandbox_mode": "read-only", "check_for_update_on_startup": false,
-		"history":  map[string]any{"persistence": "none"},
-		"features": map[string]any{"shell_tool": false, "multi_agent": false, "apps": false},
+		"web_search": "disabled",
+		"history":    map[string]any{"persistence": "none"},
+		"features":   map[string]any{"shell_tool": false, "multi_agent": false, "apps": false, "plugins": false, "view_image": false, "image_generation": false, "request_permissions_tool": false},
 		"mcp_servers": map[string]any{grok.WorkspaceBrokerMCPName: map[string]any{
 			"command": command, "args": append([]string(nil), args...), "required": true,
 			"default_tools_approval_mode": "approve",
 			"enabled_tools":               []string{"read_file", "write_file", "verify_worktree"},
 		}},
 	}
+}
+
+func primaryWorkspacePolicySHA(transport, companion string) string {
+	if transport == "openai_codex_comparison" {
+		return sha256StringCLI(primaryComparisonPolicy + "\x00" + transport + "\x00codex-controlled-tools-v1\x00" + companion)
+	}
+	return sha256StringCLI(primaryComparisonPolicy + "\x00" + transport)
+}
+
+// Pinned Codex b194851: core/tools/spec_plan.rs registers apply_patch from
+// model metadata regardless of the shell flag. A static catalog takes precedence
+// over remote tool metadata; it is a local restriction, never served-model proof.
+// ServerModel from the terminal event remains mandatory for qualification.
+func writePrimaryCodexToolCatalog(home, model string) (string, error) {
+	entry := map[string]any{"slug": model, "display_name": model, "description": nil, "supported_reasoning_levels": []any{}, "shell_type": "disabled", "visibility": "none", "supported_in_api": false, "priority": 99, "support_verbosity": false, "default_verbosity": nil, "apply_patch_tool_type": nil, "truncation_policy": map[string]any{"mode": "bytes", "limit": 10000}, "experimental_supported_tools": []string{}, "include_apps_usage_instructions": false, "include_skills_usage_instructions": false, "include_plugin_usage_instructions": false, "tool_mode": "code_mode", "multi_agent_version": "disabled"}
+	entry["base_instructions"] = "Complete the user's isolated coding assignment using the available controlled workspace tools. Respect tool denials. Verify changes through verify_worktree before reporting completion. Report failure honestly when a required step cannot be completed."
+	data, err := json.Marshal(map[string]any{"models": []any{entry}})
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(home, "controlled-tool-catalog.json")
+	return path, os.WriteFile(path, data, 0600)
 }

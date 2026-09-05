@@ -175,7 +175,10 @@ func waitForAgentPanes(sessionName string, timeout time.Duration) (tmux.Pane, tm
 			}
 		}
 
-		if claudePane != nil && codexPane != nil {
+		// Titles are assigned before the launch command reaches the shell.
+		// Dispatch correctly refuses a bare shell; wait for the actual fixture
+		// processes rather than treating pane labels as startup evidence.
+		if claudePane != nil && codexPane != nil && !claudePane.AgentCLIDead() && !codexPane.AgentCLIDead() {
 			return *claudePane, *codexPane, nil
 		}
 
@@ -623,10 +626,23 @@ func TestRunReassignment_TargetBusyWithoutForce(t *testing.T) {
 		t.Fatalf("MarkWorking failed: %v", err)
 	}
 
-	// Make the target pane appear busy.
+	// Use the actual in-flight footer; arbitrary echoed text does not revoke
+	// an otherwise valid idle composer.
 	targetPaneID := codexPane.ID
-	_ = tmux.SendKeys(targetPaneID, "busy", true)
-	time.Sleep(200 * time.Millisecond)
+	if err := tmux.SendKeys(targetPaneID, "Working (esc to interrupt)", true); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		output, err := tmux.CapturePaneOutput(targetPaneID, 20)
+		if err == nil && strings.Contains(output, "esc to interrupt") && !statuspkg.DetectIdleFromOutput(output, "cod") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("target never displayed an active Codex turn")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	assignReassign = "bd-126"
 	assignToPane = fmt.Sprintf("%d", codexPane.Index)

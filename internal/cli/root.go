@@ -4400,6 +4400,7 @@ func init() {
 	jsonArgumentRoot = rootCmd
 
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default ~/.config/ntm/config.toml)")
+	rootCmd.PersistentFlags().StringVar(&providerCampaignID, "campaign-id", "", "Explicit campaign budget for managed provider generation")
 
 	// Pre-register cobra's built-in version flag so it gets the -V shorthand
 	// (fleet probes reach for `ntm --version`/`-V` before discovering the

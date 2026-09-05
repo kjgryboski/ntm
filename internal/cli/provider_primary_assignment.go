@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/BurntSushi/toml"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -111,7 +112,11 @@ func primaryAssignmentCompleted(out primaryAssignmentOutput) bool {
 }
 
 func primaryAssignmentEnvelope(out primaryAssignmentOutput, identity provider.Identity, version, cwd string) providerqualification.Receipt {
-	return providerqualification.Receipt{Mode: providerqualification.ModeLive, Provider: identity.Provider(), Transport: "anthropic_claude_comparison", IdentitySHA256: identity.Hash(), PolicySHA256: sha256StringCLI(primaryComparisonPolicy + "\x00anthropic_claude_comparison"), RuntimeVersion: version, RuntimeSHA256: out.RuntimeSHA256, StartedAt: out.StartedAt, CompletedAt: out.CompletedAt, DisposableRepoHash: sha256StringCLI(cwd), Checks: []providerqualification.Check{{Name: "operation_binding", Passed: true, Provenance: "local_authoritative", EvidenceSHA256: primaryAssignmentDigest(out), Detail: "ordinary assignment evidence only; not a qualification"}}}
+	transport := "anthropic_claude_comparison"
+	if identity.Provider() == "openai" {
+		transport = "openai_codex_comparison"
+	}
+	return providerqualification.Receipt{Mode: providerqualification.ModeLive, Provider: identity.Provider(), Transport: transport, IdentitySHA256: identity.Hash(), PolicySHA256: sha256StringCLI(primaryComparisonPolicy + "\x00" + transport), RuntimeVersion: version, RuntimeSHA256: out.RuntimeSHA256, StartedAt: out.StartedAt, CompletedAt: out.CompletedAt, DisposableRepoHash: sha256StringCLI(cwd), Checks: []providerqualification.Check{{Name: "operation_binding", Passed: true, Provenance: "local_authoritative", EvidenceSHA256: primaryAssignmentDigest(out), Detail: "ordinary assignment evidence only; not a qualification"}}}
 }
 
 func validPrimaryAssignment(out primaryAssignmentOutput, row *state.SendOperation, identity provider.Identity, trusted providerattestation.KeyMetadata) bool {
@@ -151,6 +156,40 @@ func primaryClaudeArguments(home, model, prompt, nonce string, descriptor *grok.
 
 func primaryClaudeCompletionInstruction(nonce string) string {
 	return "This is a controller-managed coding assignment. Use only the controlled workspace tools. After the final edit, verify_worktree must succeed. If verification fails, report failure and do not emit the nonce. On success your final response must contain exactly the completion nonce on the next line, with no explanation, formatting, or other text:\n" + nonce
+}
+
+func primaryWorkspaceArguments(home, model, runtime, prompt, nonce string, descriptor *grok.WorkspaceBrokerDescriptor) ([]string, error) {
+	if runtime == "claude" {
+		return primaryClaudeArguments(home, model, prompt, nonce, descriptor)
+	}
+	if runtime != "codex" {
+		return nil, errors.New("unsupported primary runtime")
+	}
+	encoded, err := json.Marshal(descriptor)
+	if err != nil {
+		return nil, err
+	}
+	var broker struct {
+		Command string
+		Args    []string
+	}
+	if err = json.Unmarshal(encoded, &broker); err != nil {
+		return nil, err
+	}
+	settings := primaryCodexComparisonSettings(model, broker.Command, broker.Args)
+	path, err := writePrimaryCodexToolCatalog(home, model)
+	if err != nil {
+		return nil, err
+	}
+	settings["model_catalog_json"] = path
+	var b bytes.Buffer
+	if err = toml.NewEncoder(&b).Encode(settings); err != nil {
+		return nil, err
+	}
+	if err = os.WriteFile(filepath.Join(home, "config.toml"), b.Bytes(), 0600); err != nil {
+		return nil, err
+	}
+	return []string{"exec", "--json", "--sandbox", "read-only", "--model", model, prompt}, nil
 }
 
 func copyPrimaryCredential(profile config.ProviderProfileConfig, destination string) error {
@@ -222,8 +261,8 @@ func runPrimaryAssignment(cmd *cobra.Command, request providerAssignmentRequest,
 	if err != nil {
 		return err
 	}
-	if transport != "anthropic_claude_comparison" || runtime.GOOS != "linux" || request.ParentSession != "" || request.Timeout > 5*time.Minute {
-		return errors.New("primary assignment currently supports bounded native Claude workspace work and guarded restart; resume is unsupported")
+	if runtime.GOOS != "linux" || request.ParentSession != "" || request.Timeout > 5*time.Minute {
+		return errors.New("primary assignment requires bounded native workspace work; resume is unsupported")
 	}
 	ctx, cancel := context.WithTimeout(providerCommandContext(cmd), request.Timeout)
 	defer cancel()
@@ -243,7 +282,17 @@ func runPrimaryAssignment(cmd *cobra.Command, request providerAssignmentRequest,
 	if err != nil {
 		return err
 	}
-	policy := sha256StringCLI(primaryComparisonPolicy + "\x00" + transport)
+	companion := ""
+	if id.Runtime() == "codex" {
+		companion, err = hashProviderSessionExecutable(filepath.Join(filepath.Dir(profile.Command), "codex-code-mode-host"))
+		if err != nil {
+			return err
+		}
+		if _, err = primaryCodexCompanionDigest(profile.Command, companion); err != nil {
+			return err
+		}
+	}
+	policy := primaryWorkspacePolicySHA(transport, companion)
 	if _, err = authorizeProviderOperation(providerOperationAuthorization{Identity: id, Transport: transport, PolicySHA256: policy, RuntimeVersion: version, RuntimeSHA256: digest, Operation: providerOperationWorkspaceWrite, MaxQualificationAge: 24 * time.Hour, TrustedSigner: preflight.KeyMetadata}); err != nil {
 		return err
 	}
@@ -298,7 +347,7 @@ func runPrimaryAssignment(cmd *cobra.Command, request providerAssignmentRequest,
 		return err
 	}
 	prompt := request.Prompt + "\nUse only the ntm-controlled-workspace tools. Finish with verify_worktree after your final write. On successful verification reply with exactly: " + nonce
-	args, err := primaryClaudeArguments(home, id.Model(), prompt, nonce, broker)
+	args, err := primaryWorkspaceArguments(home, id.Model(), id.Runtime(), prompt, nonce, broker)
 	if err != nil {
 		return err
 	}
@@ -320,17 +369,20 @@ func runPrimaryAssignment(cmd *cobra.Command, request providerAssignmentRequest,
 	if admission.CapacityStatus().Scope != provider.CapacityControlScopeLocalShared {
 		return errors.New("shared local capacity is unavailable")
 	}
+	if err := reserveProviderExperiment(request.OperationID, id.Hash(), binding); err != nil {
+		return err
+	}
 	decision, err := acquireProviderGrokQualificationTurn(ctx, admission, id)
 	if err != nil {
 		return err
 	}
-	result, runErr := (providerqualification.LocalRunner{}).Run(ctx, providerqualification.Invocation{Binary: profile.Command, Args: args, Dir: cwd, Env: primaryComparisonEnvironment(home, "claude"), OutputLimit: 8 << 20})
+	result, runErr := (providerqualification.LocalRunner{}).Run(ctx, providerqualification.Invocation{Binary: profile.Command, Args: args, Dir: cwd, Env: primaryComparisonEnvironment(home, id.Runtime()), OutputLimit: 8 << 20})
 	capacity := admission.ReleaseObserved(id, decision)
 	capacityErr := provider.ObserveCapacityRelease(ctx, capacity)
 	scanner := bufio.NewScanner(bytes.NewReader(result.Stdout))
 	scanner.Buffer(make([]byte, 4096), 2<<20)
 	for scanner.Scan() {
-		out.Observation.observe(scanner.Bytes(), "claude", nonce)
+		out.Observation.observe(scanner.Bytes(), id.Runtime(), nonce)
 	}
 	out.Observation.Malformed = out.Observation.Malformed || scanner.Err() != nil || result.OutputTruncated
 	if scanner.Err() != nil || result.OutputTruncated {

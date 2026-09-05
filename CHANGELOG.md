@@ -15,6 +15,33 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
 
 ### Security
 
+- **Qualified Codex joins the ordinary shared provider controls.** The pinned
+  runtime loads a restricted tool catalog so model metadata cannot re-enable
+  file patching independently of the shell flag. Offline checks load the actual
+  configuration in that executable. Successful terminal events, exact served
+  model, independent verification and cleanup are required for completion;
+  stale verification, later edits and duplicate terminal events are rejected.
+
+- **Shared workspace completion requires independent proof.** Grok and Z.ai
+  ordinary controls supplement their signed runtime receipts with a separately
+  signed controller verification after cleanup. Redacted observations survive
+  signing failure. Historical runtime completion remains visible separately
+  from workspace verification; neither grants qualification by itself.
+
+- **Provider experiment budgets survive configuration changes and crashes.**
+  Explicit campaigns reserve immutable attempts in a common local ledger.
+  Concurrent dispatch cannot exceed the ceiling, and replay never refunds it.
+  Increasing a ceiling requires its current value and new authorization evidence.
+  Primary comparisons, shared assignments, Grok qualification and Codex runtime
+  dispatch use the campaign boundary.
+
+- **Primary profiles and operation histories can move into normal controls.**
+  `provider migrate` previews exact identities, copies signed bytes and unknown
+  rows unchanged, rejects collisions and backs up configuration before activation.
+  `provider readiness` checks runtime pins, credential availability/freshness and
+  qualification expiry. Controller tests now include an actual forced process
+  kill; reassignment fixtures expose the prompts required by production guards.
+
 - **Primary provider comparisons check executable tool prerequisites before
   dispatch.** Standalone Codex comparisons require a pinned code-mode companion;
   safe warning categories and MCP counters survive failed runs. Durable

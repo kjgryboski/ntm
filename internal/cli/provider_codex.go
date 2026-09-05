@@ -114,7 +114,7 @@ type providerCodexRunDependencies struct {
 var providerCodexRunDeps = providerCodexRunDependencies{
 	loadConfig:         loadSelectedConfigOrDefault,
 	attest:             zai.AttestCodexManifest,
-	run:                zai.RunCodexStructured,
+	run:                runBudgetedCodexStructured,
 	newNonce:           providerCodexNonce,
 	isLinkedWorktree:   providerIsLinkedGitWorktree,
 	pinnedSigner:       providerCodexPinnedSigner,

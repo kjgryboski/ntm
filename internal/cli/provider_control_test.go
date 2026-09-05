@@ -12,8 +12,68 @@ import (
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
+	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 )
+
+func TestProviderWorkspaceCompletionBindsRuntimeReceiptAndRejectsUnsignedOrStaleProof(t *testing.T) {
+	id, err := provider.NewIdentity("xai", "fixture", "grok-4.6", "https://api.x.ai/v1", "grok", strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit := providerGrokWorkspaceAuditForTest("/tmp/linked", strings.Repeat("a", 40))
+	verification := *audit.Events[3].VerificationReceipt
+	terminalAt := verification.StartedAt.Add(-time.Second)
+	row := &state.SendOperation{BindingHash: strings.Repeat("b", 64), OutcomeJSON: `{"runtime":"signed-fixture"}`, CompletedAt: &terminalAt}
+	out := providerWorkspaceCompletion{IdentitySHA256: id.Hash(), OperationBindingSHA256: row.BindingHash, RuntimeReceiptSHA256: sha256StringCLI(row.OutcomeJSON), Verification: verification, Verified: true, ObservedAt: verification.CompletedAt}
+	envelope := providerqualification.Receipt{Mode: providerqualification.ModeLive, Provider: "xai", Transport: "xai_acp", IdentitySHA256: id.Hash(), PolicySHA256: strings.Repeat("c", 64), RuntimeVersion: "1.0.13", RuntimeSHA256: strings.Repeat("d", 64), StartedAt: verification.StartedAt, CompletedAt: out.ObservedAt, DisposableRepoHash: verification.WorktreeSHA256, Checks: []providerqualification.Check{{Name: "operation_binding", Passed: true, Provenance: "local_authoritative", EvidenceSHA256: providerWorkspaceCompletionDigest(out), Detail: "ordinary operation fixture"}}}
+	if err = envelope.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if err = signProviderQualificationReceiptWith(t.Context(), &envelope, newProviderNativeTestSigner()); err != nil {
+		t.Fatal(err)
+	}
+	out.Envelope = &envelope
+	trusted := envelope.Attestation.KeyMetadata
+	if !validProviderWorkspaceCompletion(&out, row, id, trusted) {
+		t.Fatal("valid independent completion rejected")
+	}
+	for _, mutation := range []func(*providerWorkspaceCompletion){
+		func(o *providerWorkspaceCompletion) { o.Envelope = nil },
+		func(o *providerWorkspaceCompletion) { o.RuntimeReceiptSHA256 = strings.Repeat("e", 64) },
+		func(o *providerWorkspaceCompletion) { o.Verification.StartedAt = terminalAt.Add(-time.Hour) },
+		func(o *providerWorkspaceCompletion) { o.IdentitySHA256 = strings.Repeat("e", 64) },
+	} {
+		changed := out
+		mutation(&changed)
+		if validProviderWorkspaceCompletion(&changed, row, id, trusted) {
+			t.Fatal("unsigned, stale, or mismatched verification accepted")
+		}
+	}
+	changedRow := *row
+	changedRow.OutcomeJSON = `{"runtime":"later-completion"}`
+	if validProviderWorkspaceCompletion(&out, &changedRow, id, trusted) {
+		t.Fatal("verification reused across runtime receipts")
+	}
+}
+
+func TestProviderWorkspaceStatusDoesNotPromoteFailedAdapterWithPositiveRuntimeEvidence(t *testing.T) {
+	out := providerAssignmentStatus{State: "completed", IdentityBindingVerified: true, RuntimeCompletionConfirmed: true, LocalCleanupVerified: true, WorkspaceVerified: true}
+	if !providerWorkspaceStatusCompleted(out) {
+		t.Fatal("complete independent evidence rejected")
+	}
+	for _, state := range []string{"failed", "outcome_unknown", "cancelled_local"} {
+		changed := out
+		changed.State = state
+		if providerWorkspaceStatusCompleted(changed) {
+			t.Fatalf("%s adapter outcome promoted by positive runtime evidence", state)
+		}
+	}
+	out.WorkspaceVerified = false
+	if providerWorkspaceStatusCompleted(out) || !out.RuntimeCompletionConfirmed {
+		t.Fatal("workspace failure either promoted or erased runtime evidence")
+	}
+}
 
 func TestProviderControlCrossConnectionCancellationAndCapacity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
@@ -130,7 +190,7 @@ func TestProviderRestartRequiresTerminalCleanupAndCapacityEvidence(t *testing.T)
 }
 
 func TestProviderControllerExitCannotReplayUnknownAssignment(t *testing.T) {
-	for _, phase := range []string{"reservation", "dispatch", "signing", "receipt"} {
+	for _, phase := range []string{"reservation", "dispatch", "signing", "receipt", "killed"} {
 		t.Run(phase, func(t *testing.T) { testProviderControllerExitPhase(t, phase) })
 	}
 }
@@ -141,7 +201,29 @@ func testProviderControllerExitPhase(t *testing.T, phase string) {
 	defer cancel()
 	child := exec.CommandContext(childCtx, os.Args[0], "-test.run=^TestProviderControllerExitHelper$")
 	child.Env = append(os.Environ(), "NTM_PROVIDER_CONTROLLER_EXIT_HELPER="+root, "NTM_PROVIDER_CONTROLLER_EXIT_PHASE="+phase)
-	if output, err := child.CombinedOutput(); err != nil {
+	if phase == "killed" {
+		if err := child.Start(); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, err := os.Stat(filepath.Join(root, "ready-to-kill")); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				_ = child.Process.Kill()
+				_ = child.Wait()
+				t.Fatal("controller never reached dispatch")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err := child.Process.Kill(); err != nil {
+			t.Fatal(err)
+		}
+		if child.Wait() == nil {
+			t.Fatal("controller did not crash")
+		}
+	} else if output, err := child.CombinedOutput(); err != nil {
 		t.Fatalf("controller helper: %v %s", err, output)
 	}
 	ledger, err := state.Open(filepath.Join(root, "state.db"))
@@ -193,6 +275,12 @@ func TestProviderControllerExitHelper(t *testing.T) {
 	}
 	if _, _, err = ledger.ClaimSendOperation(&state.SendOperation{OperationID: request.OperationID, SessionName: providerAssignmentScope(identity), BindingHash: "uncertain-adapter-binding"}); err != nil {
 		t.Fatal(err)
+	}
+	if phase == "killed" {
+		if err = os.WriteFile(filepath.Join(root, "ready-to-kill"), []byte("dispatch claimed; no terminal receipt"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		select {}
 	}
 	if phase == "signing" || phase == "receipt" {
 		payload := []byte(`{"offline_crash_fixture":true}`)

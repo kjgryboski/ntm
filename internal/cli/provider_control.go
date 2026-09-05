@@ -9,8 +9,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
+	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
+	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
+	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/spf13/cobra"
 )
@@ -24,6 +28,103 @@ type providerControlOutcome struct {
 	CancelObserved         bool                                 `json:"cancel_observed"`
 	RestartOfSHA256        string                               `json:"restart_of_sha256,omitempty"`
 	Capacity               *provider.CapacityReleaseObservation `json:"capacity,omitempty"`
+	WorkspaceCompletion    *providerWorkspaceCompletion         `json:"workspace_completion,omitempty"`
+}
+
+// Independent verification supplements an exact signed runtime receipt. It
+// cannot establish remote termination, served model identity or qualification.
+type providerWorkspaceCompletion struct {
+	IdentitySHA256         string                         `json:"identity_sha256"`
+	OperationBindingSHA256 string                         `json:"operation_binding_sha256"`
+	RuntimeReceiptSHA256   string                         `json:"runtime_receipt_sha256"`
+	Verification           provider.VerificationReceipt   `json:"verification"`
+	Verified               bool                           `json:"verified"`
+	ObservedAt             time.Time                      `json:"observed_at"`
+	Envelope               *providerqualification.Receipt `json:"attestation_envelope,omitempty"`
+}
+
+func providerWorkspaceCompletionDigest(out providerWorkspaceCompletion) string {
+	out.Envelope = nil
+	return digestSafeJSON(out)
+}
+
+func validProviderWorkspaceCompletion(out *providerWorkspaceCompletion, row *state.SendOperation, identity provider.Identity, trusted providerattestation.KeyMetadata) bool {
+	if out == nil || row == nil || !out.Verified || out.IdentitySHA256 != identity.Hash() || out.OperationBindingSHA256 != row.BindingHash || out.RuntimeReceiptSHA256 != sha256StringCLI(row.OutcomeJSON) || out.Envelope == nil || out.Envelope.Passed || out.Envelope.Validate() != nil || out.Envelope.IdentitySHA256 != identity.Hash() || out.Envelope.Attestation == nil || out.Envelope.Attestation.KeyMetadata != trusted || len(out.Envelope.Checks) != 1 {
+		return false
+	}
+	check := out.Envelope.Checks[0]
+	v := &out.Verification
+	if row.CompletedAt == nil || v.StartedAt.Before(*row.CompletedAt) || v.WorktreeSHA256 != out.Envelope.DisposableRepoHash {
+		return false
+	}
+	return check.Name == "operation_binding" && check.EvidenceSHA256 == providerWorkspaceCompletionDigest(*out) && providerqualification.AuthoritativePassedCheck(check) && validProviderGrokVerificationReceipt(v, v.WorktreeSHA256, v.RevisionSHA256, v.ManifestSHA256, out.ObservedAt, out.Envelope.StartedAt, out.Envelope.CompletedAt)
+}
+
+func verifyProviderWorkspaceCompletion(ctx context.Context, request providerAssignmentRequest, profile config.ProviderProfileConfig, identity provider.Identity, row *state.SendOperation, ledger providerNativeOperationLedger) (*providerWorkspaceCompletion, error) {
+	if row == nil || row.Status != state.SendOperationCompleted {
+		return nil, nil
+	}
+	sign, err := providerProfilePinnedSigner(profile)
+	if err != nil {
+		return nil, err
+	}
+	trusted, err := preflightProviderReceiptSignerMetadataFor(ctx, sign, identity.Provider() == "xai")
+	if err != nil {
+		return nil, err
+	}
+	terminal := false
+	transport := "xai_acp"
+	if identity.Provider() == "xai" {
+		var receipt robot.GrokACPOperationOutput
+		if json.Unmarshal([]byte(row.OutcomeJSON), &receipt) == nil && robot.ValidGrokACPOperationSignature(receipt, trusted.KeyMetadata) && receipt.ProviderIdentitySHA256 == identity.Hash() && receipt.BindingSHA256 == row.BindingHash {
+			terminal = receipt.State == grok.StateCompleted && receipt.CompletionConfirmed && receipt.AcknowledgementVerified && receipt.RuntimeEventContract.Passed && receipt.Model == identity.Model() && receipt.ResolvedModel != "" && receipt.ResolvedModel == grok.ExpectedResolvedModel(profile.RuntimeVersion, identity.Model()) && receipt.Cleanup.Reaped && !receipt.Cleanup.ObservedAt.IsZero() && receipt.Cleanup.ResidualPIDs != nil && len(receipt.Cleanup.ResidualPIDs) == 0
+		}
+	} else {
+		transport = "zai_codex_runtime"
+		var receipt providerCodexRunOutput
+		terminal = json.Unmarshal([]byte(row.OutcomeJSON), &receipt) == nil && validProviderCodexStatusReceipt(receipt, row, request.Profile, identity, trusted.KeyMetadata) && receipt.State == "completed" && receipt.Receipt.RuntimeEventContract.Passed && receipt.Receipt.ResolvedModel == identity.Model() && receipt.Receipt.CompletionConfirmed && receipt.Receipt.NonceVerified && providerCodexReceiptHasNoResiduals(receipt.Receipt)
+	}
+	if !terminal {
+		return nil, nil
+	}
+	verifier, err := providerVerifyDeps.newVerifier()
+	if err != nil {
+		return nil, err
+	}
+	started := time.Now().UTC()
+	verification, verifyErr := verifier.Verify(ctx, provider.VerificationManifest{Worktree: request.CWD, Revision: request.BaseRevision, CommandIDs: []string{"go-test", "go-vet"}})
+	out := &providerWorkspaceCompletion{IdentitySHA256: identity.Hash(), OperationBindingSHA256: row.BindingHash, RuntimeReceiptSHA256: sha256StringCLI(row.OutcomeJSON), Verification: verification, ObservedAt: time.Now().UTC()}
+	out.Verified = verifyErr == nil && validProviderGrokVerificationReceipt(&verification, sha256StringCLI(request.CWD), sha256StringCLI(request.BaseRevision), sha256StringCLI(request.CWD+"\x00"+request.BaseRevision+"\x00go-test\x00go-vet"), out.ObservedAt, started, out.ObservedAt)
+	// Save redacted observations before signing. Unsigned observations cannot
+	// make the parent control record report workspace completion.
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		return out, err
+	}
+	const scope = "provider:workspace-verification-observation"
+	_, won, err := ledger.ClaimSendOperation(&state.SendOperation{OperationID: request.OperationID, SessionName: scope, BindingHash: row.BindingHash, PayloadSHA256: identity.Hash(), CreatedAt: started})
+	if err != nil || !won {
+		return out, errors.New("workspace verification observation could not be claimed")
+	}
+	if err = ledger.CompleteSendOperation(request.OperationID, scope, string(encoded), out.ObservedAt); err != nil {
+		return out, err
+	}
+	runtimeHash, err := hashProviderSessionExecutable(profile.Command)
+	if err != nil {
+		return out, err
+	}
+	envelope := providerqualification.Receipt{Mode: providerqualification.ModeLive, Provider: identity.Provider(), Transport: transport, IdentitySHA256: identity.Hash(), PolicySHA256: sha256StringCLI("shared-workspace-completion-v1"), RuntimeVersion: profile.RuntimeVersion, RuntimeSHA256: runtimeHash, StartedAt: started, CompletedAt: out.ObservedAt, DisposableRepoHash: sha256StringCLI(request.CWD), Checks: []providerqualification.Check{{Name: "operation_binding", Passed: true, Provenance: "local_authoritative", EvidenceSHA256: providerWorkspaceCompletionDigest(*out), Detail: "independent ordinary workspace verification; not a qualification"}}}
+	if err = envelope.Finalize(); err != nil {
+		return out, err
+	}
+	if err = signProviderQualificationReceiptWith(ctx, &envelope, sign); err != nil {
+		return out, err
+	}
+	out.Envelope = &envelope
+	if !validProviderWorkspaceCompletion(out, row, identity, trusted.KeyMetadata) {
+		return out, errors.New("workspace completion could not be verified")
+	}
+	return out, nil
 }
 
 func providerAssignmentScope(identity provider.Identity) string {
@@ -32,7 +133,7 @@ func providerAssignmentScope(identity provider.Identity) string {
 		return "provider:xai-acp"
 	case identity.Provider() == "zai" && identity.Runtime() == "codex":
 		return providerCodexOperationScope
-	case identity.Provider() == "anthropic" && identity.Runtime() == "claude":
+	case (identity.Provider() == "anthropic" && identity.Runtime() == "claude") || (identity.Provider() == "openai" && identity.Runtime() == "codex"):
 		return primaryAssignmentScope
 	default:
 		return ""
@@ -130,11 +231,17 @@ func beginProviderControl(ctx context.Context, ledger providerNativeOperationLed
 		if original != nil {
 			outcome.OperationBindingSHA256 = original.BindingHash
 		}
+		var verificationErr error
+		if request.VerificationProfile != nil {
+			verifyCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), 90*time.Second)
+			outcome.WorkspaceCompletion, verificationErr = verifyProviderWorkspaceCompletion(verifyCtx, request, *request.VerificationProfile, identity, original, ledger)
+			stop()
+		}
 		encoded, err := json.Marshal(outcome)
 		if err != nil {
 			return err
 		}
-		return errors.Join(watchErr, ledger.CompleteSendOperation(request.OperationID, providerControlScope, string(encoded), time.Now().UTC()))
+		return errors.Join(watchErr, verificationErr, ledger.CompleteSendOperation(request.OperationID, providerControlScope, string(encoded), time.Now().UTC()))
 	}
 	return runCtx, finish, nil
 }
@@ -195,7 +302,7 @@ func providerRestartAllowed(status providerAssignmentStatus) bool {
 	c := status.CapacityObservation
 	cancelled := (status.Provider == "xai" && status.State == grok.StateCancelled) ||
 		(status.Provider == "zai" && status.State == "cancelled") ||
-		(status.Provider == "anthropic" && status.State == "cancelled_local")
+		((status.Provider == "anthropic" || status.Provider == "openai") && status.State == "cancelled_local")
 	return status.IdentityBindingVerified && status.LocalCleanupVerified &&
 		(status.CompletionConfirmed || cancelled) &&
 		c != nil && c.IdentitySHA256 == status.IdentitySHA256 && c.Scope == provider.CapacityControlScopeLocalShared &&

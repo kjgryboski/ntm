@@ -34,6 +34,8 @@ type providerAssignmentRequest struct {
 	ParentSession                     string
 	RestartOf                         string
 	Timeout                           time.Duration
+	BaseRevision                      string
+	VerificationProfile               *config.ProviderProfileConfig
 }
 
 // Existing assignment and send controls share this selection boundary. The
@@ -42,22 +44,24 @@ type providerAssignmentRequest struct {
 var dispatchProviderAssignment = runProviderAssignment
 
 type providerAssignmentStatus struct {
-	Schema                  string                               `json:"schema_version"`
-	Profile                 string                               `json:"profile"`
-	Provider                string                               `json:"provider"`
-	Runtime                 string                               `json:"runtime"`
-	AccountSHA256           string                               `json:"account_sha256"`
-	IdentitySHA256          string                               `json:"identity_sha256"`
-	BillingClass            string                               `json:"billing_class"`
-	RequestedModel          string                               `json:"requested_model"`
-	ServedModel             string                               `json:"served_model,omitempty"`
-	State                   string                               `json:"state"`
-	IdentityBindingVerified bool                                 `json:"identity_binding_verified"`
-	CompletionConfirmed     bool                                 `json:"completion_confirmed"`
-	LocalCleanupVerified    bool                                 `json:"local_cleanup_verified"`
-	RemoteTermination       string                               `json:"remote_generation_termination"`
-	CapacityObservation     *provider.CapacityReleaseObservation `json:"local_controller_capacity_observation,omitempty"`
-	CancellationObserved    bool                                 `json:"local_cancellation_observed"`
+	Schema                     string                               `json:"schema_version"`
+	Profile                    string                               `json:"profile"`
+	Provider                   string                               `json:"provider"`
+	Runtime                    string                               `json:"runtime"`
+	AccountSHA256              string                               `json:"account_sha256"`
+	IdentitySHA256             string                               `json:"identity_sha256"`
+	BillingClass               string                               `json:"billing_class"`
+	RequestedModel             string                               `json:"requested_model"`
+	ServedModel                string                               `json:"served_model,omitempty"`
+	State                      string                               `json:"state"`
+	IdentityBindingVerified    bool                                 `json:"identity_binding_verified"`
+	CompletionConfirmed        bool                                 `json:"completion_confirmed"`
+	RuntimeCompletionConfirmed bool                                 `json:"runtime_completion_confirmed"`
+	WorkspaceVerified          bool                                 `json:"workspace_verified"`
+	LocalCleanupVerified       bool                                 `json:"local_cleanup_verified"`
+	RemoteTermination          string                               `json:"remote_generation_termination"`
+	CapacityObservation        *provider.CapacityReleaseObservation `json:"local_controller_capacity_observation,omitempty"`
+	CancellationObserved       bool                                 `json:"local_cancellation_observed"`
 }
 
 var inspectProviderAssignment = runProviderAssignmentStatus
@@ -100,7 +104,7 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 		scope = "provider:xai-acp"
 	case identity.Provider() == "zai" && identity.Runtime() == "codex":
 		scope = providerCodexOperationScope
-	case identity.Provider() == "anthropic" && identity.Runtime() == "claude":
+	case (identity.Provider() == "anthropic" && identity.Runtime() == "claude") || (identity.Provider() == "openai" && identity.Runtime() == "codex"):
 		scope = primaryAssignmentScope
 	default:
 		return errors.New("selected provider has no structured assignment status adapter")
@@ -118,6 +122,7 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 		return errors.New("provider assignment was not found")
 	}
 	out := providerAssignmentStatus{Schema: "ntm.provider-assignment-status.v1", Profile: profileName, Provider: identity.Provider(), Runtime: identity.Runtime(), AccountSHA256: sha256StringCLI(identity.AccountAlias()), IdentitySHA256: identity.Hash(), BillingClass: identity.BillingClass(), RequestedModel: identity.Model(), State: "outcome_unknown", RemoteTermination: "unverified"}
+	var trustedKey providerattestation.KeyMetadata
 	if row.Status == state.SendOperationCompleted {
 		sign, err := providerProfilePinnedSigner(profile)
 		if err != nil {
@@ -130,6 +135,7 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 			return err
 		}
 		if identity.Provider() == "xai" {
+			trustedKey = trusted.KeyMetadata
 			receipt, err := robot.GetGrokACPOperationReceipt(operationID, ledger)
 			if err != nil {
 				return err
@@ -140,15 +146,18 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 			out.State, out.ServedModel = receipt.State, receipt.ResolvedModel
 			out.CompletionConfirmed = receipt.CompletionConfirmed && receipt.AcknowledgementVerified
 			out.LocalCleanupVerified = receipt.Cleanup.Reaped && receipt.Cleanup.ResidualPIDs != nil && len(receipt.Cleanup.ResidualPIDs) == 0 && !receipt.Cleanup.ObservedAt.IsZero()
-		} else if identity.Provider() == "anthropic" {
+		} else if identity.Provider() == "anthropic" || identity.Provider() == "openai" {
 			var receipt primaryAssignmentOutput
 			if json.Unmarshal([]byte(row.OutcomeJSON), &receipt) != nil || !validPrimaryAssignment(receipt, row, identity, trusted.KeyMetadata) {
 				return errors.New("primary assignment signature or operation binding is invalid")
 			}
 			out.State, out.ServedModel = receipt.State, receipt.Observation.ServedModel
 			out.CompletionConfirmed = receipt.State == "completed" && primaryAssignmentCompleted(receipt)
+			out.RuntimeCompletionConfirmed = receipt.Observation.terminalModelVerified(identity.Model())
+			out.WorkspaceVerified = receipt.WorkspaceVerified
 			out.LocalCleanupVerified = receipt.CleanupVerified
 		} else {
+			trustedKey = trusted.KeyMetadata
 			var receipt providerCodexRunOutput
 			if json.Unmarshal([]byte(row.OutcomeJSON), &receipt) != nil || !validProviderCodexStatusReceipt(receipt, row, profileName, identity, trusted.KeyMetadata) {
 				return errors.New("provider assignment identity, signature, or operation binding is invalid")
@@ -158,6 +167,9 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 			out.LocalCleanupVerified = providerCodexReceiptHasNoResiduals(receipt.Receipt)
 		}
 		out.IdentityBindingVerified = true
+	}
+	if scope != primaryAssignmentScope {
+		out.RuntimeCompletionConfirmed = out.CompletionConfirmed
 	}
 	control, err := ledger.GetSendOperation(operationID, providerControlScope)
 	if err != nil {
@@ -169,11 +181,22 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 			return errors.New("provider control observation binding is invalid")
 		}
 		out.CancellationObserved = observation.CancelObserved
+		if identity.Provider() == "xai" || identity.Provider() == "zai" {
+			out.WorkspaceVerified = validProviderWorkspaceCompletion(observation.WorkspaceCompletion, row, identity, trustedKey)
+		}
 		if observation.Capacity != nil && observation.Capacity.IdentitySHA256 == identity.Hash() {
 			out.CapacityObservation = observation.Capacity
 		}
 	}
+	out.CompletionConfirmed = providerWorkspaceStatusCompleted(out)
+	if out.State == "completed" && out.RuntimeCompletionConfirmed && !out.WorkspaceVerified {
+		out.State = "runtime_completed_workspace_unverified"
+	}
 	return visit(out)
+}
+
+func providerWorkspaceStatusCompleted(out providerAssignmentStatus) bool {
+	return out.State == "completed" && out.IdentityBindingVerified && out.RuntimeCompletionConfirmed && out.LocalCleanupVerified && out.WorkspaceVerified
 }
 
 func validProviderCodexStatusReceipt(receipt providerCodexRunOutput, row *state.SendOperation, profile string, identity provider.Identity, trusted providerattestation.KeyMetadata) bool {
@@ -185,7 +208,7 @@ func validProviderCodexStatusReceipt(receipt providerCodexRunOutput, row *state.
 }
 
 func validateProviderControlFlags(cmd *cobra.Command, allowed ...string) error {
-	accept := map[string]bool{"json": true, "config": true, "help": true}
+	accept := map[string]bool{"json": true, "config": true, "help": true, "campaign-id": true}
 	for _, name := range allowed {
 		accept[name] = true
 	}
@@ -214,6 +237,17 @@ func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest
 	if err != nil {
 		return err
 	}
+	if identity.Provider() == "xai" || identity.Provider() == "zai" {
+		request.CWD, err = filepath.Abs(request.CWD)
+		if err != nil {
+			return err
+		}
+		request.BaseRevision, err = providerGrokQualificationGit(providerCommandContext(cmd), request.CWD, "rev-parse", "--verify", "HEAD")
+		if err != nil {
+			return err
+		}
+		request.VerificationProfile = &profile
+	}
 	previousContext := cmd.Context()
 	ctx, stop := signal.NotifyContext(providerCommandContext(cmd), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -230,7 +264,7 @@ func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest
 	cmd.SetContext(ctx)
 	defer cmd.SetContext(previousContext)
 	switch {
-	case identity.Provider() == "anthropic" && identity.Runtime() == "claude":
+	case (identity.Provider() == "anthropic" && identity.Runtime() == "claude") || (identity.Provider() == "openai" && identity.Runtime() == "codex"):
 		return runPrimaryAssignment(cmd, request, profile, ledger)
 	case identity.Provider() == "zai" && identity.Runtime() == "codex":
 		return runProviderCodex(cmd, providerCodexRunOptions{profile: request.Profile, operationID: request.OperationID, prompt: request.Prompt, cwd: request.CWD, parentSession: request.ParentSession, timeout: request.Timeout, live: true, workspaceWrite: true, workloadClass: providerCodexWorkloadImplementation}, providerCodexRunDeps)
@@ -249,6 +283,9 @@ func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest
 			return err
 		}
 		opts.Prompt, opts.OperationID = request.Prompt, request.OperationID
+		if err := reserveProviderExperiment(request.OperationID, identity.Hash(), sha256StringCLI(request.Prompt)); err != nil {
+			return err
+		}
 		output, runErr := robot.ExecuteGrokACPOperationAuthorized(ctx, opts, authorizer)
 		if output == nil {
 			return errors.New("Grok assignment returned no receipt")

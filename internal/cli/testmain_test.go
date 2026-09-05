@@ -12,8 +12,10 @@ import (
 )
 
 const (
-	testAgentCatCommandTemplate    = `{{if .Model}}: {{shellQuote .Model}} >/dev/null && {{end}}/bin/cat`
-	testAgentBinCatCommandTemplate = `{{if .Model}}: {{shellQuote .Model}} >/dev/null && {{end}}/bin/cat`
+	// These fixtures accept input like a TUI. Expose both supported composers
+	// so production delivery guards can observe readiness without being bypassed.
+	testAgentCatCommandTemplate    = `{{if .Model}}: {{shellQuote .Model}} >/dev/null && {{end}}printf '\n› \n❯ \n'; /bin/cat`
+	testAgentBinCatCommandTemplate = testAgentCatCommandTemplate
 )
 
 func newTmuxIntegrationTestConfig(projectsBase string) *config.Config {

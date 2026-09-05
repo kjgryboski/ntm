@@ -72,7 +72,7 @@ var providerCodexQualificationDeps = providerCodexQualificationDependencies{
 		return zai.CodexCredentialStatus(ctx, profile.CredentialBridgeCommand, profile.CredentialBridgeCommandSHA256, profile.BrokerCredentialID)
 	},
 	pinnedSigner: providerCodexPinnedSigner,
-	run:          zai.RunCodexStructured, newNonce: providerCodexNonce,
+	run:          runBudgetedCodexStructured, newNonce: providerCodexNonce,
 	prepare: prepareProviderCodexQualificationWorkspace, cleanup: cleanupProviderCodexQualificationWorkspace,
 	verifier: providerqualification.BubblewrapVerifier{}, store: providerqualification.Store,
 	storePreflight: func(receipt providerqualification.Receipt) (string, error) {

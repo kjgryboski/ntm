@@ -440,7 +440,7 @@ func newProviderCmd() *cobra.Command {
 		Short: "Inspect and qualify exact AI provider lanes",
 	}
 	cmd.AddCommand(newProviderDoctorCmd(), newProviderBaselineCmd(), newProviderQualifyCmd(), newProviderSessionCmd(), newProviderNativeRunCmd(), newProviderCodexCmd(), newProviderVerifyCmd(), newProviderCredentialCmd(), newProviderAttestationCmd(), newProviderCapabilitiesCmd(), newProviderPolicyCmd(), newProviderTelemetryCmd(), newProviderBrokerCmd(), newProviderRoutingCmd())
-	cmd.AddCommand(newProviderPrimaryComparisonCmd(), newProviderAcceptanceCmd())
+	cmd.AddCommand(newProviderPrimaryComparisonCmd(), newProviderAcceptanceCmd(), newProviderCampaignCmd(), newProviderMigrateCmd(), newProviderReadinessCmd())
 	return cmd
 }
 

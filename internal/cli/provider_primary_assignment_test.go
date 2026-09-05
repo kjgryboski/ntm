@@ -160,6 +160,43 @@ func TestPrimaryWorkspaceAcknowledgementRequiresControllerVerification(t *testin
 	}
 }
 
+func TestPrimaryWorkspaceCompletionRejectsStaleVerificationAndLaterEdits(t *testing.T) {
+	cwd, revision := "/tmp/linked", strings.Repeat("a", 40)
+	audit := providerGrokWorkspaceAuditForTest(cwd, revision)
+	now := audit.Header.CreatedAt
+	if !primaryWorkspaceVerified(audit, cwd, revision, now.Add(-time.Second), now.Add(time.Second)) {
+		t.Fatal("valid controller evidence rejected")
+	}
+	if primaryWorkspaceVerified(audit, cwd, revision, now.Add(time.Hour), now.Add(2*time.Hour)) {
+		t.Fatal("stale verification accepted")
+	}
+	audit.Events = append(audit.Events, providerBrokerAuditEvent{Tool: "write_file", Success: true, OccurredAt: now})
+	if primaryWorkspaceVerified(audit, cwd, revision, now.Add(-time.Second), now.Add(time.Second)) {
+		t.Fatal("edit after verification accepted")
+	}
+}
+
+func TestPrimaryCompletionRejectsDuplicateAndPostTerminalStreams(t *testing.T) {
+	for _, runtime := range []string{"claude", "codex"} {
+		var observation primaryComparisonObservation
+		terminal := `{"type":"result","subtype":"success","result":"nonce"}`
+		if runtime == "codex" {
+			terminal = `{"type":"turn.completed","server_model":"gpt-6-astra"}`
+		}
+		observation.observe([]byte(terminal), runtime, "nonce")
+		observation.observe([]byte(terminal), runtime, "nonce")
+		if !observation.Malformed {
+			t.Fatal("duplicate terminal accepted")
+		}
+		observation = primaryComparisonObservation{}
+		observation.observe([]byte(terminal), runtime, "nonce")
+		observation.observe([]byte(`{"type":"assistant","message":{"model":"claude-fable-5"}}`), runtime, "nonce")
+		if !observation.Malformed {
+			t.Fatal("post-terminal work accepted")
+		}
+	}
+}
+
 func TestPrimaryOrdinaryCompletionRequiresTerminalAndIndependentWorkspaceEvidence(t *testing.T) {
 	out := primaryAssignmentOutput{RequestedModel: "claude-fable-5", CompletionEvidence: "runtime_terminal_and_controller_verifier", WorkspaceVerified: true, CleanupVerified: true, Observation: primaryComparisonObservation{ServedModel: "claude-fable-5", Completed: true, ExitOK: true}}
 	if !primaryAssignmentCompleted(out) || out.Observation.exactModelVerified(out.RequestedModel) {

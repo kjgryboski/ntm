@@ -62,8 +62,8 @@ var providerGrokQualificationDeps = providerGrokQualificationDependencies{
 		return verifyGrokACPDispatchAuthority(ctx, cwd, profile, identity, providerDoctorDeps)
 	},
 	version:          providerRuntimeVersion,
-	run:              grok.Run,
-	runSession:       grok.ExecuteSession,
+	run:              runBudgetedGrok,
+	runSession:       runBudgetedGrokSession,
 	sessionRunner:    grok.HeadlessOSRunner{},
 	prepareLineage:   prepareProviderGrokLineageWorkspace,
 	prepareWorkspace: prepareProviderGrokWorkspaceQualification,
