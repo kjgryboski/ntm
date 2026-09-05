@@ -90,7 +90,7 @@ func applyStoredGrokACPOutcome(output *GrokACPOperationOutput, stored *state.Sen
 	if err := json.Unmarshal([]byte(stored.OutcomeJSON), &replay); err != nil {
 		return fmt.Errorf("decode durable Grok ACP outcome: %w", err)
 	}
-	if trustedSigner.KeyID != "" && !validGrokACPOperationOutput(replay, trustedSigner) {
+	if trustedSigner.KeyID != "" && !ValidGrokACPOperationSignature(replay, trustedSigner) {
 		return errors.New("durable Grok ACP outcome signature is invalid")
 	}
 	if replay.OperationID != output.OperationID || replay.BindingSHA256 != output.BindingSHA256 || replay.BindingSHA256 != stored.BindingHash ||

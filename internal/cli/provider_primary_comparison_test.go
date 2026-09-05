@@ -19,6 +19,27 @@ func TestPrimaryComparisonCommandRequiresExplicitBindingsBeforeDispatch(t *testi
 	}
 }
 
+func TestPrimaryComparisonExactModelRequiresCompleteUnconflictedTerminalEvidence(t *testing.T) {
+	passing := primaryComparisonObservation{ServedModel: "claude-fable-5", Completed: true, NonceVerified: true, ExitOK: true}
+	if !passing.exactModelVerified("claude-fable-5") || passing.exactModelVerified("other") || passing.exactModelVerified("") {
+		t.Fatal("exact model comparison is not bound to requested model")
+	}
+	for _, invalidate := range []func(*primaryComparisonObservation){
+		func(o *primaryComparisonObservation) { o.Completed = false },
+		func(o *primaryComparisonObservation) { o.NonceVerified = false },
+		func(o *primaryComparisonObservation) { o.ExitOK = false },
+		func(o *primaryComparisonObservation) { o.ModelConflict = true },
+		func(o *primaryComparisonObservation) { o.Malformed = true },
+		func(o *primaryComparisonObservation) { o.UnexpectedTool = true },
+	} {
+		copy := passing
+		invalidate(&copy)
+		if copy.exactModelVerified("claude-fable-5") {
+			t.Fatal("incomplete or conflicting model evidence passed")
+		}
+	}
+}
+
 func TestPrimaryComparisonTerminalHintsNeverRetainTextOrGrantAcknowledgement(t *testing.T) {
 	for _, tc := range []struct{ text, category string }{
 		{"This is read-only; secret-canary", "read_only_mentioned"},

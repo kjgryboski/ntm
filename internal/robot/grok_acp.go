@@ -48,6 +48,7 @@ type GrokACPOperationOptions struct {
 	Broker        *grok.WorkspaceBrokerDescriptor
 	ReceiptSigner func(context.Context, []byte) (providerattestation.SignatureMetadata, error)
 	TrustedSigner providerattestation.KeyMetadata
+	BeforeCleanup func(provider.ProtocolObservation) error
 }
 
 // GrokACPOperationScope identifies the operation-level promotion being used by
@@ -407,6 +408,16 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 	// operation ID replay the stored receipt without retaining the nonce or
 	// dispatching again. PromptSHA256 still records the exact nonce-bound packet.
 	output.BindingSHA256 = grokACPBindingHash(opts.Identity, logicalPromptHash, opts.CWD, opts.Binary, opts.RuntimeHome, opts.RuntimeVersion, toolDigest, brokerDigest, operationScope, output.QualificationReceiptSHA256)
+	if opts.ReceiptSigner != nil || opts.TrustedSigner.KeyID != "" {
+		preflight := *output
+		preflight.RobotResponse = NewRobotResponse(false)
+		preflight.State = "signer_preflight"
+		if err := sealGrokACPOperationOutput(ctx, &preflight, opts.ReceiptSigner, opts.TrustedSigner); err != nil {
+			output.RobotResponse = NewErrorResponse(errors.New("Grok operation receipt signing preflight failed"), ErrCodeDependencyMissing, "Repair the exact pinned signer before dispatch; no provider work was started")
+			output.State = "signer_unavailable"
+			return output, err
+		}
+	}
 	claimed, wonClaim, claimErr := claimGrokACPOperation(deps.Ledger, operationID, output.BindingSHA256, promptHash, int64(len(transmittedPrompt)), output.StartedAt)
 	if claimErr != nil {
 		output.RobotResponse = NewErrorResponse(errors.New("durable Grok ACP operation claim failed"), ErrCodeInternalError, "Repair the NTM state store before provider dispatch")
@@ -467,7 +478,11 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 			return
 		}
 		if opts.ReceiptSigner != nil || opts.TrustedSigner.KeyID != "" {
-			if err := sealGrokACPOperationOutput(ctx, output, opts.ReceiptSigner, opts.TrustedSigner); err != nil {
+			// Cancellation ends provider work, but its local terminal receipt still
+			// needs a bounded opportunity to be signed and persisted.
+			finalizeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			if err := sealGrokACPOperationOutput(finalizeCtx, output, opts.ReceiptSigner, opts.TrustedSigner); err != nil {
 				returnErr = applyGrokACPLedgerFailure(output)
 				return
 			}
@@ -488,6 +503,7 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 		RuntimeVersion:       opts.RuntimeVersion,
 		AutomationPolicyArgs: policyArgs,
 		Broker:               opts.Broker,
+		BeforeCleanup:        opts.BeforeCleanup,
 	})
 	applyGrokACPResult(output, result, deps.Evidence)
 	if runErr != nil {
@@ -655,10 +671,16 @@ func sealGrokACPOperationOutput(ctx context.Context, output *GrokACPOperationOut
 
 func canonicalGrokACPOperationOutput(output GrokACPOperationOutput) ([]byte, error) {
 	output.Attestation = nil
+	// These describe local delivery of the same immutable provider outcome.
+	// Ledger readers validate their state independently before returning it.
+	output.ReceiptState = ""
+	output.Replayed = false
 	return json.Marshal(output)
 }
 
-func validGrokACPOperationOutput(output GrokACPOperationOutput, trusted providerattestation.KeyMetadata) bool {
+// ValidGrokACPOperationSignature verifies the immutable outcome against the
+// selected signer. Callers must also check the exact operation/profile binding.
+func ValidGrokACPOperationSignature(output GrokACPOperationOutput, trusted providerattestation.KeyMetadata) bool {
 	if output.Attestation == nil || trusted.KeyID == "" || output.Attestation.KeyMetadata != trusted {
 		return false
 	}

@@ -3,6 +3,11 @@ package robot
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"slices"
@@ -646,16 +651,132 @@ func TestRunGrokACPOperationRejectsAdmissionThatPermitsFailover(t *testing.T) {
 	}
 }
 
+func TestRunGrokACPOperationSignsCancelledOutcomeWithBoundedFinalization(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicDigest := sha256.Sum256(public)
+	publicHash := hex.EncodeToString(publicDigest[:])
+	trusted := providerattestation.KeyMetadata{
+		Algorithm: providerattestation.AlgorithmEd25519, KeyID: "ed25519:" + publicHash,
+		PublicKey: base64.RawURLEncoding.EncodeToString(public), PublicKeySHA256: publicHash,
+		ProtectionEvidence: providerattestation.ProtectionOSProcessRead,
+	}
+	for _, signingFails := range []bool{false, true} {
+		t.Run(map[bool]string{false: "signed", true: "signer_failure"}[signingFails], func(t *testing.T) {
+			type contextKey struct{}
+			ctx, cancel := context.WithCancel(context.WithValue(t.Context(), contextKey{}, "local-observer"))
+			defer cancel()
+			engine := &recordingGrokACPEngine{
+				onRun: func(runCtx context.Context) {
+					cancel()
+					if !errors.Is(runCtx.Err(), context.Canceled) {
+						t.Fatal("provider did not receive cancellation")
+					}
+				},
+				result: grok.Result{State: grok.StateCancelled, StopReason: "cancelled", CompletionConfirmed: true,
+					Cancellation: grok.ACPCancellationReceipt{Requested: true, AgentACPAcknowledged: true}},
+				err: &grok.Error{Code: grok.ErrCancelled, Err: context.Canceled},
+			}
+			var signingContext context.Context
+			opts := GrokACPOperationOptions{
+				Prompt: "inspect", CWD: "/repo", OperationID: "op-cancel-signed", Nonce: testGrokACPNonce,
+				Identity: testGrokACPIdentity(t), TrustedSigner: trusted,
+				ReceiptSigner: func(signCtx context.Context, payload []byte) (providerattestation.SignatureMetadata, error) {
+					if engine.calls > 0 && signCtx.Value(contextKey{}) != nil {
+						signingContext = signCtx
+						deadline, bounded := signCtx.Deadline()
+						if signCtx.Err() != nil || !bounded || time.Until(deadline) <= 0 || time.Until(deadline) > 10*time.Second || signCtx.Value(contextKey{}) != "local-observer" {
+							t.Fatal("finalization must preserve values with a live bounded context")
+						}
+						if signingFails {
+							return providerattestation.SignatureMetadata{}, errors.New("signer unavailable")
+						}
+					}
+					digest := sha256.Sum256(payload)
+					return providerattestation.SignatureMetadata{KeyMetadata: trusted,
+						PayloadSHA256: hex.EncodeToString(digest[:]),
+						Signature:     base64.RawURLEncoding.EncodeToString(ed25519.Sign(private, payload))}, nil
+				},
+			}
+			ledger := testGrokACPLedger(t)
+			deps := GrokACPOperationDeps{Engine: engine, Admission: allowingAdmission{}, Ledger: ledger}
+			output, runErr := RunGrokACPOperation(ctx, opts, deps)
+			if runErr == nil || signingContext == nil || !errors.Is(signingContext.Err(), context.Canceled) {
+				payload, payloadErr := grokACPSignaturePayload(*output)
+				t.Fatalf("missing terminal error or finalization cleanup: %v; signing context=%v payload=%s marshal=%v validation=%v", runErr, signingContext, payload, payloadErr, providerattestation.ValidateBridgePayload(payload))
+			}
+			if signingFails {
+				if output.ReceiptState != "persistence_failed" || output.Attestation != nil {
+					t.Fatalf("unsigned outcome granted readiness: %+v", output)
+				}
+			} else if output.State != grok.StateCancelled || !output.Cancellation.AgentACPAcknowledged || !ValidGrokACPOperationSignature(*output, trusted) {
+				t.Fatalf("cancelled outcome was not signed: %+v", output)
+			}
+			// A later invocation must read the durable result or remain uncertain;
+			// neither a cancelled result nor a signing failure may replay work.
+			replayed, _ := RunGrokACPOperation(t.Context(), opts, deps)
+			if engine.calls != 1 {
+				t.Fatal("terminal operation was dispatched again")
+			}
+			if !signingFails && (replayed.State != grok.StateCancelled || !ValidGrokACPOperationSignature(*replayed, trusted)) {
+				t.Fatalf("durable signed cancellation was lost: %+v", replayed)
+			}
+			if !signingFails {
+				queried, err := GetGrokACPOperationReceipt(opts.OperationID, ledger)
+				if err != nil || !ValidGrokACPOperationSignature(*queried, trusted) {
+					t.Fatalf("query invalidated signature: %v", err)
+				}
+				queried.Cancellation.AgentACPAcknowledged = false
+				if ValidGrokACPOperationSignature(*queried, trusted) {
+					t.Fatal("changed cancellation evidence retained signature validity")
+				}
+			}
+		})
+	}
+}
+
+func TestRunGrokACPOperationSignerPreflightRejectsBeforeDispatch(t *testing.T) {
+	engine := &recordingGrokACPEngine{}
+	output, err := RunGrokACPOperation(t.Context(), GrokACPOperationOptions{
+		Prompt: "inspect", CWD: "/repo", OperationID: "op-signer-preflight", Nonce: testGrokACPNonce,
+		Identity: testGrokACPIdentity(t), TrustedSigner: providerattestation.KeyMetadata{KeyID: "test"},
+		ReceiptSigner: func(context.Context, []byte) (providerattestation.SignatureMetadata, error) {
+			return providerattestation.SignatureMetadata{}, errors.New("old helper rejects schema")
+		},
+	}, GrokACPOperationDeps{Engine: engine, Admission: allowingAdmission{}, Ledger: testGrokACPLedger(t)})
+	if err == nil || output.State != "signer_unavailable" || engine.calls != 0 {
+		t.Fatalf("unavailable signer allowed dispatch: output=%+v err=%v calls=%d", output, err, engine.calls)
+	}
+}
+
+func TestRunGrokACPOperationForwardsPreCleanupDiagnostics(t *testing.T) {
+	engine := &recordingGrokACPEngine{err: &grok.Error{Code: grok.ErrCancelled, Err: context.Canceled}}
+	want := errors.New("diagnostic storage unavailable")
+	_, _ = RunGrokACPOperation(t.Context(), GrokACPOperationOptions{
+		Prompt: "inspect", CWD: "/repo", OperationID: "op-diagnostic", Nonce: testGrokACPNonce,
+		Identity: testGrokACPIdentity(t), BeforeCleanup: func(provider.ProtocolObservation) error { return want },
+	}, GrokACPOperationDeps{Engine: engine, Admission: allowingAdmission{}, Ledger: testGrokACPLedger(t)})
+	if engine.request.BeforeCleanup == nil || !errors.Is(engine.request.BeforeCleanup(provider.ProtocolObservation{}), want) {
+		t.Fatal("ordinary dispatch lost the pre-cleanup diagnostic sink")
+	}
+}
+
 type recordingGrokACPEngine struct {
 	request grok.Request
 	result  grok.Result
 	err     error
 	calls   int
+	onRun   func(context.Context)
 }
 
-func (e *recordingGrokACPEngine) Run(_ context.Context, req grok.Request) (grok.Result, error) {
+func (e *recordingGrokACPEngine) Run(ctx context.Context, req grok.Request) (grok.Result, error) {
 	e.calls++
 	e.request = req
+	if e.onRun != nil {
+		e.onRun(ctx)
+	}
 	return e.result, e.err
 }
 

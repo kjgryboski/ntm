@@ -86,6 +86,11 @@ type primaryComparisonObservation struct {
 	ExitOK           bool   `json:"exit_ok"`
 }
 
+func (o primaryComparisonObservation) exactModelVerified(requested string) bool {
+	return requested != "" && o.ServedModel == requested && o.Completed && o.NonceVerified &&
+		o.ExitOK && !o.ModelConflict && !o.Malformed && !o.UnexpectedTool
+}
+
 // Only terminal assistant output can acknowledge work. Tool content, init
 // configuration, and echoed requests cannot prove completion or served model.
 func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce string) {
@@ -406,9 +411,9 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 		receipt.Checks[i].Detail = "untested: not exercised by this workspace comparison"
 	}
 	evidence := digestSafeJSON(observation)
-	// Configured account labels are not provider-authoritative account evidence.
-	// Even an exact terminal model must not silently promote that missing gate.
-	setGrokQualificationCheck(&receipt, providerqualification.CheckIdentity, false, "live", evidence, "unsupported: primary stream does not authenticate the selected account binding")
+	// The shared gate proves the served model, as it does for Grok. Account
+	// authority remains separately profile-attested; no runtime stream upgrades it.
+	setGrokQualificationCheck(&receipt, providerqualification.CheckIdentity, observation.exactModelVerified(id.Model()), "live", evidence, "exact served model, terminal acknowledgement and successful stream; account binding remains profile-attested")
 	setGrokQualificationCheck(&receipt, providerqualification.CheckWorkspaceEdit, auditErr == nil && assertions.EditObserved && assertions.ReadObserved && edit, "local_authoritative", assertions.EvidenceSHA256, "common broker edit audit and independent readback")
 	setGrokQualificationCheck(&receipt, providerqualification.CheckTestCommand, auditErr == nil && assertions.TestObserved && edit, "local_authoritative", assertions.EvidenceSHA256, "common isolated go-test/go-vet verifier")
 	boundary := id.Runtime() == "claude" && outcome.ProcessStarted && !observation.UnexpectedTool && !observation.Malformed
@@ -445,7 +450,7 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	if err != nil {
 		return err
 	}
-	if err = encodeIndentedJSON(cmd.OutOrStdout(), map[string]any{"profile": profileName, "provider": id.Provider(), "runtime": id.Runtime(), "account_sha256": sha256StringCLI(id.AccountAlias()), "billing_class": id.BillingClass(), "requested_model": id.Model(), "receipt_path": path, "receipt": receipt, "runtime_observation": observation, "local_capacity_observation": capacity}); err != nil {
+	if err = encodeIndentedJSON(cmd.OutOrStdout(), map[string]any{"profile": profileName, "provider": id.Provider(), "runtime": id.Runtime(), "account_sha256": sha256StringCLI(id.AccountAlias()), "account_identity_evidence": provider.IdentityEvidenceProfileAttested, "billing_class": id.BillingClass(), "requested_model": id.Model(), "receipt_path": path, "receipt": receipt, "runtime_observation": observation, "local_capacity_observation": capacity}); err != nil {
 		return err
 	}
 	return &providerQualificationExitError{}

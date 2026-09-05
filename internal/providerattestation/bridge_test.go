@@ -52,6 +52,38 @@ func TestValidateBridgePayloadRejectsRawQualificationTurnData(t *testing.T) {
 	}
 }
 
+func TestValidateBridgePayloadAllowsOnlyDigestBoundGrokOperation(t *testing.T) {
+	fields := map[string]string{
+		"schema_version": "ntm.provider-grok-acp.v1", "identity_sha256": bridgeTestDigest,
+		"binding_sha256": bridgeTestDigest, "receipt_sha256": bridgeTestDigest,
+	}
+	valid, err := json.Marshal(fields)
+	if err != nil || ValidateBridgePayload(valid) != nil {
+		t.Fatalf("valid Grok digest envelope rejected: %v", err)
+	}
+	for _, name := range []string{"identity_sha256", "binding_sha256", "receipt_sha256"} {
+		fields[name] = "not-a-digest"
+		invalid, _ := json.Marshal(fields)
+		if !errors.Is(ValidateBridgePayload(invalid), ErrBridgePayloadDenied) {
+			t.Fatalf("invalid %s accepted", name)
+		}
+		delete(fields, name)
+		missing, _ := json.Marshal(fields)
+		if !errors.Is(ValidateBridgePayload(missing), ErrBridgePayloadDenied) {
+			t.Fatalf("missing %s accepted", name)
+		}
+		fields[name] = bridgeTestDigest
+	}
+	for _, name := range []string{"prompt", "credential", "attestation", "unknown"} {
+		fields[name] = "must-not-be-signed"
+		invalid, _ := json.Marshal(fields)
+		if !errors.Is(ValidateBridgePayload(invalid), ErrBridgePayloadDenied) {
+			t.Fatalf("extra %s accepted", name)
+		}
+		delete(fields, name)
+	}
+}
+
 func TestValidateBridgePayloadRejectsInvalidQualificationTurnAuthority(t *testing.T) {
 	for _, payload := range [][]byte{
 		bytes.Replace(validBridgeCodexQualificationTurnPayload(), []byte(`"state":"completed"`), []byte(`"state":"unrecognized"`), 1),

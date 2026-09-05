@@ -15,6 +15,21 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
 
 ### Security
 
+- **Primary comparisons apply the same served-model gate as Grok.** The exact
+  model requires successful terminal acknowledgement and an unconflicted stream.
+  Account authority remains explicitly profile-attested and is not inferred
+  from a model match. Comparison receipts do not change dispatch admission.
+
+- **Cancelled Grok operations retain signed terminal receipts.** Local signing
+  gets a separate ten-second finalization window after provider work stops.
+  Signing failures remain uncertain and cannot replay the original assignment.
+  The ordinary Grok receipt allowlist now admits its four required digest fields
+  while rejecting raw data, missing digests, and recursive signatures.
+  Ordinary dispatch checks this signing envelope before starting provider work
+  and saves redacted protocol observations before cleanup. Local receipt
+  delivery status cannot invalidate signatures; status and restart verify the
+  immutable signed outcome before trusting its identity and cleanup evidence.
+
 - **Grok acknowledgement candidates respect response and tool boundaries.**
   Earlier commentary cannot be concatenated with the final nonce, and an early
   acknowledgement cannot authorize later work. Redacted text counters survive

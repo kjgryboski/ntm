@@ -20,6 +20,7 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
+	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/state"
@@ -131,7 +132,7 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 			if err != nil {
 				return err
 			}
-			if receipt.Attestation == nil || receipt.Attestation.KeyMetadata != trusted.KeyMetadata || receipt.ProviderIdentitySHA256 != identity.Hash() {
+			if !robot.ValidGrokACPOperationSignature(*receipt, trusted.KeyMetadata) || receipt.ProviderIdentitySHA256 != identity.Hash() {
 				return errors.New("provider assignment identity or signer differs from selected profile")
 			}
 			out.State, out.ServedModel = receipt.State, receipt.ResolvedModel
@@ -306,6 +307,11 @@ func prepareGrokACPDispatch(ctx context.Context, cwd string, resolved grokACPPro
 		return opts, nil, err
 	}
 	opts = robot.GrokACPOperationOptions{CWD: absolute, Binary: binary, RuntimeHome: resolved.Profile.RuntimeHome, Model: resolved.Model, RuntimeVersion: resolved.Profile.RuntimeVersion, Identity: resolved.Identity, OperationScope: robot.GrokACPOperationScope(operation), AutomationPolicy: resolved.AutomationPolicy, Broker: broker, ReceiptSigner: signPayload, TrustedSigner: preflight.KeyMetadata}
+	started := time.Now().UTC()
+	opts.BeforeCleanup = func(observation provider.ProtocolObservation) error {
+		_, err := providerqualification.StoreProtocolDiagnostics("", resolved.Identity.Hash(), agent.GrokAutomationPolicySHA256(resolved.AutomationPolicy), resolved.Profile.RuntimeSHA256, started, time.Now().UTC(), "before_cleanup", observation)
+		return err
+	}
 	return opts, authorizer, nil
 }
 

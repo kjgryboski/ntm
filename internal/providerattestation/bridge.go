@@ -143,7 +143,8 @@ func validateBridgeCodexQualificationTurn(object map[string]json.RawMessage) err
 // signing and replay verification, so this compact allowlist still binds the
 // exact canonical robot receipt to the profile-selected TPM key.
 func validateBridgeGrokACP(object map[string]json.RawMessage) error {
-	if err := bridgeAllowed(object, []string{"schema_version", "identity_sha256", "binding_sha256", "receipt_sha256"}); err != nil {
+	fields := []string{"schema_version", "identity_sha256", "binding_sha256", "receipt_sha256"}
+	if err := bridgeAllowed(object, fields, fields...); err != nil {
 		return err
 	}
 	if schema, _ := bridgeString(object, "schema_version"); schema != "ntm.provider-grok-acp.v1" {
