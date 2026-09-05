@@ -16,9 +16,55 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
+	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
 	"github.com/Dicklesworthstone/ntm/internal/zai"
 )
+
+func TestGrokOperationDiagnosticsPreflightAndCleanupBindVerifiedRuntime(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", root)
+	identity, policy, runtimeHash := providerTestHash("identity"), providerTestHash("policy"), providerTestHash("executable")
+	if sink, err := prepareGrokOperationDiagnosticSink(identity, policy, "", time.Now().UTC()); err == nil || sink != nil {
+		t.Fatal("empty optional runtime digest survived preflight")
+	}
+	sink, err := prepareGrokOperationDiagnosticSink(identity, policy, runtimeHash, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink(provider.ProtocolObservation{}); err != nil {
+		t.Fatal(err)
+	}
+	files, err := os.ReadDir(filepath.Join(root, "ntm", "provider-diagnostics", identity))
+	if err != nil || len(files) != 2 {
+		t.Fatalf("expected both durable observations: %v %v", files, err)
+	}
+	phases := map[string]bool{}
+	for _, file := range files {
+		data, err := os.ReadFile(filepath.Join(root, "ntm", "provider-diagnostics", identity, file.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var record providerqualification.DiagnosticObservation
+		if err := json.Unmarshal(data, &record); err != nil {
+			t.Fatal(err)
+		}
+		if record.Trust != "unsigned_diagnostic_only" || record.RuntimeSHA256 != runtimeHash || record.IdentitySHA256 != identity {
+			t.Fatalf("incorrect diagnostic authority: %+v", record)
+		}
+		phases[record.Phase] = true
+	}
+	if !phases["before_dispatch"] || !phases["before_cleanup"] {
+		t.Fatal("missing lifecycle observation")
+	}
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "unwritable-file"))
+	if err := os.WriteFile(filepath.Join(root, "unwritable-file"), []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if sink, err := prepareGrokOperationDiagnosticSink(identity, policy, runtimeHash, time.Now().UTC()); err == nil || sink != nil {
+		t.Fatal("unavailable store survived preflight")
+	}
+}
 
 func TestAssignmentAndSendShareExactProviderDispatch(t *testing.T) {
 	previous := dispatchProviderAssignment

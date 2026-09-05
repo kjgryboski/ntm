@@ -728,6 +728,13 @@ func TestRunGrokACPOperationSignsCancelledOutcomeWithBoundedFinalization(t *test
 				if err != nil || !ValidGrokACPOperationSignature(*queried, trusted) {
 					t.Fatalf("query invalidated signature: %v", err)
 				}
+				stdout, printErr := captureStdout(t, func() error {
+					return encodeTerminalRobotOutput(queried, queried.RobotResponse, "cancelled")
+				})
+				var printed GrokACPOperationOutput
+				if printErr == nil || json.Unmarshal([]byte(stdout), &printed) != nil || !ValidGrokACPOperationSignature(printed, trusted) {
+					t.Fatalf("terminal printer invalidated signature: %v", printErr)
+				}
 				queried.Cancellation.AgentACPAcknowledged = false
 				if ValidGrokACPOperationSignature(*queried, trusted) {
 					t.Fatal("changed cancellation evidence retained signature validity")

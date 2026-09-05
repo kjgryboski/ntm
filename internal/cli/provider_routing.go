@@ -289,11 +289,11 @@ func prepareGrokACPDispatch(ctx context.Context, cwd string, resolved grokACPPro
 		return opts, nil, err
 	}
 	var authorizer robot.GrokACPOperationAuthorizer
+	runtimeHash, err := hashProviderSessionExecutable(binary)
+	if err != nil || !validProviderNativeDigest(runtimeHash) {
+		return opts, nil, errors.New("Grok runtime digest is unavailable")
+	}
 	if operation != providerOperationObserve {
-		runtimeHash, err := hashProviderSessionExecutable(binary)
-		if err != nil || !validProviderNativeDigest(runtimeHash) {
-			return opts, nil, errors.New("Grok runtime digest is unavailable")
-		}
 		authorizer = robot.GrokACPOperationAuthorizerFunc(func(_ context.Context, scope robot.GrokACPOperationScope, identity provider.Identity) (robot.GrokACPOperationAuthorization, error) {
 			if identity.Hash() != resolved.Identity.Hash() || string(scope) != operation {
 				return robot.GrokACPOperationAuthorization{}, errors.New("Grok dispatch changed identity or operation scope")
@@ -307,12 +307,24 @@ func prepareGrokACPDispatch(ctx context.Context, cwd string, resolved grokACPPro
 		return opts, nil, err
 	}
 	opts = robot.GrokACPOperationOptions{CWD: absolute, Binary: binary, RuntimeHome: resolved.Profile.RuntimeHome, Model: resolved.Model, RuntimeVersion: resolved.Profile.RuntimeVersion, Identity: resolved.Identity, OperationScope: robot.GrokACPOperationScope(operation), AutomationPolicy: resolved.AutomationPolicy, Broker: broker, ReceiptSigner: signPayload, TrustedSigner: preflight.KeyMetadata}
-	started := time.Now().UTC()
-	opts.BeforeCleanup = func(observation provider.ProtocolObservation) error {
-		_, err := providerqualification.StoreProtocolDiagnostics("", resolved.Identity.Hash(), agent.GrokAutomationPolicySHA256(resolved.AutomationPolicy), resolved.Profile.RuntimeSHA256, started, time.Now().UTC(), "before_cleanup", observation)
-		return err
+	opts.BeforeCleanup, err = prepareGrokOperationDiagnosticSink(resolved.Identity.Hash(), agent.GrokAutomationPolicySHA256(resolved.AutomationPolicy), runtimeHash, time.Now().UTC())
+	if err != nil {
+		return opts, nil, err
 	}
 	return opts, authorizer, nil
+}
+
+func prepareGrokOperationDiagnosticSink(identity, policy, runtimeHash string, started time.Time) (func(provider.ProtocolObservation) error, error) {
+	// The runtime digest comes from the verified executable, not an optional
+	// profile field. Fail before paid work if the exact diagnostic store cannot
+	// persist this binding.
+	if _, err := providerqualification.StoreProtocolDiagnostics("", identity, policy, runtimeHash, started, time.Now().UTC(), "before_dispatch", provider.ProtocolObservation{}); err != nil {
+		return nil, err
+	}
+	return func(observation provider.ProtocolObservation) error {
+		_, err := providerqualification.StoreProtocolDiagnostics("", identity, policy, runtimeHash, started, time.Now().UTC(), "before_cleanup", observation)
+		return err
+	}, nil
 }
 
 const (

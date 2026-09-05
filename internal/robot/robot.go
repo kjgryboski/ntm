@@ -7624,12 +7624,23 @@ func PrintSend(opts SendOptions) error {
 }
 
 func encodeTerminalRobotOutput(output any, response RobotResponse, fallback string) error {
-	if response.Success {
-		return encodeJSON(output)
-	}
-	response.OutputFormat = string(FormatJSON)
-	if err := encodeRobotFailureJSON(output); err != nil {
-		return ExitResultForCode(1, fmt.Errorf("encode robot failure: %w", err), false)
+	if receipt, ok := output.(*GrokACPOperationOutput); ok && receipt.Attestation != nil {
+		// Signed evidence must survive output exactly. Generic verbosity, array,
+		// and format normalization can change its covered bytes after signing.
+		if err := json.NewEncoder(os.Stdout).Encode(receipt); err != nil {
+			return ExitResultForCode(1, fmt.Errorf("encode signed provider receipt: %w", err), false)
+		}
+		if response.Success {
+			return nil
+		}
+	} else {
+		if response.Success {
+			return encodeJSON(output)
+		}
+		response.OutputFormat = string(FormatJSON)
+		if err := encodeRobotFailureJSON(output); err != nil {
+			return ExitResultForCode(1, fmt.Errorf("encode robot failure: %w", err), false)
+		}
 	}
 	cause := errors.New(response.Error)
 	if response.Error == "" {

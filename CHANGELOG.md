@@ -15,6 +15,11 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
 
 ### Security
 
+- **Ordinary Grok diagnostics bind the verified executable digest.** Missing
+  optional profile hashes cannot break finalization; invalid bindings and
+  unavailable diagnostic storage are rejected before dispatch.
+  Robot receipt queries preserve signed fields exactly through JSON output.
+
 - **Primary comparisons apply the same served-model gate as Grok.** The exact
   model requires successful terminal acknowledgement and an unconflicted stream.
   Account authority remains explicitly profile-attested and is not inferred
