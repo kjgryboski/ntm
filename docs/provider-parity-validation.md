@@ -57,6 +57,13 @@ attempt ceiling.
 
 ## Offline prerequisites and evidence compatibility
 
+The native `make build` target now binds the actual Go toolchain root and runs
+the compiled broker fixture against the resulting executable. Missing Linux,
+native architecture, Bubblewrap, or compiled-binary prerequisites fail this
+verification instead of silently skipping it. `install` and `install-user`
+depend on this verified build. Distribution cross-builds are not local workspace
+qualification and still require verification on the destination machine.
+
 A trimpath build must bind `internal/provider.verifierBuildGoRoot` to its actual
 Go toolchain root. Broker preparation now initializes the isolated verifier before
 generation. Before a live attempt, run the compiled broker fixture against the
@@ -88,3 +95,41 @@ totals do not bind an older request or establish its remaining cost. An explicit
 legacy unbound accounting exception is a different operation and must not be
 presented as authoritative settlement. Preserve the strict served-model preflight
 until the required admission evidence is available.
+
+## One readiness and acceptance view
+
+`provider readiness --profile NAME` supports the exact Codex, Claude, Grok and
+Z.ai profiles. Repeat `--profile` to compare them. Use `--cwd ABSOLUTE_WORKSPACE`
+for Grok policy discovery in the intended workspace. Optional repeated
+`--operation PROFILE=OPERATION_ID` adds existing verified task evidence; it makes
+no generation calls. Use the ordinary global `--campaign-id` to inspect that
+budget alongside the profiles without consuming an attempt.
+
+The shared response separates workspace evidence, credential freshness, local
+admission blockers, qualification expiry, and task observations. The state
+`ready_for_dispatch_checks` means local prerequisites passed; the read surface
+always returns `dispatch_authorized=false`. Actual dispatch owns the final
+credential, exact target, policy, qualification, capacity and campaign checks.
+Offline Grok authentication stays explicitly unverified. Missing, stale and
+unsupported capabilities are never inferred from ordinary CLI usability.
+
+The acceptance matrix retains the source and digest for each passed, failed,
+unsupported or untested observation. Qualification checks include their expiry;
+historical task results do not renew it. Ordinary task completion, local
+cancellation, guarded fresh restart, provider session resume, remote generation
+termination and billing settlement remain distinct. A later failed task does
+not erase an independently successful earlier task. Select both task IDs to
+inspect both outcomes.
+
+Capacity has three separate dimensions: local process slots, durable experiment
+dispatch attempts, and provider billing usage. Runtime adapters may make several
+provider requests inside one experiment attempt; native API tool rounds reserve
+one attempt per HTTP generation request. Campaign limits are not billing limits,
+and releasing a local process slot never settles unknown provider charges.
+
+`provider codex reconciliation-plan --profile NAME --operation-id ID` includes
+the original local operation reference and timestamp, plus concrete evidence
+fields and acquisition sources. A local operation binding hash cannot by itself
+prove the provider request/account association. Obtain that association, terminal
+usage/units and settlement coverage from an account-owner export or provider
+support. The current aggregate endpoints alone do not establish that association.

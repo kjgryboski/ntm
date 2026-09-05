@@ -1521,7 +1521,7 @@ func diagnoseProviderReceiptAttestationWithKey(ctx context.Context, preflight fu
 
 func diagnoseQualification(identity provider.Identity, transport, policySHA string, trustedSigner *providerattestation.KeyMetadata, opts providerCommandOptions, deps providerDoctorDependencies, checks []providerDoctorCheck) (providerDoctorQualification, []providerDoctorCheck) {
 	result := providerDoctorQualification{State: "missing", PolicySHA256: policySHA}
-	qualificationRequired := transport == "xai_acp" || transport == "xai_headless_session" || transport == "zai_claude_runtime" || transport == "zai_codex_runtime" || transport == "zai_native_api" && policySHA == providerNativeToolsPolicySHA256()
+	qualificationRequired := transport == "openai_codex_comparison" || transport == "anthropic_claude_comparison" || transport == "xai_acp" || transport == "xai_headless_session" || transport == "zai_claude_runtime" || transport == "zai_codex_runtime" || transport == "zai_native_api" && policySHA == providerNativeToolsPolicySHA256()
 	if !qualificationRequired {
 		result.State = "not_required"
 		checks = append(checks, providerDoctorCheck{ID: "qualification", Status: providerDoctorPass, Provenance: "capability_registry", Summary: "the nine-check coding qualification is not applicable to this no-tool/provider-native transport; online identity and capability-specific gates still apply"})

@@ -86,6 +86,25 @@ func (c OperationCapabilities) LocalLifecycleSupported() bool {
 // identifier intentionally separate from a provider profile/config surface.
 func CapabilityMatrix() map[string]OperationCapabilities {
 	return map[string]OperationCapabilities{
+		// Controlled primary adapters own local process-tree cancellation and
+		// terminal model evidence. Fresh restart is not provider session resume;
+		// opaque runtime requests are not individually billed by this controller.
+		"openai_codex_comparison": {
+			IdentityEvidence: IdentityEvidenceProfileAttested, CapacityControlScope: CapacityControlScopeLocalShared,
+			Launch: EvidenceAuthoritative, Delivery: EvidenceAuthoritative,
+			Completion: EvidenceAuthoritative, CompletionAuthorityScope: EvidenceAuthorityScopeProvider,
+			Cancellation: EvidenceAuthoritative, CancellationAuthorityScope: EvidenceAuthorityScopeLocalProcessTree,
+			Resume: EvidenceUnavailable, Cleanup: EvidenceAuthoritative, CleanupAuthorityScope: EvidenceAuthorityScopeLocalProcessTree,
+			LaunchCapacityControl: EvidenceAuthoritative, RequestCapacityControl: EvidenceUnavailable, LiveErrorFeedback: EvidenceUnavailable,
+		},
+		"anthropic_claude_comparison": {
+			IdentityEvidence: IdentityEvidenceProfileAttested, CapacityControlScope: CapacityControlScopeLocalShared,
+			Launch: EvidenceAuthoritative, Delivery: EvidenceAuthoritative,
+			Completion: EvidenceAuthoritative, CompletionAuthorityScope: EvidenceAuthorityScopeProvider,
+			Cancellation: EvidenceAuthoritative, CancellationAuthorityScope: EvidenceAuthorityScopeLocalProcessTree,
+			Resume: EvidenceUnavailable, Cleanup: EvidenceAuthoritative, CleanupAuthorityScope: EvidenceAuthorityScopeLocalProcessTree,
+			LaunchCapacityControl: EvidenceAuthoritative, RequestCapacityControl: EvidenceUnavailable, LiveErrorFeedback: EvidenceUnavailable,
+		},
 		// xAI ACP cancellation is authoritative only at the Grok ACP-agent
 		// boundary: NTM writes session/cancel and requires the original
 		// session/prompt response to say stopReason=cancelled. That does not

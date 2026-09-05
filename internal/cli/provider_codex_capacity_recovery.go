@@ -27,9 +27,10 @@ import (
 const providerCodexCapacityRecoverySchema = "ntm.provider-codex-capacity-recovery.v1"
 
 func newProviderCodexReconciliationPlanCmd() *cobra.Command {
-	var name string
+	var name, operation string
 	cmd := &cobra.Command{Use: "reconciliation-plan", Short: "Show the missing evidence for an uncertain Coding Plan reservation without changing admission", Args: cobra.NoArgs}
 	cmd.Flags().StringVar(&name, "profile", "", "Exact Z.ai Codex profile")
+	cmd.Flags().StringVar(&operation, "operation-id", "", "Original uncertain operation to correlate; never grants an identity binding")
 	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
 		cfg := loadSelectedConfigOrDefault()
 		if cfg == nil {
@@ -47,7 +48,23 @@ func newProviderCodexReconciliationPlanCmd() *cobra.Command {
 			return errors.New("exact Z.ai Coding Plan Codex profile required")
 		}
 		snapshot := defaultProviderCodexSubscriptionAdmission().Snapshot(id)
-		return encodeIndentedJSON(cmd.OutOrStdout(), providerCodexReconciliationPlan(id, snapshot))
+		out := providerCodexReconciliationPlan(id, snapshot)
+		if operation != "" {
+			if !validProviderNativeOperationID(operation) {
+				return errors.New("valid original operation ID required")
+			}
+			ledger, closeLedger, err := openProviderNativeLedger()
+			if err != nil {
+				return err
+			}
+			defer closeLedger()
+			row, err := ledger.GetSendOperation(operation, providerCodexOperationScope)
+			if err != nil {
+				return err
+			}
+			out["original_operation"] = providerReconciliationOperationTarget(operation, row)
+		}
+		return encodeIndentedJSON(cmd.OutOrStdout(), out)
 	}
 	return cmd
 }
@@ -62,7 +79,25 @@ func providerCodexReconciliationPlan(id provider.Identity, snapshot ratelimit.Su
 		"insufficient_evidence": []string{"aggregate model usage or quota alone", "elapsed time or controller reset estimate", "local process exit without provider settlement", "a local signer repeating an unverified provider claim", "a legacy unbound rollout treated as authoritative settlement"},
 		"next_generation":       "strict exact served-model preflight only after authoritative admission",
 		"legacy_recovery":       "recover-capacity is an explicit owner-authorized unbound accounting exception; it is not this authoritative settlement path",
+		"evidence_sources": []map[string]string{
+			{"source": "account-owner provider dashboard/export or provider support", "obtain": "account-bound request/usage identifier, terminal usage in Coding Plan credits, final status and settlement cutoff covering outstanding requests", "limitation": "a local operation hash is only a correlation reference until the provider binds it"},
+			{"source": "official aggregate quota and model-usage endpoints", "obtain": "fresh quota/units plus account scope", "limitation": "existing aggregate responses do not identify or settle the uncertain operation; no public per-request settlement endpoint has been established by this integration"},
+			{"source": "provider's authoritative outstanding-request accounting contract", "obtain": "enforceable maximum outstanding cost and coverage of concurrent requests", "limitation": "the configured full-week uncertainty reservation is not an enforceable request cost bound"},
+		},
+		"evidence_record_fields": []string{"provider_account_binding", "original_request_binding", "terminal_status", "billing_units", "final_usage", "settled_through", "outstanding_requests_and_bounds", "provider_source", "observed_at", "source_digest"},
 	}
+}
+
+func providerReconciliationOperationTarget(operation string, row *state.SendOperation) map[string]any {
+	out := map[string]any{"operation_id_sha256": sha256StringCLI(operation), "found_in_selected_ledger": row != nil, "provider_request_binding": "not_established", "settlement": "unverified", "changes_admission": false}
+	if row != nil {
+		out["recorded_binding_sha256"] = row.BindingHash
+		out["recorded_payload_sha256"] = row.PayloadSHA256
+		out["recorded_state"] = row.Status
+		out["created_at"] = row.CreatedAt
+		out["completed_at"] = row.CompletedAt
+	}
+	return out
 }
 
 type providerCodexCapacityRecoveryOptions struct {

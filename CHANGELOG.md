@@ -13,6 +13,19 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
 
 ## [Unreleased]
 
+### Changed
+
+- Append exact provider profiles as quoted child tables during migration, preserving
+  existing configuration and making repeated migration idempotent.
+- Share one provider readiness and acceptance view across exact primary, Grok,
+  and Z.ai profiles, preserving qualification expiry and independent task evidence.
+- Report local execution slots, experiment dispatch attempts, and billing usage
+  separately; unknown usage and remote termination are never inferred from release.
+- Bind the Go verifier root in native builds and require the actual compiled broker
+  fixture before the standard build/install targets succeed.
+- Include exact local operation correlation references and acquisition sources in
+  Z.ai's read-only reconciliation plan without granting provider settlement.
+
 ### Security
 
 - **Managed campaign coverage includes legacy provider paths.** Online doctor

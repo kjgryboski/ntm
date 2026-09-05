@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -128,8 +129,20 @@ func newProviderMigrateCmd() *cobra.Command {
 			return err
 		}
 		var appendix bytes.Buffer
-		if len(add) > 0 {
-			if err = toml.NewEncoder(&appendix).Encode(map[string]any{"provider_profiles": add}); err != nil {
+		names := make([]string, 0, len(add))
+		for name := range add {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			// Encode only the new child table: repeating the parent table makes
+			// an existing provider_profiles configuration invalid TOML.
+			key, err := json.Marshal(name)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(&appendix, "\n[provider_profiles.%s]\n", key)
+			if err = toml.NewEncoder(&appendix).Encode(add[name]); err != nil {
 				return err
 			}
 		}
@@ -190,91 +203,87 @@ func newProviderMigrateCmd() *cobra.Command {
 	return cmd
 }
 
-func newProviderReadinessCmd() *cobra.Command {
-	var name string
-	cmd := &cobra.Command{Use: "readiness", Short: "Show exact primary profile, credential freshness and workspace admission before assignment", Args: cobra.NoArgs}
-	cmd.Flags().StringVar(&name, "profile", "", "Exact primary provider profile")
-	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
-		loaded := loadSelectedConfigOrDefault()
-		if loaded == nil {
-			return errors.New("configuration unavailable")
-		}
-		p, err := loaded.ProviderProfile(name)
-		if err != nil {
-			return err
-		}
-		id, transport, err := validatePrimaryComparisonProfile(p)
-		if err != nil {
-			return err
-		}
-		out := map[string]any{"profile": name, "provider": id.Provider(), "runtime": id.Runtime(), "requested_model": id.Model(), "identity_sha256": id.Hash(), "billing_class": id.BillingClass(), "workspace_admission": false, "generation_calls": 0}
-		credential := "auth.json"
-		if id.Runtime() == "claude" {
-			credential = ".credentials.json"
-		}
-		credentialPath := filepath.Join(p.RuntimeHome, credential)
-		info, readErr := os.Lstat(credentialPath)
-		var data []byte
-		if readErr == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Size() <= 1<<20 {
-			data, readErr = os.ReadFile(credentialPath)
-		}
-		fresh := readErr == nil && primaryComparisonCredentialValid(data, id.Runtime()) && primaryCredentialSnapshotFresh(data, id.Runtime(), time.Now())
-		if id.Runtime() == "claude" {
-			var snapshot struct {
-				OAuth struct {
-					ExpiresAt int64 `json:"expiresAt"`
-				} `json:"claudeAiOauth"`
-			}
-			if json.Unmarshal(data, &snapshot) == nil && snapshot.OAuth.ExpiresAt > 0 {
-				out["credential_expires_at"] = time.UnixMilli(snapshot.OAuth.ExpiresAt).UTC()
-			}
-		} else {
-			out["credential_freshness_scope"] = "OAuth snapshot present; runtime owns token refresh"
-		}
-		for i := range data {
-			data[i] = 0
-		}
-		out["credential_fresh"] = fresh
-		digest, hashErr := hashProviderSessionExecutable(p.Command)
-		ctx, cancel := context.WithTimeout(providerCommandContext(cmd), 5*time.Second)
-		defer cancel()
-		version, versionErr := primaryPinnedRuntimeVersion(ctx, p)
-		if hashErr != nil || versionErr != nil || digest != p.RuntimeSHA256 || !versionMatches(version, p.RuntimeVersion) {
-			out["reason"] = "runtime_pin_mismatch"
-			return encodeIndentedJSON(cmd.OutOrStdout(), out)
-		}
-		companion := ""
-		if id.Runtime() == "codex" {
-			companion, err = hashProviderSessionExecutable(filepath.Join(filepath.Dir(p.Command), "codex-code-mode-host"))
-			if err != nil {
-				out["reason"] = "companion_unavailable"
-				return encodeIndentedJSON(cmd.OutOrStdout(), out)
-			}
-		}
-		sign, err := providerProfilePinnedSigner(p)
-		if err != nil {
-			out["reason"] = "signer_unavailable"
-			return encodeIndentedJSON(cmd.OutOrStdout(), out)
-		}
-		trusted, err := preflightProviderReceiptSignerMetadata(providerCommandContext(cmd), sign)
-		if err != nil {
-			out["reason"] = "signer_preflight_failed"
-			return encodeIndentedJSON(cmd.OutOrStdout(), out)
-		}
-		_, err = authorizeProviderOperation(providerOperationAuthorization{Identity: id, Transport: transport, PolicySHA256: primaryWorkspacePolicySHA(transport, companion), RuntimeVersion: p.RuntimeVersion, RuntimeSHA256: p.RuntimeSHA256, Operation: providerOperationWorkspaceWrite, MaxQualificationAge: 24 * time.Hour, TrustedSigner: trusted.KeyMetadata})
-		out["qualification_max_age_hours"] = 24
-		if receipt, _, loadErr := providerqualification.LoadLatestForTransport("", id.Hash(), transport); loadErr == nil {
-			out["qualification_expires_at"] = receipt.CompletedAt.Add(24 * time.Hour)
-		}
-		out["workspace_admission"] = err == nil && fresh
-		if err != nil {
-			out["reason"] = "qualification_missing_stale_or_mismatched"
-		} else if !fresh {
-			out["reason"] = "credential_snapshot_requires_refresh"
-		} else {
-			out["reason"] = "ready"
-		}
-		return encodeIndentedJSON(cmd.OutOrStdout(), out)
+func inspectPrimaryReadiness(cmd *cobra.Command, name string, visit func(map[string]any) error) error {
+	loaded := loadSelectedConfigOrDefault()
+	if loaded == nil {
+		return errors.New("configuration unavailable")
 	}
-	return cmd
+	p, err := loaded.ProviderProfile(name)
+	if err != nil {
+		return err
+	}
+	id, transport, err := validatePrimaryComparisonProfile(p)
+	if err != nil {
+		return err
+	}
+	out := map[string]any{"profile": name, "provider": id.Provider(), "runtime": id.Runtime(), "requested_model": id.Model(), "identity_sha256": id.Hash(), "billing_class": id.BillingClass(), "workspace_admission": false, "generation_calls": 0}
+	credential := "auth.json"
+	if id.Runtime() == "claude" {
+		credential = ".credentials.json"
+	}
+	credentialPath := filepath.Join(p.RuntimeHome, credential)
+	info, readErr := os.Lstat(credentialPath)
+	var data []byte
+	if readErr == nil && info.Mode().IsRegular() && info.Size() > 0 && info.Size() <= 1<<20 {
+		data, readErr = os.ReadFile(credentialPath)
+	}
+	fresh := readErr == nil && primaryComparisonCredentialValid(data, id.Runtime()) && primaryCredentialSnapshotFresh(data, id.Runtime(), time.Now())
+	if id.Runtime() == "claude" {
+		var snapshot struct {
+			OAuth struct {
+				ExpiresAt int64 `json:"expiresAt"`
+			} `json:"claudeAiOauth"`
+		}
+		if json.Unmarshal(data, &snapshot) == nil && snapshot.OAuth.ExpiresAt > 0 {
+			out["credential_expires_at"] = time.UnixMilli(snapshot.OAuth.ExpiresAt).UTC()
+		}
+	} else {
+		out["credential_freshness_scope"] = "OAuth snapshot present; runtime owns token refresh"
+	}
+	for i := range data {
+		data[i] = 0
+	}
+	out["credential_fresh"] = fresh
+	digest, hashErr := hashProviderSessionExecutable(p.Command)
+	ctx, cancel := context.WithTimeout(providerCommandContext(cmd), 5*time.Second)
+	defer cancel()
+	version, versionErr := primaryPinnedRuntimeVersion(ctx, p)
+	if hashErr != nil || versionErr != nil || digest != p.RuntimeSHA256 || !versionMatches(version, p.RuntimeVersion) {
+		out["reason"] = "runtime_pin_mismatch"
+		return visit(out)
+	}
+	companion := ""
+	if id.Runtime() == "codex" {
+		companion, err = hashProviderSessionExecutable(filepath.Join(filepath.Dir(p.Command), "codex-code-mode-host"))
+		if err != nil {
+			out["reason"] = "companion_unavailable"
+			return visit(out)
+		}
+	}
+	sign, err := providerProfilePinnedSigner(p)
+	if err != nil {
+		out["reason"] = "signer_unavailable"
+		return visit(out)
+	}
+	trusted, err := preflightProviderReceiptSignerMetadata(providerCommandContext(cmd), sign)
+	if err != nil {
+		out["reason"] = "signer_preflight_failed"
+		return visit(out)
+	}
+	_, err = authorizeProviderOperation(providerOperationAuthorization{Identity: id, Transport: transport, PolicySHA256: primaryWorkspacePolicySHA(transport, companion), RuntimeVersion: p.RuntimeVersion, RuntimeSHA256: p.RuntimeSHA256, Operation: providerOperationWorkspaceWrite, MaxQualificationAge: 24 * time.Hour, TrustedSigner: trusted.KeyMetadata})
+	out["qualification_max_age_hours"] = 24
+	qualification, _ := diagnoseQualification(id, transport, primaryWorkspacePolicySHA(transport, companion), &trusted.KeyMetadata, providerCommandOptions{qualificationAge: 24 * time.Hour}, providerDoctorDeps, nil)
+	out["qualification_report"] = qualification
+	if receipt, _, loadErr := providerqualification.LoadLatestForTransport("", id.Hash(), transport); loadErr == nil {
+		out["qualification_expires_at"] = receipt.CompletedAt.Add(24 * time.Hour)
+	}
+	out["workspace_admission"] = err == nil && fresh
+	if err != nil {
+		out["reason"] = "qualification_missing_stale_or_mismatched"
+	} else if !fresh {
+		out["reason"] = "credential_snapshot_requires_refresh"
+	} else {
+		out["reason"] = "ready"
+	}
+	return visit(out)
 }

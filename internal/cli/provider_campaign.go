@@ -104,7 +104,7 @@ func newProviderCampaignCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		return encodeIndentedJSON(cmd.OutOrStdout(), out)
+		return encodeIndentedJSON(cmd.OutOrStdout(), providerCampaignObservation(out))
 	}
 	return cmd
 }

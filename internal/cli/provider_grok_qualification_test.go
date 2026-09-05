@@ -384,10 +384,20 @@ func TestProviderGrokWorkspaceAuditRejectsEvidenceOutsideQualificationWindow(t *
 }
 
 func TestProviderGrokWorkspaceBrokerProducesRealQualificationEvidence(t *testing.T) {
+	required := os.Getenv("NTM_PROVIDER_BROKER_REQUIRE_COMPILED") == "1"
+	if required && os.Getenv("NTM_PROVIDER_BROKER_BINARY") == "" {
+		t.Fatal("compiled provider verification requires the exact built binary")
+	}
 	if runtime.GOOS != "linux" {
+		if required {
+			t.Fatal("compiled provider verification requires Linux")
+		}
 		t.Skip("the production workspace verifier is Linux-only")
 	}
 	if _, err := exec.LookPath("bwrap"); err != nil {
+		if required {
+			t.Fatal("compiled provider verification requires Bubblewrap")
+		}
 		t.Skip("Bubblewrap is unavailable")
 	}
 

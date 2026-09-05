@@ -6,13 +6,15 @@ VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 COMMIT := $(shell git rev-parse HEAD 2>/dev/null || echo "none")
 BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 BUILT_BY := make
+GO := go
+VERIFIER_GO_ROOT := $(shell $(GO) env GOROOT)
 LDFLAGS := -ldflags "-s -w \
 	-X github.com/Dicklesworthstone/ntm/internal/cli.Version=$(VERSION) \
 	-X github.com/Dicklesworthstone/ntm/internal/cli.Commit=$(COMMIT) \
 	-X github.com/Dicklesworthstone/ntm/internal/cli.Date=$(BUILD_TIME) \
-	-X github.com/Dicklesworthstone/ntm/internal/cli.BuiltBy=$(BUILT_BY)"
+	-X github.com/Dicklesworthstone/ntm/internal/cli.BuiltBy=$(BUILT_BY) \
+	-X 'github.com/Dicklesworthstone/ntm/internal/provider.verifierBuildGoRoot=$(VERIFIER_GO_ROOT)'"
 
-GO := go
 GOFLAGS := -trimpath
 
 # Output directory
@@ -25,6 +27,15 @@ all: build
 ## Build for current platform
 build:
 	$(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BINARY_NAME) ./cmd/ntm
+	$(MAKE) verify-provider-build
+
+## Verify the actual native Linux binary before provider workspace use
+.PHONY: verify-provider-build
+verify-provider-build:
+	@test "$$($(GO) env GOOS)" = "linux" || { echo "Provider workspace verification requires a native Linux build; use build-all for distribution artifacts."; exit 1; }
+	@test "$$($(GO) env GOARCH)" = "$$($(GO) env GOHOSTARCH)" || { echo "Provider workspace verification requires the native architecture."; exit 1; }
+	@test -x "$(VERIFIER_GO_ROOT)/bin/go" || { echo "Bound Go verifier root is unavailable."; exit 1; }
+	NTM_PROVIDER_BROKER_REQUIRE_COMPILED=1 NTM_PROVIDER_BROKER_BINARY="$(abspath $(BINARY_NAME))" $(GO) test -p 1 ./internal/cli -run '^TestProviderGrokWorkspaceBrokerProducesRealQualificationEvidence$$' -count=1 -timeout=120s
 
 ## Build for all platforms
 build-all: clean

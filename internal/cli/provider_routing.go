@@ -62,6 +62,10 @@ type providerAssignmentStatus struct {
 	RemoteTermination          string                               `json:"remote_generation_termination"`
 	CapacityObservation        *provider.CapacityReleaseObservation `json:"local_controller_capacity_observation,omitempty"`
 	CancellationObserved       bool                                 `json:"local_cancellation_observed"`
+	OutcomeSHA256              string                               `json:"signed_outcome_sha256,omitempty"`
+	CompletedAt                *time.Time                           `json:"completed_at,omitempty"`
+	RestartOfSHA256            string                               `json:"local_restart_of_sha256,omitempty"`
+	CapacityUnits              map[string]any                       `json:"capacity_units"`
 }
 
 var inspectProviderAssignment = runProviderAssignmentStatus
@@ -167,6 +171,8 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 			out.LocalCleanupVerified = providerCodexReceiptHasNoResiduals(receipt.Receipt)
 		}
 		out.IdentityBindingVerified = true
+		out.OutcomeSHA256 = sha256StringCLI(row.OutcomeJSON)
+		out.CompletedAt = row.CompletedAt
 	}
 	if scope != primaryAssignmentScope {
 		out.RuntimeCompletionConfirmed = out.CompletionConfirmed
@@ -181,6 +187,7 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 			return errors.New("provider control observation binding is invalid")
 		}
 		out.CancellationObserved = observation.CancelObserved
+		out.RestartOfSHA256 = observation.RestartOfSHA256
 		if identity.Provider() == "xai" || identity.Provider() == "zai" {
 			out.WorkspaceVerified = validProviderWorkspaceCompletion(observation.WorkspaceCompletion, row, identity, trustedKey)
 		}
@@ -192,6 +199,7 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 	if out.State == "completed" && out.RuntimeCompletionConfirmed && !out.WorkspaceVerified {
 		out.State = "runtime_completed_workspace_unverified"
 	}
+	out.CapacityUnits = map[string]any{"execution_slots": "local controller process leases", "experiment_attempts": "separate durable campaign; not billing requests", "billing_usage": "not inferred from local slot release", "billing_settlement": "unverified"}
 	return visit(out)
 }
 

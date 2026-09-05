@@ -101,7 +101,7 @@ func TestCapabilityMatrixPreservesEvidenceBoundaries(t *testing.T) {
 	}
 	for transport, capabilities := range matrix {
 		want := EvidenceSubmission
-		if transport == "xai_headless_session" || transport == "xai_acp" || transport == "zai_codex_runtime" {
+		if transport == "xai_headless_session" || transport == "xai_acp" || transport == "zai_codex_runtime" || transport == "openai_codex_comparison" || transport == "anthropic_claude_comparison" {
 			want = EvidenceAuthoritative
 		}
 		if capabilities.Cleanup != want {
