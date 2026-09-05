@@ -15,6 +15,22 @@ NTM is a tmux session management tool for orchestrating multiple AI coding agent
 
 ### Security
 
+- **Managed campaign coverage includes legacy provider paths.** Online doctor
+  probes, direct robot Grok ACP, headless Grok sessions and native API generation
+  rounds now share the durable attempt ceiling. Raw pane routes reject campaign
+  claims. Source-audit and behavioral regressions guard these entry points.
+  Opaque Z.ai Claude-compatible probes and qualification no longer dispatch
+  live requests without authoritative per-request accounting.
+- **Verifier initialization happens before provider dispatch.** A missing
+  build-bound Go toolchain fails before paid work. Primary OAuth snapshot refresh
+  rejects stale credentials and changed local account bindings, retaining a
+  private backup and leaving signed qualification unchanged.
+- **Representative acceptance and source-bound scanner review are available.**
+  The order-total fixture requires a multi-file fix with immutable tests. AST
+  review baselines fail on new findings, changed source, or scanner/rule drift;
+  they never change raw scanner severity. Z.ai reconciliation plans expose the
+  missing settlement evidence without changing uncertain accounting.
+
 - **Qualified Codex joins the ordinary shared provider controls.** The pinned
   runtime loads a restricted tool catalog so model metadata cannot re-enable
   file patching independently of the shell flag. Offline checks load the actual

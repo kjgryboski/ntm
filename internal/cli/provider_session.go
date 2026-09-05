@@ -87,7 +87,7 @@ var providerSessionDeps = providerSessionDependencies{
 	authorizeOperation:   authorizeProviderOperation,
 	hashBinary:           hashProviderSessionExecutable,
 	recordTelemetry:      recordProviderTelemetryDefault,
-	run:                  grok.ExecuteSession,
+	run:                  runBudgetedGrokSession,
 	runner:               grok.HeadlessOSRunner{},
 	admission:            ratelimit.DefaultAdmissionController(),
 	now:                  func() time.Time { return time.Now().UTC() },

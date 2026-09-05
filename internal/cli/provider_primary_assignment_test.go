@@ -16,6 +16,39 @@ import (
 	"github.com/spf13/cobra"
 )
 
+func TestProviderRepresentativeAcceptanceSurfaceBindsMultipleFilesAndImmutableTests(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "orders")
+	cmd := newProviderAcceptanceCmd()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetArgs([]string{"--directory", root, "--scenario", "order-total"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(filepath.Join(root, "acceptance.json"))
+	var manifest struct {
+		Scenario, Prompt string
+		TestsSHA256      string `json:"tests_sha256"`
+		ScenarioSHA256   string `json:"scenario_sha256"`
+		ProviderCalls    int    `json:"provider_calls"`
+	}
+	if json.Unmarshal(data, &manifest) != nil {
+		t.Fatal("bad manifest")
+	}
+	files := providerOrderAcceptanceFiles()
+	if manifest.Scenario != "order-total" || manifest.ProviderCalls != 0 || manifest.ScenarioSHA256 != digestSafeJSON(files) || manifest.TestsSHA256 != sha256StringCLI(files["orders_test.go"]) {
+		t.Fatal("representative scenario binding differs")
+	}
+	for name, content := range files {
+		got, err := os.ReadFile(filepath.Join(root, "workspace", name))
+		if err != nil || string(got) != content {
+			t.Fatalf("fixture changed: %s", name)
+		}
+	}
+	if !strings.Contains(manifest.Prompt, "parse.go and total.go") {
+		t.Fatal("assignment does not require both sources")
+	}
+}
+
 func TestProviderAcceptanceSurfacePreservesReusableFixtureAndBudget(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "acceptance")
 	cmd := newProviderAcceptanceCmd()

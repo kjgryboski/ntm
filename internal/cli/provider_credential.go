@@ -1,13 +1,19 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -56,8 +62,147 @@ type providerCredentialOutput struct {
 
 func newProviderCredentialCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "credential", Short: "Manage exact provider credentials in native OS secure storage"}
-	cmd.AddCommand(newProviderCredentialStatusCmd(), newProviderCredentialSetCmd(), newProviderCredentialRemoveCmd())
+	cmd.AddCommand(newProviderCredentialStatusCmd(), newProviderCredentialSetCmd(), newProviderCredentialRemoveCmd(), newProviderCredentialRefreshSnapshotCmd())
 	return cmd
+}
+
+// Refresh uses an already refreshed account-owner snapshot. It does not rotate
+// OAuth tokens from a disposable home or switch the user's active account.
+func newProviderCredentialRefreshSnapshotCmd() *cobra.Command {
+	var name, sourceHome string
+	var apply bool
+	cmd := &cobra.Command{Use: "refresh-snapshot", Short: "Preview or copy a fresh primary OAuth snapshot with unchanged local account binding", Args: cobra.NoArgs}
+	cmd.Flags().StringVar(&name, "profile", "", "Exact primary provider profile")
+	cmd.Flags().StringVar(&sourceHome, "source-home", "", "Absolute account-owner runtime home containing an already refreshed snapshot")
+	cmd.Flags().BoolVar(&apply, "apply", false, "Apply after continuity and freshness checks, preserving a private backup")
+	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		cfg := loadSelectedConfigOrDefault()
+		if cfg == nil {
+			return errors.New("configuration unavailable")
+		}
+		p, err := cfg.ProviderProfile(name)
+		if err != nil {
+			return err
+		}
+		id, _, err := validatePrimaryComparisonProfile(p)
+		if err != nil {
+			return err
+		}
+		if !filepath.IsAbs(sourceHome) || filepath.Clean(sourceHome) == filepath.Clean(p.RuntimeHome) {
+			return errors.New("source must be a distinct absolute account-owner home")
+		}
+		filename := "auth.json"
+		if id.Runtime() == "claude" {
+			filename = ".credentials.json"
+		}
+		destination, source := filepath.Join(p.RuntimeHome, filename), filepath.Join(sourceHome, filename)
+		old, err := readPrimaryCredentialSnapshot(destination)
+		if err != nil {
+			return err
+		}
+		defer zeroProviderSecret(old)
+		next, err := readPrimaryCredentialSnapshot(source)
+		if err != nil {
+			return err
+		}
+		defer zeroProviderSecret(next)
+		scope, err := primaryCredentialRefreshContinuity(old, next, id.Runtime(), time.Now())
+		if err != nil {
+			return err
+		}
+		out := map[string]any{"profile": name, "identity_sha256": id.Hash(), "continuity_scope": scope, "applied": false, "generation_calls": 0, "qualification_rewritten": false}
+		if apply {
+			backup, err := applyPrimaryCredentialSnapshot(destination, old, next)
+			if err != nil {
+				return err
+			}
+			out["applied"], out["backup_path_sha256"] = true, sha256StringCLI(backup)
+		}
+		return encodeIndentedJSON(cmd.OutOrStdout(), out)
+	}
+	return cmd
+}
+
+func readPrimaryCredentialSnapshot(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 1<<20 {
+		return nil, errors.New("credential snapshot must be a bounded regular file")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, errors.New("credential snapshot could not be read")
+	}
+	return data, nil
+}
+
+func primaryCredentialRefreshContinuity(old, next []byte, runtime string, now time.Time) (string, error) {
+	if !primaryComparisonCredentialValid(old, runtime) || !primaryComparisonCredentialValid(next, runtime) || !primaryCredentialSnapshotFresh(next, runtime, now) {
+		return "", errors.New("fresh subscription OAuth snapshot required; API credentials and expired snapshots are rejected")
+	}
+	var before, after struct {
+		Tokens struct {
+			AccountID string `json:"account_id"`
+		} `json:"tokens"`
+		OAuth struct {
+			RefreshToken     string `json:"refreshToken"`
+			SubscriptionType string `json:"subscriptionType"`
+		} `json:"claudeAiOauth"`
+	}
+	if json.Unmarshal(old, &before) != nil || json.Unmarshal(next, &after) != nil {
+		return "", errors.New("invalid credential snapshots")
+	}
+	if runtime == "codex" && before.Tokens.AccountID != "" && before.Tokens.AccountID == after.Tokens.AccountID {
+		return "local_account_id_match_profile_attested", nil
+	}
+	beforeHash, afterHash := sha256.Sum256([]byte(before.OAuth.RefreshToken)), sha256.Sum256([]byte(after.OAuth.RefreshToken))
+	if runtime == "claude" && before.OAuth.RefreshToken != "" && subtle.ConstantTimeCompare(beforeHash[:], afterHash[:]) == 1 && before.OAuth.SubscriptionType == after.OAuth.SubscriptionType {
+		return "local_refresh_lineage_match_profile_attested", nil
+	}
+	return "", errors.New("account continuity is not established; changed account IDs or rotated opaque Claude refresh tokens require fresh identity binding, not automatic qualification reuse")
+}
+
+func applyPrimaryCredentialSnapshot(destination string, old, next []byte) (string, error) {
+	current, err := readPrimaryCredentialSnapshot(destination)
+	if err != nil {
+		return "", err
+	}
+	defer zeroProviderSecret(current)
+	if !bytes.Equal(current, old) {
+		return "", errors.New("credential changed during refresh; no snapshot replaced")
+	}
+	backup := destination + ".before-refresh-" + time.Now().UTC().Format("20060102T150405.000000000")
+	f, err := os.OpenFile(backup, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return "", err
+	}
+	_, writeErr := f.Write(old)
+	closeErr := f.Close()
+	if err = errors.Join(writeErr, closeErr); err != nil {
+		return "", err
+	}
+	candidate := backup + ".candidate"
+	f, err = os.OpenFile(candidate, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return "", err
+	}
+	_, writeErr = f.Write(next)
+	syncErr := f.Sync()
+	closeErr = f.Close()
+	if err = errors.Join(writeErr, syncErr, closeErr); err != nil {
+		return "", err
+	}
+	current, err = readPrimaryCredentialSnapshot(destination)
+	if err != nil {
+		return "", err
+	}
+	defer zeroProviderSecret(current)
+	if !bytes.Equal(current, old) {
+		return "", errors.New("credential changed before activation; private backup retained")
+	}
+	if err = os.Rename(candidate, destination); err != nil {
+		return "", err
+	}
+	return backup, nil
 }
 
 func newProviderCredentialStatusCmd() *cobra.Command {

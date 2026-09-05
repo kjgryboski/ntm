@@ -19,6 +19,21 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/zai"
 )
 
+func TestProviderReconciliationPlanCannotGrantAdmissionOrMutateUnknownUsage(t *testing.T) {
+	id, err := provider.NewIdentity("zai", "fixture", "glm-5.3", "https://api.z.ai/api/v1", "codex", strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := ratelimit.SubscriptionCapacitySnapshot{UnknownUsageReserved: true, SubscriptionScopeSHA256: strings.Repeat("b", 64)}
+	out := providerCodexReconciliationPlan(id, snapshot)
+	if out["admission_granted"] != false || out["accounting_mutated"] != false || out["generation_calls"] != 0 || out["unknown_usage_reserved"] != true {
+		t.Fatal("evidence plan changed accounting or readiness")
+	}
+	if len(out["insufficient_evidence"].([]string)) == 0 || len(out["settlement_path"].([]string)) == 0 {
+		t.Fatal("missing actionable evidence requirements")
+	}
+}
+
 type providerCodexCapacityRecoveryAdmissionFake struct {
 	status       ratelimit.CapacityStatus
 	before       ratelimit.SubscriptionCapacitySnapshot

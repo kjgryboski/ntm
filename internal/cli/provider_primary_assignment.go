@@ -26,10 +26,14 @@ import (
 const primaryAssignmentScope = "provider:primary-assignment"
 
 func newProviderAcceptanceCmd() *cobra.Command {
-	var directory string
+	var directory, scenario string
 	cmd := &cobra.Command{Use: "acceptance", Short: "Prepare the common isolated coding acceptance fixture without calling a provider", Args: cobra.NoArgs}
 	cmd.Flags().StringVar(&directory, "directory", "", "New absolute fixture directory (must not already exist)")
+	cmd.Flags().StringVar(&scenario, "scenario", "add", "Acceptance scenario: add or order-total (multiple files)")
 	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		if scenario != "add" && scenario != "order-total" {
+			return errors.New("unknown acceptance scenario")
+		}
 		if !filepath.IsAbs(directory) {
 			return errors.New("acceptance fixture requires a new absolute directory")
 		}
@@ -45,12 +49,19 @@ func newProviderAcceptanceCmd() *cobra.Command {
 			return err
 		}
 		files := map[string]string{"go.mod": "module providerparityfixture\n\ngo 1.26.3\n", "calc.go": "package fixture\n\nfunc Add(a, b int) int { return a - b }\n", "calc_test.go": "package fixture\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) { for _, tc := range [][3]int{{2,3,5},{-4,7,3},{0,0,0}} { if got := Add(tc[0],tc[1]); got != tc[2] { t.Fatalf(\"Add(%d,%d) = %d, want %d\",tc[0],tc[1],got,tc[2]) } } }\n"}
+		prompt := "Fix Add in calc.go so the existing tests pass. Keep the tests unchanged. Read the current file, use its SHA-256 when writing, and run verify_worktree after the final edit."
+		testFile := "calc_test.go"
+		if scenario == "order-total" {
+			files = providerOrderAcceptanceFiles()
+			testFile = "orders_test.go"
+			prompt = "Fix the order importer in parse.go and total.go. ParseLine must trim surrounding whitespace in SKU and quantity, reject empty SKU and non-positive or invalid quantities, and require exactly two comma-separated fields. Total must sum quantity times unit price in cents for every line, including duplicate SKUs; reject unknown SKUs and negative prices. Keep go.mod and orders_test.go unchanged; add no dependencies. Use only the controlled workspace tools: read_file each source, provide its SHA-256 when writing, and run verify_worktree after the final edit."
+		}
 		for name, content := range files {
 			if err := os.WriteFile(filepath.Join(base, name), []byte(content), 0600); err != nil {
 				return err
 			}
 		}
-		if _, err := providerGrokQualificationGit(ctx, base, "add", "go.mod", "calc.go", "calc_test.go"); err != nil {
+		if _, err := providerGrokQualificationGit(ctx, base, "add", "."); err != nil {
 			return err
 		}
 		if _, err := providerGrokQualificationGit(ctx, base, "-c", "user.name=NTM Acceptance", "-c", "user.email=fixture@localhost", "-c", "commit.gpgsign=false", "commit", "-m", "Initialize provider acceptance fixture"); err != nil {
@@ -63,7 +74,7 @@ func newProviderAcceptanceCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		manifest := map[string]any{"schema_version": "ntm.provider-acceptance.v1", "worktree": worktree, "base_revision": revision, "prompt": "Fix Add in calc.go so the existing tests pass. Keep the tests unchanged. Read the current file, use its SHA-256 when writing, and run verify_worktree after the final edit.", "tests_sha256": sha256StringCLI(files["calc_test.go"]), "scenario_sha256": digestSafeJSON(files), "expected_evidence": []string{"exact_identity", "workspace_edit", "passing_verification", "completion", "local_cleanup", "capacity_release"}, "lifecycle_evidence": []string{"local_cancellation", "guarded_restart"}, "remote_generation_termination": "unverified", "retry_rule": "Another paid attempt requires a relevant fix or new diagnostic evidence. Compare permits one attempt per durable experiment ID; ordinary tasks use distinct durable operation IDs. Unknown outcomes must not be replayed.", "provider_calls": 0}
+		manifest := map[string]any{"schema_version": "ntm.provider-acceptance.v1", "scenario": scenario, "worktree": worktree, "base_revision": revision, "prompt": prompt, "tests_sha256": sha256StringCLI(files[testFile]), "scenario_sha256": digestSafeJSON(files), "expected_evidence": []string{"exact_identity", "workspace_edit", "passing_verification", "completion", "local_cleanup", "capacity_release"}, "lifecycle_evidence": []string{"local_cancellation", "guarded_restart"}, "remote_generation_termination": "unverified", "retry_rule": "Another paid attempt requires a relevant fix or new diagnostic evidence. Compare permits one attempt per durable experiment ID; ordinary tasks use distinct durable operation IDs. Unknown outcomes must not be replayed.", "provider_calls": 0}
 		encoded, err := json.MarshalIndent(manifest, "", "  ")
 		if err != nil {
 			return err
@@ -74,6 +85,75 @@ func newProviderAcceptanceCmd() *cobra.Command {
 		return encodeIndentedJSON(cmd.OutOrStdout(), manifest)
 	}
 	return cmd
+}
+
+func providerOrderAcceptanceFiles() map[string]string {
+	return map[string]string{
+		"go.mod": "module providerparityfixture\n\ngo 1.26.3\n",
+		"parse.go": `package fixture
+
+import (
+ "fmt"
+ "strconv"
+ "strings"
+)
+
+type Line struct { SKU string; Quantity int }
+
+func ParseLine(text string) (Line, error) {
+ fields := strings.Split(text, ",")
+ if len(fields) != 2 { return Line{}, fmt.Errorf("expected SKU,quantity") }
+ quantity, err := strconv.Atoi(fields[1])
+ if err != nil { return Line{}, err }
+ return Line{SKU: fields[0], Quantity: quantity}, nil
+}
+`,
+		"total.go": `package fixture
+
+import "fmt"
+
+func Total(lines []Line, prices map[string]int) (int, error) {
+ total := 0
+ for _, line := range lines {
+  price, ok := prices[line.SKU]
+  if !ok { return 0, fmt.Errorf("unknown SKU") }
+  total += price
+ }
+ return total, nil
+}
+`,
+		"orders_test.go": `package fixture
+
+import "testing"
+
+func TestParseLine(t *testing.T) {
+ for _, text := range []string{"A,2", " A , 2 "} {
+  got, err := ParseLine(text)
+  if err != nil || got != (Line{SKU:"A", Quantity:2}) { t.Fatalf("parse %q: %#v, %v", text, got, err) }
+ }
+ for _, text := range []string{"", "A", "A,1,2", ",1", " ,1", "A,0", "A,-1", "A,x"} {
+  if _, err := ParseLine(text); err == nil { t.Errorf("accepted invalid line %q", text) }
+ }
+}
+
+func TestTotal(t *testing.T) {
+ prices := map[string]int{"A":125, "B":40, "FREE":0}
+ lines := []Line{{"A",2},{"B",3},{"A",1},{"FREE",5}}
+ if got, err := Total(lines, prices); err != nil || got != 495 { t.Fatalf("total = %d, %v; want 495", got, err) }
+ if got, err := Total(nil, prices); err != nil || got != 0 { t.Fatal("empty order") }
+ if _, err := Total([]Line{{"MISSING",1}}, prices); err == nil { t.Fatal("unknown SKU accepted") }
+ if _, err := Total([]Line{{"A",1}}, map[string]int{"A":-1}); err == nil { t.Fatal("negative price accepted") }
+}
+
+func TestImportIntegration(t *testing.T) {
+ var lines []Line
+ for _, text := range []string{" A , 2 ", "B,3", "A,1"} {
+  line, err := ParseLine(text); if err != nil { t.Fatal(err) }; lines = append(lines, line)
+ }
+ if got, err := Total(lines, map[string]int{"A":125,"B":40}); err != nil || got != 495 { t.Fatalf("import = %d, %v", got, err) }
+}
+`,
+	}
 }
 
 type primaryAssignmentOutput struct {
@@ -390,6 +470,9 @@ func runPrimaryAssignment(cmd *cobra.Command, request providerAssignmentRequest,
 	}
 	out.Observation.ExitOK = runErr == nil && result.ExitCode == 0
 	out.Observation.observeWarnings(result.Stderr)
+	if !out.Observation.ExitOK && out.Observation.EventCount == 0 && out.Observation.FailureCategory == "" {
+		out.Observation.FailureCategory = "runtime_error"
+	}
 	for i := range result.Stdout {
 		result.Stdout[i] = 0
 	}

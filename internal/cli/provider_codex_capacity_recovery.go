@@ -26,6 +26,45 @@ import (
 
 const providerCodexCapacityRecoverySchema = "ntm.provider-codex-capacity-recovery.v1"
 
+func newProviderCodexReconciliationPlanCmd() *cobra.Command {
+	var name string
+	cmd := &cobra.Command{Use: "reconciliation-plan", Short: "Show the missing evidence for an uncertain Coding Plan reservation without changing admission", Args: cobra.NoArgs}
+	cmd.Flags().StringVar(&name, "profile", "", "Exact Z.ai Codex profile")
+	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		cfg := loadSelectedConfigOrDefault()
+		if cfg == nil {
+			return errors.New("configuration unavailable")
+		}
+		p, err := cfg.ProviderProfile(name)
+		if err != nil {
+			return err
+		}
+		id, err := p.Identity()
+		if err != nil {
+			return err
+		}
+		if id.Provider() != "zai" || id.Runtime() != "codex" || id.Entitlement() != provider.EntitlementCodexResponses {
+			return errors.New("exact Z.ai Coding Plan Codex profile required")
+		}
+		snapshot := defaultProviderCodexSubscriptionAdmission().Snapshot(id)
+		return encodeIndentedJSON(cmd.OutOrStdout(), providerCodexReconciliationPlan(id, snapshot))
+	}
+	return cmd
+}
+
+func providerCodexReconciliationPlan(id provider.Identity, snapshot ratelimit.SubscriptionCapacitySnapshot) map[string]any {
+	return map[string]any{
+		"schema_version": "ntm.provider-reconciliation-plan.v1", "identity_sha256": id.Hash(),
+		"subscription_scope_sha256": snapshot.SubscriptionScopeSHA256, "unknown_usage_reserved": snapshot.UnknownUsageReserved,
+		"generation_calls": 0, "accounting_mutated": false, "admission_granted": false,
+		"settlement_path":       []string{"bind provider account and original request to the uncertain operation", "obtain terminal provider usage in the applicable billing units", "verify provider settlement cutoff covers the request and all outstanding usage", "persist reviewed evidence before an atomic reservation reconciliation"},
+		"bounded_headroom_path": []string{"obtain authoritative account quota and billing units", "establish an enforceable upper bound for every outstanding request", "deduct those bounds and concurrent reservations atomically from fresh remaining quota", "retain the historical operation as unknown unless separately settled"},
+		"insufficient_evidence": []string{"aggregate model usage or quota alone", "elapsed time or controller reset estimate", "local process exit without provider settlement", "a local signer repeating an unverified provider claim", "a legacy unbound rollout treated as authoritative settlement"},
+		"next_generation":       "strict exact served-model preflight only after authoritative admission",
+		"legacy_recovery":       "recover-capacity is an explicit owner-authorized unbound accounting exception; it is not this authoritative settlement path",
+	}
+}
+
 type providerCodexCapacityRecoveryOptions struct {
 	profile             string
 	operationID         string

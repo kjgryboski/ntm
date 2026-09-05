@@ -74,6 +74,11 @@ func providerWorkspaceBrokerDescriptor(ctx context.Context, worktree string) (*g
 // linked-worktree admission and verifier-manifest discovery, then binds the
 // supplied create-only audit path into the typed Grok descriptor.
 func providerWorkspaceBrokerDescriptorWithAudit(ctx context.Context, worktree, auditFile string) (*grok.WorkspaceBrokerDescriptor, error) {
+	// The MCP child must be able to initialize its verifier before any paid
+	// runtime is launched. In particular, trimpath builds need a bound Go root.
+	if _, err := providerBrokerDeps.newVerifier(); err != nil {
+		return nil, fmt.Errorf("preflight isolated verifier before provider dispatch: %w", err)
+	}
 	worktree, err := filepath.Abs(worktree)
 	if err != nil {
 		return nil, fmt.Errorf("resolve provider broker worktree: %w", err)

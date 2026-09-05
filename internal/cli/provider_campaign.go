@@ -3,16 +3,53 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	"github.com/Dicklesworthstone/ntm/internal/grok"
+	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/zai"
 	"github.com/spf13/cobra"
 )
 
 var providerCampaignID string
+
+type unaccountedQualificationRunner struct{}
+
+func (unaccountedQualificationRunner) Run(context.Context, providerqualification.Invocation) (providerqualification.Outcome, error) {
+	return providerqualification.Outcome{ExitCode: -1}, errors.New("opaque Z.ai Claude qualification cannot account for individual requests; structured admission is required before live dispatch")
+}
+
+func runAccountedLegacyQualification(ctx context.Context, options providerqualification.Options) providerqualification.Receipt {
+	// Preserve diagnostic receipt production, but the legacy opaque transport
+	// cannot be used to evade the Coding Plan admission/usage boundary.
+	options.Runner = unaccountedQualificationRunner{}
+	return providerqualification.Run(ctx, options)
+}
+
+func validateProviderCampaignRoute(cmd *cobra.Command) error {
+	if providerCampaignID == "" {
+		return nil
+	}
+	for parent := cmd; parent != nil; parent = parent.Parent() {
+		if parent.Name() == "provider" {
+			return nil
+		}
+	}
+	if cmd.Parent() == nil && robotGrokACPRun {
+		return nil
+	}
+	if cmd.Name() == "assign" || cmd.Name() == "send" || cmd.Name() == "spawn" || cmd.Name() == "respawn" || cmd.Name() == "interrupt" || cmd.Name() == "status" {
+		if flag := cmd.Flags().Lookup("provider-profile"); flag != nil && flag.Value.String() != "" {
+			return nil
+		}
+	}
+	return errors.New("--campaign-id requires a managed provider route; raw pane commands cannot provide campaign or qualification enforcement")
+}
 
 func openProviderCampaignStore() (*state.Store, error) {
 	home, err := os.UserHomeDir()
@@ -92,4 +129,34 @@ func runBudgetedCodexStructured(ctx context.Context, spec zai.CodexRunSpec) (zai
 		return zai.CodexRunReceipt{}, err
 	}
 	return zai.RunCodexStructured(ctx, spec)
+}
+
+// Native tool rounds each send a generation request. Counting only the outer
+// tool loop would allow its round limit to multiply the campaign allowance.
+type providerBudgetedNativeClient struct {
+	client                        zai.NativeHTTPClient
+	requestID, identity, evidence string
+	round                         atomic.Uint64
+}
+
+func (c *providerBudgetedNativeClient) Do(request *http.Request) (*http.Response, error) {
+	attempt := "native-" + sha256StringCLI(fmt.Sprintf("%s:%d", c.requestID, c.round.Add(1)))
+	if err := reserveProviderExperiment(attempt, c.identity, c.evidence); err != nil {
+		return nil, err
+	}
+	return c.client.Do(request)
+}
+
+func budgetedNativeClient(client zai.NativeHTTPClient, request zai.NativeRequest) zai.NativeHTTPClient {
+	return &providerBudgetedNativeClient{client: client, requestID: request.ExpectedRequestID,
+		identity: sha256StringCLI(request.Endpoint + "\x00" + request.Model + "\x00" + request.ExpectedRequestID),
+		evidence: sha256StringCLI(request.Prompt)}
+}
+
+func runBudgetedNative(ctx context.Context, client zai.NativeHTTPClient, request zai.NativeRequest) (zai.NativeReceipt, error) {
+	return zai.RunNative(ctx, budgetedNativeClient(client, request), request)
+}
+
+func runBudgetedNativeTools(ctx context.Context, client zai.NativeHTTPClient, request zai.NativeToolRequest) (zai.NativeToolReceipt, error) {
+	return zai.RunNativeTools(ctx, budgetedNativeClient(client, request.NativeRequest), request)
 }

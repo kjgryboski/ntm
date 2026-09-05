@@ -425,7 +425,7 @@ var providerQualificationDeps = providerQualificationDependencies{
 	lookPath:   exec.LookPath,
 	version:    providerRuntimeVersion,
 	lookupEnv:  os.LookupEnv,
-	run:        providerqualification.Run,
+	run:        runAccountedLegacyQualification,
 	store:      providerqualification.Store,
 	sign:       signProviderQualificationReceipt,
 	preflight: func(ctx context.Context) error {
@@ -440,7 +440,7 @@ func newProviderCmd() *cobra.Command {
 		Short: "Inspect and qualify exact AI provider lanes",
 	}
 	cmd.AddCommand(newProviderDoctorCmd(), newProviderBaselineCmd(), newProviderQualifyCmd(), newProviderSessionCmd(), newProviderNativeRunCmd(), newProviderCodexCmd(), newProviderVerifyCmd(), newProviderCredentialCmd(), newProviderAttestationCmd(), newProviderCapabilitiesCmd(), newProviderPolicyCmd(), newProviderTelemetryCmd(), newProviderBrokerCmd(), newProviderRoutingCmd())
-	cmd.AddCommand(newProviderPrimaryComparisonCmd(), newProviderAcceptanceCmd(), newProviderCampaignCmd(), newProviderMigrateCmd(), newProviderReadinessCmd())
+	cmd.AddCommand(newProviderPrimaryComparisonCmd(), newProviderAcceptanceCmd(), newProviderCampaignCmd(), newProviderMigrateCmd(), newProviderReadinessCmd(), newProviderScanReviewCmd())
 	return cmd
 }
 
@@ -1920,8 +1920,16 @@ func providerTransportForIdentity(identity provider.Identity) (string, error) {
 }
 
 func runProviderDoctorOnlineProbe(ctx context.Context, profile config.ProviderProfileConfig, identity provider.Identity) (providerDoctorLiveEvidence, error) {
+	if identity.Provider() == "zai" && identity.Runtime() == "claude" {
+		return providerDoctorLiveEvidence{}, errors.New("opaque Z.ai Claude probes lack authoritative request accounting; use the structured admission-controlled provider lane")
+	}
 	nonce, err := providerDoctorNonce()
 	if err != nil {
+		return providerDoctorLiveEvidence{}, err
+	}
+	// Legacy doctor probes generate too. They must share the same durable
+	// ceiling as ordinary work, even though their output grants no qualification.
+	if err := reserveProviderExperiment("doctor-"+sha256StringCLI(nonce), identity.Hash(), digestSafeJSON(profile)); err != nil {
 		return providerDoctorLiveEvidence{}, err
 	}
 	switch {
@@ -1944,13 +1952,6 @@ func runProviderDoctorOnlineProbe(ctx context.Context, profile config.ProviderPr
 			RuntimeContractPassed: result.RuntimeEventContract.Passed,
 			SHA256:                digest,
 		}, nil
-	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementClaudeCompat:
-		receipt, probeErr := zai.Probe(ctx, zai.ProbeSpec{Binary: profile.Command, Endpoint: identity.Endpoint(), Model: identity.Model()})
-		digest := digestSafeJSON(receipt)
-		if probeErr != nil {
-			return providerDoctorLiveEvidence{SHA256: digest}, probeErr
-		}
-		return providerDoctorLiveEvidence{ModelVerified: receipt.ModelSessionEvidence && receipt.Model == identity.Model(), AuthVerified: receipt.ModelSessionEvidence, SHA256: digest}, nil
 	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementCodexResponses:
 		return providerDoctorLiveEvidence{}, errors.New("Z.ai Codex online doctor dispatch is disabled; use provider codex run or provider qualify for admission-controlled, durable, signed execution")
 	case identity.Provider() == "zai" && identity.Entitlement() == provider.EntitlementNativeAPI:

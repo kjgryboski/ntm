@@ -166,7 +166,7 @@ type providerCodexSubscriptionAdmissionEvidence struct {
 
 func newProviderCodexCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "codex", Short: "Operate the isolated Z.ai Coding Plan Codex lane"}
-	cmd.AddCommand(newProviderCodexRunCmd(), newProviderCodexRecoverCapacityCmd())
+	cmd.AddCommand(newProviderCodexRunCmd(), newProviderCodexRecoverCapacityCmd(), newProviderCodexReconciliationPlanCmd())
 	return cmd
 }
 

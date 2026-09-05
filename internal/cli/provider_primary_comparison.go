@@ -425,6 +425,9 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	}
 	observation.ExitOK = runErr == nil && outcome.ExitCode == 0
 	observation.observeWarnings(outcome.Stderr)
+	if !observation.ExitOK && observation.EventCount == 0 && observation.FailureCategory == "" {
+		observation.FailureCategory = "runtime_error"
+	}
 	// Raw streams remain memory-only and are never embedded in diagnostic or
 	// signed evidence. Reuse the common continuously observed process runner.
 	for i := range outcome.Stdout {

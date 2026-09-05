@@ -3,9 +3,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -13,6 +17,50 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 )
+
+func TestPrimarySnapshotRefreshPreservesAccountAndRejectsSwitchExpiryAndBilling(t *testing.T) {
+	now := time.Now().UTC()
+	claude := func(token, refresh string, expiry time.Time) []byte {
+		data, _ := json.Marshal(map[string]any{"claudeAiOauth": map[string]any{"accessToken": token, "refreshToken": refresh, "expiresAt": expiry.UnixMilli(), "subscriptionType": "max"}})
+		return data
+	}
+	old := claude("old-fixture", "same-lineage", now.Add(-time.Hour))
+	fresh := claude("new-fixture", "same-lineage", now.Add(time.Hour))
+	if _, err := primaryCredentialRefreshContinuity(old, fresh, "claude", now); err != nil {
+		t.Fatal(err)
+	}
+	for _, next := range [][]byte{claude("new-fixture", "changed-account-or-rotation", now.Add(time.Hour)), claude("new-fixture", "same-lineage", now), []byte(`{"OPENAI_API_KEY":"fixture"}`)} {
+		if _, err := primaryCredentialRefreshContinuity(old, next, "claude", now); err == nil {
+			t.Fatal("unsafe credential replacement accepted")
+		}
+	}
+	codex := func(account, token string) []byte {
+		data, _ := json.Marshal(map[string]any{"auth_mode": "chatgpt", "tokens": map[string]string{"account_id": account, "access_token": token}})
+		return data
+	}
+	if _, err := primaryCredentialRefreshContinuity(codex("one", "old"), codex("one", "new"), "codex", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := primaryCredentialRefreshContinuity(codex("one", "old"), codex("two", "new"), "codex", now); err == nil {
+		t.Fatal("Codex account switch inherited qualification")
+	}
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	if err := os.WriteFile(path, old, 0600); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := applyPrimaryCredentialSnapshot(path, old, fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, _ := os.ReadFile(backup)
+	current, _ := os.ReadFile(path)
+	if !bytes.Equal(retained, old) || !bytes.Equal(current, fresh) {
+		t.Fatal("refresh lost backup or failed activation")
+	}
+	if _, err := applyPrimaryCredentialSnapshot(path, old, fresh); err == nil {
+		t.Fatal("stale compare-and-swap accepted")
+	}
+}
 
 type providerCredentialStoreFake struct {
 	secret  []byte

@@ -34,7 +34,7 @@ type providerNativeQualificationDependencies struct {
 }
 
 var providerNativeQualificationDeps = providerNativeQualificationDependencies{
-	credential: providerCredentialDeps.store, newNonce: providerNativeNonce, runTools: zai.RunNativeTools,
+	credential: providerCredentialDeps.store, newNonce: providerNativeNonce, runTools: runBudgetedNativeTools,
 	client: zai.DefaultNativeHTTPClient(), newController: newProviderNativeController,
 	prepare: prepareProviderNativeQualificationWorkspace, store: providerqualification.Store,
 	sign: signProviderQualificationReceipt,

@@ -739,6 +739,9 @@ Shell Integration:
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if err := validateProviderCampaignRoute(cmd); err != nil {
+			return err
+		}
 		// Configure remote client if requested
 		if sshHost != "" {
 			tmux.DefaultClient = tmux.NewClient(sshHost)
@@ -2156,6 +2159,10 @@ Shell Integration:
 				return
 			}
 			opts.Prompt, opts.OperationID, opts.Nonce = msg, strings.TrimSpace(robotSendOpID), strings.TrimSpace(robotGrokACPNonce)
+			if err := reserveProviderExperiment(opts.OperationID, resolvedProfile.Identity.Hash(), sha256StringCLI(opts.Prompt)); err != nil {
+				failRobotCommand(err, robot.ErrCodeInvalidFlag, "Use an authorized campaign and a distinct durable operation ID", "robot-grok-acp-run")
+				return
+			}
 			if err := robot.PrintGrokACPOperationAuthorized(runCtx, opts, grokOperationAuthorizer); err != nil {
 				recordRobotProcessExit(err)
 			}

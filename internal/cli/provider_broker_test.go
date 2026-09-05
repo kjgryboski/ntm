@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,16 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 )
+
+func TestProviderBrokerDescriptorRejectsUnusableCompiledVerifierBeforeDispatch(t *testing.T) {
+	prior := providerBrokerDeps.newVerifier
+	defer func() { providerBrokerDeps.newVerifier = prior }()
+	providerBrokerDeps.newVerifier = func() (providerBrokerVerifier, error) { return nil, errors.New("build-bound Go root missing") }
+	_, err := providerWorkspaceBrokerDescriptorWithAudit(t.Context(), "/must-not-reach-workspace", "")
+	if err == nil || !strings.Contains(err.Error(), "preflight isolated verifier") {
+		t.Fatalf("verifier not checked before dispatch: %v", err)
+	}
+}
 
 type providerBrokerVerifierFake struct {
 	manifests []provider.VerificationManifest
