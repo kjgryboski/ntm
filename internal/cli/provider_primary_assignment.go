@@ -504,8 +504,7 @@ func runPrimaryAssignment(cmd *cobra.Command, request providerAssignmentRequest,
 	if errors.Is(ctx.Err(), context.Canceled) && out.CleanupVerified {
 		out.State = "cancelled_local"
 	}
-	diagnostic := providerqualification.PrimaryComparisonDiagnostic{Completed: out.Observation.Completed, NonceVerified: out.Observation.NonceVerified, ModelMatched: out.Observation.ServedModel == id.Model(), Malformed: out.Observation.Malformed, UnexpectedTool: out.Observation.UnexpectedTool, EventCount: out.Observation.EventCount, ExitOK: out.Observation.ExitOK, TerminalCategory: out.Observation.TerminalCategory}
-	diagnostic.FailureCategory = out.Observation.FailureCategory
+	diagnostic := out.Observation.diagnostic(id.Model())
 	_, diagErr := providerqualification.StorePrimaryComparisonDiagnostics("", transport, id.Hash(), policy, digest, out.StartedAt, out.CompletedAt, "before_cleanup", diagnostic)
 	if err = os.RemoveAll(home); err != nil {
 		out.CleanupVerified = false

@@ -82,22 +82,24 @@ func validatePrimaryComparisonProfile(p config.ProviderProfileConfig) (provider.
 }
 
 type primaryComparisonObservation struct {
-	TerminalSeen        bool   `json:"terminal_seen,omitempty"`
-	FailureCategory     string `json:"failure_category,omitempty"`
-	CodeModeUnavailable bool   `json:"code_mode_unavailable,omitempty"`
-	MetadataFallback    bool   `json:"model_metadata_fallback,omitempty"`
-	MCPStarted          int    `json:"mcp_calls_started,omitempty"`
-	MCPCompleted        int    `json:"mcp_calls_completed,omitempty"`
-	MCPFailed           int    `json:"mcp_calls_failed,omitempty"`
-	TerminalCategory    string `json:"terminal_category,omitempty"`
-	Completed           bool   `json:"completed"`
-	NonceVerified       bool   `json:"nonce_verified"`
-	ServedModel         string `json:"served_model,omitempty"`
-	ModelConflict       bool   `json:"model_conflict"`
-	Malformed           bool   `json:"malformed"`
-	UnexpectedTool      bool   `json:"unexpected_tool"`
-	EventCount          int    `json:"event_count"`
-	ExitOK              bool   `json:"exit_ok"`
+	RuntimeFailure      *providerqualification.PrimaryRuntimeFailure `json:"runtime_failure,omitempty"`
+	RuntimeEvents       *providerqualification.PrimaryRuntimeEvents  `json:"runtime_events,omitempty"`
+	TerminalSeen        bool                                         `json:"terminal_seen,omitempty"`
+	FailureCategory     string                                       `json:"failure_category,omitempty"`
+	CodeModeUnavailable bool                                         `json:"code_mode_unavailable,omitempty"`
+	MetadataFallback    bool                                         `json:"model_metadata_fallback,omitempty"`
+	MCPStarted          int                                          `json:"mcp_calls_started,omitempty"`
+	MCPCompleted        int                                          `json:"mcp_calls_completed,omitempty"`
+	MCPFailed           int                                          `json:"mcp_calls_failed,omitempty"`
+	TerminalCategory    string                                       `json:"terminal_category,omitempty"`
+	Completed           bool                                         `json:"completed"`
+	NonceVerified       bool                                         `json:"nonce_verified"`
+	ServedModel         string                                       `json:"served_model,omitempty"`
+	ModelConflict       bool                                         `json:"model_conflict"`
+	Malformed           bool                                         `json:"malformed"`
+	UnexpectedTool      bool                                         `json:"unexpected_tool"`
+	EventCount          int                                          `json:"event_count"`
+	ExitOK              bool                                         `json:"exit_ok"`
 }
 
 func (o primaryComparisonObservation) exactModelVerified(requested string) bool {
@@ -119,6 +121,7 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 		Result      string          `json:"result"`
 		ServerModel string          `json:"server_model"`
 		Message     json.RawMessage `json:"message"`
+		Error       json.RawMessage `json:"error"`
 		Item        struct {
 			Type   string `json:"type"`
 			Text   string `json:"text"`
@@ -172,6 +175,29 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 			o.TerminalCategory = primaryTerminalCategory(e.Result, nonce)
 		}
 	} else {
+		if o.RuntimeEvents == nil {
+			o.RuntimeEvents = &providerqualification.PrimaryRuntimeEvents{}
+		}
+		switch e.Type {
+		case "thread.started":
+			o.RuntimeEvents.ThreadStarted++
+		case "turn.started":
+			o.RuntimeEvents.TurnStarted++
+		case "item.started":
+			o.RuntimeEvents.ItemStarted++
+		case "item.updated":
+			o.RuntimeEvents.ItemUpdated++
+		case "item.completed":
+			o.RuntimeEvents.ItemCompleted++
+		case "error":
+			o.RuntimeEvents.Error++
+		case "turn.failed":
+			o.RuntimeEvents.TurnFailed++
+		case "turn.completed":
+			o.RuntimeEvents.TurnCompleted++
+		default:
+			o.RuntimeEvents.Other++
+		}
 		if e.Item.Type == "mcp_tool_call" {
 			if e.Type == "item.started" {
 				o.MCPStarted++
@@ -205,6 +231,23 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 			model = e.ServerModel
 		}
 		if e.Type == "turn.failed" || e.Type == "error" {
+			// b194851 exec_events.rs exposes only message; its JSONL processor
+			// discards codex_error_info and will_retry. Do not infer those fields
+			// from prose or accept invented JSON extensions. Preserve first error.
+			if o.RuntimeFailure == nil {
+				message := e.Message
+				if e.Type == "turn.failed" {
+					var failure struct {
+						Message json.RawMessage `json:"message"`
+					}
+					if json.Unmarshal(e.Error, &failure) == nil {
+						message = failure.Message
+					} else {
+						message = nil
+					}
+				}
+				o.RuntimeFailure = &providerqualification.PrimaryRuntimeFailure{EventCategory: e.Type, ErrorCode: "unavailable", Retryability: "unknown", MessageCategory: primaryRuntimeMessageCategory(message)}
+			}
 			o.TerminalSeen = true
 			o.Malformed = true
 			o.FailureCategory = "runtime_error"
@@ -227,6 +270,53 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 		}
 		o.ServedModel = model
 	}
+}
+
+// Fixed display strings from pinned Codex b194851 protocol/src/error.rs.
+// Variable suffixes can contain credentials and are never copied or hashed.
+func primaryRuntimeMessageCategory(raw json.RawMessage) string {
+	var message string
+	if json.Unmarshal(raw, &message) != nil || message == "" {
+		return "missing_or_invalid"
+	}
+	for _, match := range []struct{ prefix, category string }{
+		{"stream disconnected before completion: ", "stream_disconnected"},
+		{"rate limit exceeded: ", "rate_limit"},
+		{"Codex ran out of room in the model's context window.", "context_window"},
+		{"Quota exceeded. Check your plan and billing details.", "quota"},
+		{"Selected model is at capacity. Please try a different model.", "model_capacity"},
+		{"request timed out", "request_timeout"},
+		{"timeout waiting for child process to exit", "child_timeout"},
+		{"sandbox error: ", "sandbox"},
+		{"duplicate tool: ", "tool_collision"},
+	} {
+		if strings.HasPrefix(message, match.prefix) {
+			return match.category
+		}
+	}
+	if message == "turn failed" {
+		return "turn_failed"
+	}
+	return "other_text"
+}
+
+// Both ordinary assignment and qualification must persist the same safe fields
+// before cleanup/signing. Optional additions preserve historical signed hashes.
+func (o primaryComparisonObservation) diagnostic(requested string) providerqualification.PrimaryComparisonDiagnostic {
+	d := providerqualification.PrimaryComparisonDiagnostic{
+		RuntimeFailure: o.RuntimeFailure, RuntimeEvents: o.RuntimeEvents,
+		FailureCategory: o.FailureCategory, CodeModeUnavailable: o.CodeModeUnavailable,
+		MetadataFallback: o.MetadataFallback, MCPStarted: o.MCPStarted,
+		MCPCompleted: o.MCPCompleted, MCPFailed: o.MCPFailed, TerminalCategory: o.TerminalCategory,
+		Completed: o.Completed, NonceVerified: o.NonceVerified,
+		ModelMatched:  o.ServedModel != "" && o.ServedModel == requested,
+		ModelConflict: o.ModelConflict, Malformed: o.Malformed, UnexpectedTool: o.UnexpectedTool,
+		EventCount: o.EventCount, ExitOK: o.ExitOK,
+	}
+	if o.ServedModel != "" {
+		d.ModelSHA256 = sha256StringCLI(o.ServedModel)
+	}
+	return d
 }
 
 // Match only source-defined runtime warning categories. Never retain stderr,
@@ -454,14 +544,7 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	outcome.Stderr = nil
 	capacity := admission.ReleaseObserved(id, decision)
 	completed := time.Now().UTC()
-	diagnostic := providerqualification.PrimaryComparisonDiagnostic{Completed: observation.Completed, NonceVerified: observation.NonceVerified, ModelMatched: observation.ServedModel != "" && observation.ServedModel == id.Model(), ModelConflict: observation.ModelConflict, Malformed: observation.Malformed, UnexpectedTool: observation.UnexpectedTool, EventCount: observation.EventCount, ExitOK: observation.ExitOK}
-	diagnostic.FailureCategory = observation.FailureCategory
-	diagnostic.TerminalCategory = observation.TerminalCategory
-	diagnostic.CodeModeUnavailable, diagnostic.MetadataFallback = observation.CodeModeUnavailable, observation.MetadataFallback
-	diagnostic.MCPStarted, diagnostic.MCPCompleted, diagnostic.MCPFailed = observation.MCPStarted, observation.MCPCompleted, observation.MCPFailed
-	if observation.ServedModel != "" {
-		diagnostic.ModelSHA256 = sha256StringCLI(observation.ServedModel)
-	}
+	diagnostic := observation.diagnostic(id.Model())
 	if _, err = providerqualification.StorePrimaryComparisonDiagnostics("", transport, id.Hash(), policy, digest, started, completed, "before_cleanup", diagnostic); err != nil {
 		return err
 	}

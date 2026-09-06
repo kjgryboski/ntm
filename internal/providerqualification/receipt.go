@@ -510,27 +510,76 @@ func StoreWorkspaceDiagnostics(baseDir, transport, identity, policy, runtime str
 // PrimaryComparisonDiagnostic retains closed observations and a model digest,
 // never provider text, credentials, prompts, or a purported account identity.
 type PrimaryComparisonDiagnostic struct {
-	FailureCategory     string `json:"failure_category,omitempty"`
-	CodeModeUnavailable bool   `json:"code_mode_unavailable,omitempty"`
-	MetadataFallback    bool   `json:"model_metadata_fallback,omitempty"`
-	MCPStarted          int    `json:"mcp_calls_started,omitempty"`
-	MCPCompleted        int    `json:"mcp_calls_completed,omitempty"`
-	MCPFailed           int    `json:"mcp_calls_failed,omitempty"`
-	TerminalCategory    string `json:"terminal_category,omitempty"`
-	Completed           bool   `json:"completed"`
-	NonceVerified       bool   `json:"nonce_verified"`
-	ModelSHA256         string `json:"model_sha256,omitempty"`
-	ModelMatched        bool   `json:"model_matched"`
-	ModelConflict       bool   `json:"model_conflict"`
-	Malformed           bool   `json:"malformed"`
-	UnexpectedTool      bool   `json:"unexpected_tool"`
-	EventCount          int    `json:"event_count"`
-	ExitOK              bool   `json:"exit_ok"`
+	RuntimeFailure      *PrimaryRuntimeFailure `json:"runtime_failure,omitempty"`
+	RuntimeEvents       *PrimaryRuntimeEvents  `json:"runtime_events,omitempty"`
+	FailureCategory     string                 `json:"failure_category,omitempty"`
+	CodeModeUnavailable bool                   `json:"code_mode_unavailable,omitempty"`
+	MetadataFallback    bool                   `json:"model_metadata_fallback,omitempty"`
+	MCPStarted          int                    `json:"mcp_calls_started,omitempty"`
+	MCPCompleted        int                    `json:"mcp_calls_completed,omitempty"`
+	MCPFailed           int                    `json:"mcp_calls_failed,omitempty"`
+	TerminalCategory    string                 `json:"terminal_category,omitempty"`
+	Completed           bool                   `json:"completed"`
+	NonceVerified       bool                   `json:"nonce_verified"`
+	ModelSHA256         string                 `json:"model_sha256,omitempty"`
+	ModelMatched        bool                   `json:"model_matched"`
+	ModelConflict       bool                   `json:"model_conflict"`
+	Malformed           bool                   `json:"malformed"`
+	UnexpectedTool      bool                   `json:"unexpected_tool"`
+	EventCount          int                    `json:"event_count"`
+	ExitOK              bool                   `json:"exit_ok"`
+}
+
+// Closed observations from the exec JSONL surface. Message categories are
+// diagnostic hints, never provider codes, retry authority, or readiness evidence.
+type PrimaryRuntimeFailure struct {
+	EventCategory   string `json:"event_category"`
+	ErrorCode       string `json:"error_code"`
+	Retryability    string `json:"retryability"`
+	MessageCategory string `json:"message_category"`
+}
+
+type PrimaryRuntimeEvents struct {
+	ThreadStarted int `json:"thread_started"`
+	TurnStarted   int `json:"turn_started"`
+	ItemStarted   int `json:"item_started"`
+	ItemUpdated   int `json:"item_updated"`
+	ItemCompleted int `json:"item_completed"`
+	Error         int `json:"error"`
+	TurnFailed    int `json:"turn_failed"`
+	TurnCompleted int `json:"turn_completed"`
+	Other         int `json:"other"`
+}
+
+func (d PrimaryComparisonDiagnostic) validateRuntimeDiagnostics() error {
+	if f := d.RuntimeFailure; f != nil {
+		if (f.EventCategory != "error" && f.EventCategory != "turn.failed") || f.ErrorCode != "unavailable" || f.Retryability != "unknown" {
+			return errors.New("invalid primary runtime failure metadata")
+		}
+		switch f.MessageCategory {
+		case "stream_disconnected", "rate_limit", "context_window", "quota", "model_capacity", "request_timeout", "child_timeout", "sandbox", "tool_collision", "turn_failed", "other_text", "missing_or_invalid":
+		default:
+			return errors.New("invalid primary runtime message category")
+		}
+	}
+	if e := d.RuntimeEvents; e != nil {
+		remaining := d.EventCount
+		for _, count := range []int{e.ThreadStarted, e.TurnStarted, e.ItemStarted, e.ItemUpdated, e.ItemCompleted, e.Error, e.TurnFailed, e.TurnCompleted, e.Other} {
+			if count < 0 || count > remaining {
+				return errors.New("invalid primary runtime event counters")
+			}
+			remaining -= count
+		}
+	}
+	return nil
 }
 
 func StorePrimaryComparisonDiagnostics(baseDir, transport, identity, policy, runtime string, started, observed time.Time, phase string, observation PrimaryComparisonDiagnostic) (string, error) {
+	if err := observation.validateRuntimeDiagnostics(); err != nil {
+		return "", err
+	}
 	switch observation.FailureCategory {
-	case "", "invalid_event_envelope", "invalid_assistant_envelope", "duplicate_terminal", "runtime_error", "invalid_model_label", "output_incomplete", "environment_start_failed":
+	case "", "invalid_event_envelope", "invalid_assistant_envelope", "duplicate_terminal", "event_after_terminal", "runtime_error", "invalid_model_label", "output_incomplete", "environment_start_failed":
 	default:
 		return "", errors.New("invalid primary failure category")
 	}

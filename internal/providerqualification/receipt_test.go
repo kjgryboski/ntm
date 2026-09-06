@@ -57,6 +57,24 @@ func testHash(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func TestPrimaryRuntimeDiagnosticsRejectUnboundedFields(t *testing.T) {
+	for _, corrupt := range []func(*PrimaryComparisonDiagnostic){
+		func(d *PrimaryComparisonDiagnostic) { d.RuntimeFailure.EventCategory = "private-canary" },
+		func(d *PrimaryComparisonDiagnostic) { d.RuntimeFailure.ErrorCode = "private-canary" },
+		func(d *PrimaryComparisonDiagnostic) { d.RuntimeFailure.Retryability = "true" },
+		func(d *PrimaryComparisonDiagnostic) { d.RuntimeFailure.MessageCategory = "private-canary" },
+		func(d *PrimaryComparisonDiagnostic) { d.RuntimeEvents.Error = -1 },
+		func(d *PrimaryComparisonDiagnostic) { d.RuntimeEvents.Other = int(^uint(0) >> 1) },
+	} {
+		d := PrimaryComparisonDiagnostic{EventCount: 1, RuntimeEvents: &PrimaryRuntimeEvents{Error: 1}, RuntimeFailure: &PrimaryRuntimeFailure{EventCategory: "error", ErrorCode: "unavailable", Retryability: "unknown", MessageCategory: "other_text"}}
+		corrupt(&d)
+		now := time.Now().UTC()
+		if _, err := StorePrimaryComparisonDiagnostics(t.TempDir(), "openai_codex_comparison", testHash("id"), testHash("policy"), testHash("runtime"), now, now, "before_cleanup", d); err == nil {
+			t.Fatal("unsafe runtime diagnostic accepted")
+		}
+	}
+}
+
 func passingReceipt(t *testing.T, completed time.Time) Receipt {
 	t.Helper()
 	checks := make([]Check, 0, len(requiredChecks))

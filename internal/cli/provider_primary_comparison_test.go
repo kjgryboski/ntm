@@ -14,7 +14,91 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/grok"
+	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 )
+
+func TestPrimaryCodexSourceErrorDiagnosticsSurviveBeforeSigning(t *testing.T) {
+	// Pinned b194851 exec_events.rs / event_processor_with_jsonl_output.rs:
+	// ServerNotification::Error emits error.message, then Failed emits
+	// turn.failed.error.message. Neither exposes structured code or retryability.
+	var o primaryComparisonObservation
+	for _, line := range []string{
+		`{"type":"thread.started","thread_id":"private-canary"}`,
+		`{"type":"turn.started"}`,
+		`{"type":"error","message":"stream disconnected before completion: private-canary","code":"private-canary","retryable":true}`,
+		`{"type":"turn.failed","error":{"message":"private-canary"}}`,
+	} {
+		o.observe([]byte(line), "codex", "nonce")
+	}
+	if o.RuntimeFailure == nil || o.RuntimeFailure.EventCategory != "error" || o.RuntimeFailure.MessageCategory != "stream_disconnected" || o.RuntimeFailure.ErrorCode != "unavailable" || o.RuntimeFailure.Retryability != "unknown" || o.RuntimeEvents.Error != 1 || o.RuntimeEvents.TurnFailed != 1 || o.exactModelVerified("gpt-6-astra") {
+		t.Fatalf("incorrect runtime evidence: %+v", o)
+	}
+	now := time.Now().UTC()
+	diagnostic := o.diagnostic("gpt-6-astra")
+	path, err := providerqualification.StorePrimaryComparisonDiagnostics(t.TempDir(), "openai_codex_comparison", sha256StringCLI("identity"), sha256StringCLI("policy"), sha256StringCLI("runtime"), now, now, "before_cleanup", diagnostic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "private-canary") || !strings.Contains(string(data), "stream_disconnected") || !strings.Contains(string(data), "unsigned_diagnostic_only") {
+		t.Fatalf("lost or unsafe pre-sign diagnostic: %s", data)
+	}
+	for _, raw := range []string{`null`, `[]`, `{"message":"private-canary"}`, `"private-canary"`} {
+		var failure primaryComparisonObservation
+		failure.observe([]byte(`{"type":"turn.failed","error":`+raw+`}`), "codex", "nonce")
+		encoded, err := json.Marshal(failure)
+		if err != nil || failure.RuntimeFailure == nil || strings.Contains(string(encoded), "private-canary") || failure.RuntimeFailure.Retryability != "unknown" {
+			t.Fatalf("unsafe failure shape %s: %s %v", raw, encoded, err)
+		}
+	}
+}
+
+func TestPrimaryDiagnosticProjectionPreservesAssignmentObservations(t *testing.T) {
+	o := primaryComparisonObservation{CodeModeUnavailable: true, MetadataFallback: true, MCPStarted: 2, MCPCompleted: 1, MCPFailed: 1, EventCount: 4, ModelConflict: true, FailureCategory: "event_after_terminal"}
+	d := o.diagnostic("")
+	if !d.CodeModeUnavailable || !d.MetadataFallback || d.MCPStarted != 2 || d.MCPFailed != 1 || !d.ModelConflict || d.ModelMatched {
+		t.Fatal("assignment diagnostic fields lost")
+	}
+	now := time.Now().UTC()
+	if _, err := providerqualification.StorePrimaryComparisonDiagnostics(t.TempDir(), "openai_codex_comparison", sha256StringCLI("identity"), sha256StringCLI("policy"), sha256StringCLI("runtime"), now, now, "before_cleanup", d); err != nil {
+		t.Fatal(err)
+	}
+	var old primaryComparisonObservation
+	if err := json.Unmarshal([]byte(`{"terminal_seen":true,"failure_category":"runtime_error","completed":false,"nonce_verified":false,"model_conflict":false,"malformed":true,"unexpected_tool":false,"event_count":4,"exit_ok":false}`), &old); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(old)
+	if err != nil || strings.Contains(string(encoded), "runtime_failure") || strings.Contains(string(encoded), "runtime_events") {
+		t.Fatal("historical signed observation changed")
+	}
+}
+
+func TestPrimaryCodexMessageCategoriesAreHintsOnly(t *testing.T) {
+	for _, tc := range []struct{ message, category string }{
+		{"rate limit exceeded: private-canary", "rate_limit"},
+		{"Quota exceeded. Check your plan and billing details.", "quota"},
+		{"Selected model is at capacity. Please try a different model.", "model_capacity"},
+		{"request timed out", "request_timeout"},
+		{"timeout waiting for child process to exit", "child_timeout"},
+		{"sandbox error: private-canary", "sandbox"},
+		{"duplicate tool: private-canary", "tool_collision"},
+		{"Codex ran out of room in the model's context window.", "context_window"},
+		{"turn failed", "turn_failed"},
+		{"private-canary", "other_text"},
+		{"", "missing_or_invalid"},
+	} {
+		raw, err := json.Marshal(tc.message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := primaryRuntimeMessageCategory(raw); got != tc.category {
+			t.Fatalf("category %s != %s", got, tc.category)
+		}
+	}
+}
 
 // Loads the production-generated configuration in the reviewed executable.
 // features list does not authenticate or dispatch generation.

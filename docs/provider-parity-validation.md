@@ -197,3 +197,28 @@ fields and acquisition sources. A local operation binding hash cannot by itself
 prove the provider request/account association. Obtain that association, terminal
 usage/units and settlement coverage from an account-owner export or provider
 support. The current aggregate endpoints alone do not establish that association.
+
+## Safe Codex runtime failure diagnostics
+
+Both qualification and ordinary assignments preserve the first runtime error's
+event category and closed message hint, plus counts of known exec event types.
+Unknown event names and all error text, arguments, paths and credentials are
+discarded. The unsigned observation is saved before cleanup/signing; the ordinary
+assignment also binds these fields into its signed outcome. Unsigned diagnostics
+never qualify a provider. Optional fields leave historical signed hashes intact.
+
+Source baseline: Codex fork commit `b194851`, `codex-rs/exec/src/exec_events.rs`
+and `event_processor_with_jsonl_output.rs`. Its `ThreadErrorEvent` contains only
+`message`; the formatter discards structured error information and retryability.
+Consequently this adapter explicitly reports `error_code=unavailable` and
+`retryability=unknown`, even if an unreviewed event supplies extra fields. Message
+hints match fixed strings in `codex-rs/protocol/src/error.rs`; they are not provider
+error codes or permission to retry. Runtime failures remain fail-closed.
+
+The common diagnostic projection also preserves tool counters, startup warnings
+and model-conflict observations for ordinary assignments. `event_after_terminal`
+is an accepted diagnostic failure category, so that failure cannot prevent saving
+the observation. Regression fixtures cover nested/flat errors, malformed shapes,
+unknown text, credential redaction, first-error retention, invalid counters and
+pre-signing storage without readiness promotion. Another paid Codex attempt still
+requires new authorization and a relevant change or diagnostic evidence.
