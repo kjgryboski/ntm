@@ -26,15 +26,18 @@ import (
 // Grok ACP operation. Prompt and nonce are accepted only as input; neither is
 // returned in the robot receipt.
 type GrokACPOperationOptions struct {
-	Prompt         string
-	CWD            string
-	Binary         string
-	RuntimeHome    string
-	Model          string
-	RuntimeVersion string
-	OperationID    string
-	Nonce          string
-	Identity       provider.Identity
+	ResumeSession   string
+	ParentOperation string
+	CloseSession    bool
+	Prompt          string
+	CWD             string
+	Binary          string
+	RuntimeHome     string
+	Model           string
+	RuntimeVersion  string
+	OperationID     string
+	Nonce           string
+	Identity        provider.Identity
 	// OperationScope is the permission level being requested. It is part of the
 	// durable idempotency binding: an operation ID admitted for review can never
 	// be replayed as a workspace-write request. Empty means observe only.
@@ -114,11 +117,16 @@ type GrokACPExecutionEvidence struct {
 // completion metadata.
 type GrokACPOperationOutput struct {
 	RobotResponse
-	OperationID                string                `json:"operation_id"`
-	Provider                   string                `json:"provider"`
-	OperationScope             GrokACPOperationScope `json:"operation_scope"`
-	QualificationReceiptSHA256 string                `json:"qualification_receipt_sha256,omitempty"`
-	ProviderIdentitySHA256     string                `json:"provider_identity_sha256"`
+	WorkspaceSHA256            string                        `json:"workspace_sha256,omitempty"`
+	ParentOperationSHA256      string                        `json:"parent_operation_sha256,omitempty"`
+	SessionResumed             bool                          `json:"session_resumed,omitempty"`
+	SessionClosed              bool                          `json:"session_closed,omitempty"`
+	ProtocolObservation        *provider.ProtocolObservation `json:"protocol_observation,omitempty"`
+	OperationID                string                        `json:"operation_id"`
+	Provider                   string                        `json:"provider"`
+	OperationScope             GrokACPOperationScope         `json:"operation_scope"`
+	QualificationReceiptSHA256 string                        `json:"qualification_receipt_sha256,omitempty"`
+	ProviderIdentitySHA256     string                        `json:"provider_identity_sha256"`
 	// ProviderIdentityEvidence describes the complete tuple. Structured ACP
 	// observations can prove session/model facts, but endpoint/config remain
 	// profile-attested unless an adapter records separate runtime proof.
@@ -408,6 +416,14 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 	// operation ID replay the stored receipt without retaining the nonce or
 	// dispatching again. PromptSHA256 still records the exact nonce-bound packet.
 	output.BindingSHA256 = grokACPBindingHash(opts.Identity, logicalPromptHash, opts.CWD, opts.Binary, opts.RuntimeHome, opts.RuntimeVersion, toolDigest, brokerDigest, operationScope, output.QualificationReceiptSHA256)
+	output.WorkspaceSHA256 = sha256Hex(opts.CWD)
+	if opts.ResumeSession != "" || opts.ParentOperation != "" || opts.CloseSession {
+		if opts.ResumeSession == "" || opts.ParentOperation == "" {
+			return output, errors.New("persistent session requires an exact predecessor and session")
+		}
+		output.ParentOperationSHA256 = sha256Hex(opts.ParentOperation)
+		output.BindingSHA256 = sha256Hex(fmt.Sprintf("%s\x00%s\x00%s\x00%t", output.BindingSHA256, opts.ResumeSession, opts.ParentOperation, opts.CloseSession))
+	}
 	if opts.ReceiptSigner != nil || opts.TrustedSigner.KeyID != "" {
 		preflight := *output
 		preflight.RobotResponse = NewRobotResponse(false)
@@ -493,6 +509,8 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 	}()
 
 	result, runErr := deps.Engine.Run(ctx, grok.Request{
+		ResumeSession:        opts.ResumeSession,
+		CloseSession:         opts.CloseSession,
 		Prompt:               transmittedPrompt,
 		ExpectedNonce:        nonce,
 		OperationID:          operationID,
@@ -506,6 +524,7 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 		BeforeCleanup:        opts.BeforeCleanup,
 	})
 	applyGrokACPResult(output, result, deps.Evidence)
+	output.SessionResumed, output.SessionClosed = result.SessionResumed, result.SessionClosed
 	if runErr != nil {
 		// Only exact provider/account conditions belong in the provider circuit.
 		// Local launch, protocol, timeout, and outcome-unknown failures are not
@@ -515,6 +534,16 @@ func RunGrokACPOperation(ctx context.Context, opts GrokACPOperationOptions, deps
 		}
 		applyGrokACPError(output, runErr)
 		return output, runErr
+	}
+	if opts.ResumeSession != "" && (!result.SessionResumed || result.ProviderSessionID != opts.ResumeSession) {
+		output.RobotResponse = NewErrorResponse(errors.New("Grok ACP did not resume the exact predecessor session"), ErrCodeDispatchUnknown, "Inspect the saved session outcome before any further dispatch")
+		output.State = grok.StateOutcomeUnknown
+		return output, errors.New("resumed session identity differs")
+	}
+	if opts.CloseSession && result.SessionClosed && result.Success && result.Cleanup.Reaped && !result.Cleanup.ObservedAt.IsZero() && result.Cleanup.ResidualPIDs != nil && len(result.Cleanup.ResidualPIDs) == 0 {
+		output.State = "session_closed"
+		output.RobotResponse = NewRobotResponse(true)
+		return output, nil
 	}
 	if !result.CompletionConfirmed || strings.TrimSpace(result.StopReason) == "" {
 		output.RobotResponse = NewErrorResponse(errors.New("Grok ACP completed without authoritative terminal metadata"), ErrCodeDispatchUnknown, "Inspect the provider session before retrying")
@@ -706,6 +735,8 @@ func applyGrokACPResult(output *GrokACPOperationOutput, result grok.Result, evid
 	if output == nil {
 		return
 	}
+	observation := result.ProtocolObservation.Redacted()
+	output.ProtocolObservation = &observation
 	output.ProviderSessionID = result.ProviderSessionID
 	output.StopReason = result.StopReason
 	output.CompletionConfirmed = result.CompletionConfirmed

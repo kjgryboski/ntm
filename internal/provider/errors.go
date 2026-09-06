@@ -13,6 +13,7 @@ type ProtocolObservation struct {
 	ToolRequests            int                   `json:"tool_requests"`
 	ToolCompletions         int                   `json:"tool_completions"`
 	PermissionDenials       int                   `json:"permission_denials"`
+	BrokerRejectedCalls     int                   `json:"broker_rejected_calls,omitempty"`
 	AssistantTextChunks     int                   `json:"assistant_text_chunks,omitempty"`
 	AssistantTextBytes      int64                 `json:"assistant_text_bytes,omitempty"`
 	ReplyBoundaries         int                   `json:"reply_boundaries,omitempty"`
@@ -48,7 +49,7 @@ func (o ProtocolObservation) Redacted() ProtocolObservation {
 	}
 	switch o.Stage {
 	case "request_validation", "process_start", "initialize", "auth_method_selection", "authenticate", "session_new",
-		"prompt_write", "prompt_response", "completion_metadata", "post_response_updates", "completion_validation":
+		"session_resume", "session_close", "prompt_write", "prompt_response", "completion_metadata", "post_response_updates", "completion_validation":
 	default:
 		o.Stage = "unobserved"
 	}
@@ -59,6 +60,7 @@ func (o ProtocolObservation) Redacted() ProtocolObservation {
 	o.ToolRequests = max(0, o.ToolRequests)
 	o.ToolCompletions = max(0, o.ToolCompletions)
 	o.PermissionDenials = max(0, o.PermissionDenials)
+	o.BrokerRejectedCalls = max(0, o.BrokerRejectedCalls)
 	o.AssistantTextChunks = max(0, o.AssistantTextChunks)
 	o.AssistantTextBytes = max(0, o.AssistantTextBytes)
 	o.ReplyBoundaries = max(0, o.ReplyBoundaries)

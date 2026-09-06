@@ -43,7 +43,7 @@ func validateProviderCampaignRoute(cmd *cobra.Command) error {
 	if cmd.Parent() == nil && robotGrokACPRun {
 		return nil
 	}
-	if cmd.Name() == "assign" || cmd.Name() == "send" || cmd.Name() == "spawn" || cmd.Name() == "respawn" || cmd.Name() == "interrupt" || cmd.Name() == "status" {
+	if cmd.Name() == "assign" || cmd.Name() == "send" || cmd.Name() == "spawn" || cmd.Name() == "respawn" || cmd.Name() == "resume" || cmd.Name() == "interrupt" || cmd.Name() == "status" {
 		if flag := cmd.Flags().Lookup("provider-profile"); flag != nil && flag.Value.String() != "" {
 			return nil
 		}

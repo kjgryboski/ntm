@@ -32,6 +32,7 @@ const providerRoutingSchema = "ntm.provider-routing.v1"
 type providerAssignmentRequest struct {
 	Profile, OperationID, Prompt, CWD string
 	ParentSession                     string
+	CloseSession                      bool
 	RestartOf                         string
 	Timeout                           time.Duration
 	BaseRevision                      string
@@ -44,6 +45,9 @@ type providerAssignmentRequest struct {
 var dispatchProviderAssignment = runProviderAssignment
 
 type providerAssignmentStatus struct {
+	SessionResumed             bool                                 `json:"session_resumed,omitempty"`
+	SessionClosed              bool                                 `json:"session_closed,omitempty"`
+	ParentOperationSHA256      string                               `json:"parent_operation_sha256,omitempty"`
 	Schema                     string                               `json:"schema_version"`
 	Profile                    string                               `json:"profile"`
 	Provider                   string                               `json:"provider"`
@@ -155,6 +159,7 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 				return errors.New("provider assignment identity or signer differs from selected profile")
 			}
 			out.State, out.ServedModel = receipt.State, receipt.ResolvedModel
+			out.SessionResumed, out.SessionClosed, out.ParentOperationSHA256 = receipt.SessionResumed, receipt.SessionClosed, receipt.ParentOperationSHA256
 			out.CompletionConfirmed = receipt.CompletionConfirmed && receipt.AcknowledgementVerified
 			out.LocalCleanupVerified = receipt.Cleanup.Reaped && receipt.Cleanup.ResidualPIDs != nil && len(receipt.Cleanup.ResidualPIDs) == 0 && !receipt.Cleanup.ObservedAt.IsZero()
 		} else if identity.Provider() == "anthropic" || identity.Provider() == "openai" {
@@ -272,6 +277,9 @@ func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest
 	if err != nil {
 		return err
 	}
+	if request.CloseSession && (identity.Provider() != "xai" || identity.Runtime() != "grok") {
+		return errors.New("session close is supported only by the Grok ACP adapter")
+	}
 	if identity.Provider() == "xai" || identity.Provider() == "zai" {
 		request.CWD, err = filepath.Abs(request.CWD)
 		if err != nil {
@@ -304,9 +312,6 @@ func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest
 	case identity.Provider() == "zai" && identity.Runtime() == "codex":
 		return runProviderCodex(cmd, providerCodexRunOptions{profile: request.Profile, operationID: request.OperationID, prompt: request.Prompt, cwd: request.CWD, parentSession: request.ParentSession, timeout: request.Timeout, live: true, workspaceWrite: true, workloadClass: providerCodexWorkloadImplementation}, providerCodexRunDeps)
 	case identity.Provider() == "xai" && identity.Runtime() == "grok":
-		if request.ParentSession != "" {
-			return errors.New("Grok ACP workspace resume is unsupported; its one-shot assignment cannot be silently restarted")
-		}
 		resolved, err := resolveGrokACPProviderProfile(loaded, request.Profile, "", "")
 		if err != nil {
 			return err
@@ -318,14 +323,25 @@ func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest
 			return err
 		}
 		opts.Prompt, opts.OperationID = request.Prompt, request.OperationID
+		if request.ParentSession != "" {
+			parent, err := claimGrokSessionSuccessor(ctx, ledger, profile, identity, request, opts.TrustedSigner)
+			if err != nil {
+				return err
+			}
+			opts.ResumeSession, opts.ParentOperation, opts.CloseSession = parent.ProviderSessionID, request.ParentSession, request.CloseSession
+		} else if request.CloseSession {
+			return errors.New("closing a session requires its last completed operation")
+		}
 		if err := checkProviderDispatchClock(clockStarted); err != nil {
 			return err
 		}
 		if err := ctx.Err(); err != nil {
 			return &providerEnvironmentError{reason: "prerequisite_deadline_expired"}
 		}
-		if err := reserveProviderExperiment(request.OperationID, identity.Hash(), sha256StringCLI(request.Prompt)); err != nil {
-			return err
+		if !request.CloseSession {
+			if err := reserveProviderExperiment(request.OperationID, identity.Hash(), sha256StringCLI(request.Prompt)); err != nil {
+				return err
+			}
 		}
 		output, runErr := robot.ExecuteGrokACPOperationAuthorized(ctx, opts, authorizer)
 		if output == nil {

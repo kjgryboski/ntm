@@ -128,7 +128,7 @@ Examples:
 	cmd.Flags().StringVar(&fromPath, "from", "", "Specific handoff file to resume from")
 	cmd.Flags().StringVar(&providerProfile, "provider-profile", "", "Resume a supported provider session through its exact qualified adapter")
 	cmd.Flags().StringVar(&providerOperationID, "operation-id", "", "New durable operation ID for the resume turn")
-	cmd.Flags().StringVar(&providerParent, "parent-session", "", "Exact provider session to resume; no automatic restart fallback")
+	cmd.Flags().StringVar(&providerParent, "parent-session", "", "Exact provider session; for Grok ACP, the last completed operation ID")
 	cmd.Flags().StringVar(&providerPrompt, "prompt", "", "Assignment for the resumed provider session")
 	cmd.Flags().StringVar(&providerCWD, "cwd", "", "Linked disposable worktree bound to the provider session")
 	cmd.Flags().DurationVar(&providerTimeout, "timeout", 20*time.Minute, "Maximum duration of the provider resume turn")

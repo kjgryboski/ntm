@@ -115,7 +115,7 @@ func CapabilityMatrix() map[string]OperationCapabilities {
 			Launch:               EvidenceAuthoritative, Delivery: EvidenceAuthoritative,
 			Completion: EvidenceAuthoritative, CompletionAuthorityScope: EvidenceAuthorityScopeProvider,
 			Cancellation: EvidenceAuthoritative, CancellationAuthorityScope: EvidenceAuthorityScopeAgentACP,
-			Resume: EvidenceUnavailable, Cleanup: EvidenceAuthoritative, CleanupAuthorityScope: EvidenceAuthorityScopeLocalProcessTree,
+			Resume: EvidenceAuthoritative, Cleanup: EvidenceAuthoritative, CleanupAuthorityScope: EvidenceAuthorityScopeLocalProcessTree,
 			LaunchCapacityControl: EvidenceAuthoritative, RequestCapacityControl: EvidenceAuthoritative,
 			LiveErrorFeedback: EvidenceUnavailable,
 		},

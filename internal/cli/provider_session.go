@@ -126,9 +126,20 @@ type providerSessionOutput struct {
 func newProviderSessionCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "session",
-		Short: "Resume or fork an exact native Grok headless session",
+		Short: "Manage exact Grok session resume, fork and close operations",
 	}
-	cmd.AddCommand(newProviderSessionActionCmd(grok.SessionResume), newProviderSessionActionCmd(grok.SessionFork))
+	cmd.AddCommand(newProviderSessionActionCmd(grok.SessionResume), newProviderSessionActionCmd(grok.SessionFork), newProviderSessionCloseCmd())
+	return cmd
+}
+
+func newProviderSessionCloseCmd() *cobra.Command {
+	r := providerAssignmentRequest{Prompt: "Close the existing ACP session without generation", Timeout: 30 * time.Second, CloseSession: true}
+	cmd := &cobra.Command{Use: "close", Short: "Close a verified Grok ACP session through shared assignment controls", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error { return dispatchProviderAssignment(cmd, r) }}
+	cmd.Flags().StringVar(&r.Profile, "profile", "", "Exact Grok profile")
+	cmd.Flags().StringVar(&r.ParentSession, "parent-operation", "", "Last completed operation in the persistent session")
+	cmd.Flags().StringVar(&r.OperationID, "operation-id", "", "Unique close operation ID")
+	cmd.Flags().StringVar(&r.CWD, "cwd", "", "Original isolated worktree")
+	cmd.Flags().DurationVar(&r.Timeout, "timeout", r.Timeout, "Bounded close timeout")
 	return cmd
 }
 

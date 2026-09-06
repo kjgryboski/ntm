@@ -139,6 +139,7 @@ type providerBroker struct {
 	audit               *providerBrokerAudit
 	lastSuccessfulWrite uint64
 	lastVerifiedWrite   uint64
+	rejectedCalls       int
 }
 
 const providerBrokerAuditSchemaVersion = "ntm.provider-workspace-broker-audit.v1"
@@ -371,7 +372,14 @@ func (a *providerBrokerAudit) write(value any) error {
 	return a.file.Sync()
 }
 
+// RejectedCalls preserves a payload-free denial count for ordinary signed
+// controller receipts even when no qualification audit file was requested.
+func (b *providerBroker) RejectedCalls() int { return b.rejectedCalls }
+
 func (b *providerBroker) recordToolEvent(tool, path string, success, rejected bool, workspaceReceipt *provider.WorkspaceOperationReceipt, verificationReceipt *provider.VerificationReceipt, cause error) error {
+	if b != nil && rejected {
+		b.rejectedCalls++
+	}
 	if b == nil || b.audit == nil {
 		return nil
 	}

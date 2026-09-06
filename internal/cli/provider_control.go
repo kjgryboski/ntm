@@ -22,6 +22,53 @@ import (
 const providerControlScope = "provider:assignment-control"
 const providerCancelScope = "provider:assignment-cancel"
 
+// One immutable edge per completed turn prevents forks and duplicate work.
+// An interrupted claimant is quarantined; elapsed time never grants takeover.
+func claimGrokSessionSuccessor(ctx context.Context, ledger providerNativeOperationLedger, profile config.ProviderProfileConfig, identity provider.Identity, request providerAssignmentRequest, trusted providerattestation.KeyMetadata) (*robot.GrokACPOperationOutput, error) {
+	if request.ParentSession == request.OperationID || !validProviderNativeOperationID(request.ParentSession) {
+		return nil, errors.New("resume requires a distinct completed predecessor operation ID")
+	}
+	row, err := ledger.GetSendOperation(request.ParentSession, "provider:xai-acp")
+	if err != nil {
+		return nil, err
+	}
+	var parent robot.GrokACPOperationOutput
+	if row == nil || row.Status != state.SendOperationCompleted || json.Unmarshal([]byte(row.OutcomeJSON), &parent) != nil || !robot.ValidGrokACPOperationSignature(parent, trusted) || parent.BindingSHA256 != row.BindingHash || parent.ProviderIdentitySHA256 != identity.Hash() || parent.WorkspaceSHA256 != sha256StringCLI(request.CWD) || parent.ProviderSessionID == "" || parent.SessionClosed || !parent.Cleanup.Reaped || parent.Cleanup.ResidualPIDs == nil || len(parent.Cleanup.ResidualPIDs) != 0 {
+		return nil, errors.New("predecessor lacks a signed completed session for this exact identity and workspace")
+	}
+	// A confirmed cancellation may be closed without promoting it to completed
+	// coding work. It cannot authorize another generation turn.
+	closeCancelled := request.CloseSession && parent.State == grok.StateCancelled && parent.StopReason == "cancelled" && parent.Cancellation.Requested && parent.Cancellation.AgentACPAcknowledged && parent.Cancellation.SessionSHA256 == sha256StringCLI(parent.ProviderSessionID)
+	completed := parent.State == grok.StateCompleted && parent.CompletionConfirmed && parent.AcknowledgementVerified && parent.ResolvedModel != "" && parent.ResolvedModel == grok.ExpectedResolvedModel(profile.RuntimeVersion, identity.Model()) && parent.RuntimeEventContract.Passed
+	if (!completed && !closeCancelled) || parent.RuntimeVersion != profile.RuntimeVersion || parent.Model != identity.Model() || parent.Cleanup.ObservedAt.IsZero() {
+		return nil, errors.New("predecessor runtime, model or terminal event evidence is incomplete")
+	}
+	control, err := ledger.GetSendOperation(request.ParentSession, providerControlScope)
+	if err != nil {
+		return nil, err
+	}
+	var outcome providerControlOutcome
+	if control == nil || control.Status != state.SendOperationCompleted || json.Unmarshal([]byte(control.OutcomeJSON), &outcome) != nil || outcome.IdentitySHA256 != identity.Hash() || outcome.OperationBindingSHA256 != row.BindingHash || (!closeCancelled && !validProviderWorkspaceCompletion(outcome.WorkspaceCompletion, row, identity, trusted)) {
+		return nil, errors.New("predecessor controller cleanup and workspace verification are incomplete")
+	}
+	capacity := outcome.Capacity
+	if capacity == nil || capacity.IdentitySHA256 != identity.Hash() || capacity.Scope != provider.CapacityControlScopeLocalShared || !capacity.LocalSlotReleased || capacity.ObservedAt.IsZero() {
+		return nil, errors.New("predecessor local capacity release is unverified")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	binding := sha256StringCLI(fmt.Sprintf("%s\x00%s\x00%s\x00%t", identity.Hash(), request.OperationID, sha256StringCLI(request.Prompt), request.CloseSession))
+	edge, won, err := ledger.ClaimSendOperation(&state.SendOperation{OperationID: request.ParentSession, SessionName: "provider:grok-session-successor", BindingHash: binding, PayloadSHA256: sha256StringCLI(request.OperationID), CreatedAt: time.Now().UTC()})
+	if err != nil {
+		return nil, err
+	}
+	if !won && (edge == nil || edge.BindingHash != binding) {
+		return nil, errors.New("session already has a successor; use the last completed operation or reconcile its uncertain outcome")
+	}
+	return &parent, nil
+}
+
 type providerControlOutcome struct {
 	IdentitySHA256         string                               `json:"identity_sha256"`
 	OperationBindingSHA256 string                               `json:"operation_binding_sha256"`
@@ -151,6 +198,9 @@ func beginProviderControl(ctx context.Context, ledger providerNativeOperationLed
 		return nil, nil, err
 	}
 	binding := sha256StringCLI(identity.Hash() + "\x00" + request.OperationID + "\x00" + sha256StringCLI(request.Prompt) + "\x00" + absolute + "\x00" + request.ParentSession + "\x00" + request.RestartOf)
+	if request.CloseSession {
+		binding = sha256StringCLI(binding + "\x00session_close")
+	}
 	row, won, err := ledger.ClaimSendOperation(&state.SendOperation{OperationID: request.OperationID, SessionName: providerControlScope, BindingHash: binding, PayloadSHA256: identity.Hash(), CreatedAt: time.Now().UTC()})
 	if err != nil {
 		return nil, nil, err

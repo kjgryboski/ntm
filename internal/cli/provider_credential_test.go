@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +19,45 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 )
+
+func TestClaudeRotatedSnapshotRequiresAuthenticatedOriginalAccount(t *testing.T) {
+	now := time.Now().UTC()
+	snapshot := func(token, refresh string, expiry time.Time) []byte {
+		b, _ := json.Marshal(map[string]any{"claudeAiOauth": map[string]any{"accessToken": token, "refreshToken": refresh, "expiresAt": expiry.UnixMilli(), "subscriptionType": "max"}})
+		return b
+	}
+	old, next := snapshot("old-private", "old-lineage", now.Add(-time.Hour)), snapshot("new-private", "rotated-lineage", now.Add(time.Hour))
+	for _, tc := range []struct {
+		name, body string
+		status     int
+		want       bool
+	}{
+		{"matched", `{"account":{"uuid":"original","has_claude_max":true},"organization":{"organization_type":"claude_max"}}`, 200, true},
+		{"foreign", `{"account":{"uuid":"other","has_claude_max":true},"organization":{"organization_type":"claude_max"}}`, 200, false},
+		{"wrong_plan", `{"account":{"uuid":"original","has_claude_max":false},"organization":{"organization_type":"claude_pro"}}`, 200, false},
+		{"expired_token", `{"private":"server-canary"}`, 401, false},
+		{"redirect", `{}`, 302, false},
+		{"malformed", `null`, 200, false},
+	} {
+		calls := 0
+		scope, err := primaryClaudeAccountContinuity(t.Context(), old, next, sha256StringCLI("original"), now, func(r *http.Request) (*http.Response, error) {
+			calls++
+			if r.URL.String() != "https://api.anthropic.com/api/oauth/profile" || r.Method != "GET" || r.Header.Get("Authorization") != "Bearer new-private" || r.Body != nil {
+				t.Fatal("credential sent outside the reviewed account lookup")
+			}
+			return &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+		})
+		if (err == nil) != tc.want || calls != 1 || strings.Contains(scope, "private") || (err != nil && strings.Contains(err.Error(), "server-canary")) {
+			t.Fatalf("%s: %s %v", tc.name, scope, err)
+		}
+	}
+	if _, err := primaryClaudeAccountContinuity(t.Context(), old, snapshot("new-private", "rotated-lineage", now), sha256StringCLI("original"), now, func(*http.Request) (*http.Response, error) {
+		t.Fatal("expired snapshot contacted provider")
+		return nil, nil
+	}); err == nil {
+		t.Fatal("expired snapshot accepted")
+	}
+}
 
 func TestPrimarySnapshotRefreshPreservesAccountAndRejectsSwitchExpiryAndBilling(t *testing.T) {
 	now := time.Now().UTC()

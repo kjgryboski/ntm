@@ -122,6 +122,8 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 		ServerModel string          `json:"server_model"`
 		Message     json.RawMessage `json:"message"`
 		Error       json.RawMessage `json:"error"`
+		ErrorInfo   json.RawMessage `json:"codex_error_info"`
+		WillRetry   *bool           `json:"will_retry"`
 		Item        struct {
 			Type   string `json:"type"`
 			Text   string `json:"text"`
@@ -231,26 +233,46 @@ func (o *primaryComparisonObservation) observe(line []byte, runtime, nonce strin
 			model = e.ServerModel
 		}
 		if e.Type == "turn.failed" || e.Type == "error" {
-			// b194851 exec_events.rs exposes only message; its JSONL processor
-			// discards codex_error_info and will_retry. Do not infer those fields
-			// from prose or accept invented JSON extensions. Preserve first error.
+			// The corrected exec producer preserves typed categories and retry
+			// intent. Older producers remain explicitly unavailable/unknown.
+			info, retry := e.ErrorInfo, e.WillRetry
+			message := e.Message
+			if e.Type == "turn.failed" {
+				var failure struct {
+					Message   json.RawMessage `json:"message"`
+					ErrorInfo json.RawMessage `json:"codex_error_info"`
+					WillRetry *bool           `json:"will_retry"`
+				}
+				if json.Unmarshal(e.Error, &failure) == nil {
+					message, info, retry = failure.Message, failure.ErrorInfo, failure.WillRetry
+				} else {
+					message, info, retry = nil, nil, nil
+				}
+			}
 			if o.RuntimeFailure == nil {
-				message := e.Message
-				if e.Type == "turn.failed" {
-					var failure struct {
-						Message json.RawMessage `json:"message"`
-					}
-					if json.Unmarshal(e.Error, &failure) == nil {
-						message = failure.Message
-					} else {
-						message = nil
+				code := ""
+				if json.Unmarshal(info, &code) != nil {
+					var tagged map[string]json.RawMessage
+					if json.Unmarshal(info, &tagged) == nil && len(tagged) == 1 {
+						for key := range tagged {
+							code = key
+						}
 					}
 				}
-				o.RuntimeFailure = &providerqualification.PrimaryRuntimeFailure{EventCategory: e.Type, ErrorCode: "unavailable", Retryability: "unknown", MessageCategory: primaryRuntimeMessageCategory(message)}
+				retryability := "unknown"
+				if retry != nil {
+					retryability = "not_retrying"
+					if *retry && e.Type != "turn.failed" {
+						retryability = "retrying"
+					}
+				}
+				o.RuntimeFailure = &providerqualification.PrimaryRuntimeFailure{EventCategory: e.Type, ErrorCode: providerqualification.PrimaryRuntimeErrorCode(code), Retryability: retryability, MessageCategory: primaryRuntimeMessageCategory(message)}
 			}
-			o.TerminalSeen = true
-			o.Malformed = true
-			o.FailureCategory = "runtime_error"
+			if e.Type == "turn.failed" || retry == nil || !*retry || o.TerminalSeen {
+				o.TerminalSeen = true
+				o.Malformed = true
+				o.FailureCategory = "runtime_error"
+			}
 		}
 	}
 	if model != "" {

@@ -95,6 +95,66 @@ func TestToolContentArraysPreserveTerminalLifecycleWithoutAcknowledgement(t *tes
 	}
 }
 
+func TestRunResumesAndClosesAdvertisedSession(t *testing.T) {
+	for _, closeSession := range []bool{false, true} {
+		terminal := `{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}`
+		if closeSession {
+			terminal = `{"jsonrpc":"2.0","id":4,"result":{"_meta":{"x.ai/closeOutcome":"closed"}}}`
+		}
+		transcript := strings.Join([]string{
+			`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}],"agentCapabilities":{"sessionCapabilities":{"resume":{},"close":{}}}}}`,
+			`{"jsonrpc":"2.0","id":2,"result":{}}`,
+			`{"jsonrpc":"2.0","id":3,"result":{}}`, terminal,
+		}, "\n") + "\n"
+		proc := newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))
+		result, err := Run(t.Context(), &fakeRunner{proc: proc}, Request{Prompt: "next turn", CWD: "/work/project", ResumeSession: "previous-session", CloseSession: closeSession})
+		if err != nil || !result.Success || !result.SessionResumed || result.SessionClosed != closeSession || result.CompletionConfirmed == closeSession || !result.Cleanup.Reaped {
+			t.Fatalf("resume/close: %+v %v", result, err)
+		}
+		requests := decodeRequests(t, proc.stdin.String())
+		lastMethod := "session/prompt"
+		if closeSession {
+			lastMethod = "session/close"
+		}
+		if len(requests) != 4 || requests[2].Method != "session/resume" || requests[3].Method != lastMethod || nestedString(t, requests[2].Params, "sessionId") != "previous-session" || nestedString(t, requests[3].Params, "sessionId") != "previous-session" {
+			t.Fatalf("wrong persistent transcript: %s", proc.stdin.String())
+		}
+	}
+}
+
+func TestRunCloseRejectsUnconfirmedAndSupersededOutcomes(t *testing.T) {
+	for _, response := range []string{`{}`, `null`, `{"_meta":{"x.ai/closeOutcome":"notResident"}}`, `{"_meta":{"x.ai/closeOutcome":"superseded"}}`} {
+		transcript := `{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}],"agentCapabilities":{"sessionCapabilities":{"resume":{},"close":{}}}}}` + "\n" + `{"jsonrpc":"2.0","id":2,"result":{}}` + "\n" + `{"jsonrpc":"2.0","id":3,"result":{}}` + "\n" + `{"jsonrpc":"2.0","id":4,"result":` + response + `}` + "\n"
+		proc := newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))
+		result, err := Run(t.Context(), &fakeRunner{proc: proc}, Request{Prompt: "close", CWD: "/work/project", ResumeSession: "previous-session", CloseSession: true})
+		if err == nil || result.SessionClosed || result.Success || strings.Contains(proc.stdin.String(), "session/prompt") {
+			t.Fatal("unconfirmed close became success or generated a prompt")
+		}
+	}
+}
+
+func TestRunResumeFailsBeforePromptForMissingCapabilityOrMismatchedSession(t *testing.T) {
+	for _, tc := range []struct {
+		capabilities, result string
+		requests             int
+	}{
+		{`{}`, `{}`, 1},
+		{`{"sessionCapabilities":{"resume":{}}}`, `{"sessionId":"different"}`, 3},
+		{`{"sessionCapabilities":{"resume":{}}}`, `null`, 3},
+	} {
+		transcript := `{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"}],"agentCapabilities":` + tc.capabilities + `}}` + "\n" + `{"jsonrpc":"2.0","id":2,"result":{}}` + "\n" + `{"jsonrpc":"2.0","id":3,"result":` + tc.result + `}` + "\n"
+		proc := newFakeProcess(strings.NewReader(transcript), strings.NewReader(""))
+		var diagnostic provider.ProtocolObservation
+		result, err := Run(t.Context(), &fakeRunner{proc: proc}, Request{Prompt: "next", CWD: "/work/project", ResumeSession: "previous", BeforeCleanup: func(observation provider.ProtocolObservation) error { diagnostic = observation.Redacted(); return nil }})
+		if err == nil || result.Success || len(decodeRequests(t, proc.stdin.String())) != tc.requests || strings.Contains(proc.stdin.String(), `"method":"session/prompt"`) {
+			t.Fatalf("invalid session dispatched: %+v %v", result, err)
+		}
+		if tc.requests == 3 && diagnostic.Stage != "session_resume" {
+			t.Fatalf("resume failure stage lost before persistence: %+v", diagnostic)
+		}
+	}
+}
+
 func TestRunCompletesFromACPTranscript(t *testing.T) {
 	transcript := strings.Join([]string{
 		`{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"cached_token"},{"id":"xai.api_key"}]}}`,

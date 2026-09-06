@@ -11,10 +11,142 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
+	"github.com/Dicklesworthstone/ntm/internal/grok"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
+	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 )
+
+func TestGrokSessionSuccessorSurvivesControllerRestartAndRejectsFork(t *testing.T) {
+	for _, terminal := range []string{"completed", "cancelled", "unacknowledged"} {
+		t.Run(terminal, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.db")
+			owner, err := state.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer owner.Close()
+			if err := owner.Migrate(); err != nil {
+				t.Fatal(err)
+			}
+			id, err := provider.NewIdentity("xai", "fixture", "grok-4.6", "https://api.x.ai/v1", "grok", strings.Repeat("a", 64))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := providerAssignmentRequest{OperationID: "second-turn", ParentSession: "first-turn", CWD: "/tmp/linked", Prompt: "continue", Timeout: time.Minute}
+			audit := providerGrokWorkspaceAuditForTest(request.CWD, strings.Repeat("a", 40))
+			verification := *audit.Events[3].VerificationReceipt
+			terminalAt := verification.StartedAt.Add(-time.Second)
+			parent := robot.GrokACPOperationOutput{OperationID: request.ParentSession, ProviderIdentitySHA256: id.Hash(), WorkspaceSHA256: sha256StringCLI(request.CWD), BindingSHA256: strings.Repeat("b", 64), ProviderSessionID: "persistent-session", State: grok.StateCompleted, CompletionConfirmed: true, AcknowledgementVerified: true, Cleanup: grok.ProcessCleanupReceipt{Reaped: true, ObservedAt: terminalAt, ResidualPIDs: []int32{}}}
+			// Reproduce the documented canonical robot signing envelope, keeping this
+			// fixture independent of the runtime executor under test.
+			profile := config.ProviderProfileConfig{RuntimeVersion: "1.0.13"}
+			parent.RuntimeVersion, parent.Model, parent.ResolvedModel = profile.RuntimeVersion, id.Model(), grok.ExpectedResolvedModel(profile.RuntimeVersion, id.Model())
+			parent.RuntimeEventContract.Passed = true
+			if terminal != "completed" {
+				request.CloseSession = true
+				parent.State, parent.StopReason = grok.StateCancelled, "cancelled"
+				parent.CompletionConfirmed, parent.AcknowledgementVerified = false, false
+				parent.ResolvedModel, parent.RuntimeEventContract.Passed = "", false
+				parent.Cancellation = grok.ACPCancellationReceipt{Requested: true, AgentACPAcknowledged: terminal == "cancelled", SessionSHA256: sha256StringCLI(parent.ProviderSessionID)}
+			}
+			canonical, err := json.Marshal(parent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, err := json.Marshal(struct {
+				Schema   string `json:"schema_version"`
+				Identity string `json:"identity_sha256"`
+				Binding  string `json:"binding_sha256"`
+				Receipt  string `json:"receipt_sha256"`
+			}{"ntm.provider-grok-acp.v1", id.Hash(), parent.BindingSHA256, sha256TextCLI(canonical)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sign := newProviderNativeTestSigner()
+			sig, err := sign(t.Context(), payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parent.Attestation = &sig
+			if !robot.ValidGrokACPOperationSignature(parent, sig.KeyMetadata) {
+				t.Fatal("bad signed parent fixture")
+			}
+			encoded, err := json.Marshal(parent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row := &state.SendOperation{OperationID: request.ParentSession, SessionName: "provider:xai-acp", BindingHash: parent.BindingSHA256, PayloadSHA256: id.Hash(), CreatedAt: terminalAt.Add(-time.Minute)}
+			if _, _, err := owner.ClaimSendOperation(row); err != nil {
+				t.Fatal(err)
+			}
+			if err := owner.CompleteSendOperation(row.OperationID, row.SessionName, string(encoded), terminalAt); err != nil {
+				t.Fatal(err)
+			}
+			row.OutcomeJSON, row.CompletedAt = string(encoded), &terminalAt
+			completion := providerWorkspaceCompletion{IdentitySHA256: id.Hash(), OperationBindingSHA256: row.BindingHash, RuntimeReceiptSHA256: sha256TextCLI(encoded), Verification: verification, Verified: true, ObservedAt: verification.CompletedAt}
+			envelope := providerqualification.Receipt{Mode: providerqualification.ModeLive, Provider: "xai", Transport: "xai_acp", IdentitySHA256: id.Hash(), PolicySHA256: strings.Repeat("c", 64), RuntimeVersion: "1.0.13", RuntimeSHA256: strings.Repeat("d", 64), StartedAt: verification.StartedAt, CompletedAt: completion.ObservedAt, DisposableRepoHash: verification.WorktreeSHA256, Checks: []providerqualification.Check{{Name: "operation_binding", Passed: true, Provenance: "local_authoritative", EvidenceSHA256: providerWorkspaceCompletionDigest(completion), Detail: "offline fixture"}}}
+			if err := envelope.Finalize(); err != nil {
+				t.Fatal(err)
+			}
+			if err := signProviderQualificationReceiptWith(t.Context(), &envelope, sign); err != nil {
+				t.Fatal(err)
+			}
+			completion.Envelope = &envelope
+			control := providerControlOutcome{IdentitySHA256: id.Hash(), OperationBindingSHA256: row.BindingHash, WorkspaceCompletion: &completion}
+			control.Capacity = &provider.CapacityReleaseObservation{IdentitySHA256: id.Hash(), Scope: provider.CapacityControlScopeLocalShared, LocalSlotReleased: true, ObservedAt: verification.CompletedAt}
+			if terminal != "completed" {
+				control.WorkspaceCompletion = nil
+			}
+			controlJSON, err := json.Marshal(control)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := owner.ClaimSendOperation(&state.SendOperation{OperationID: row.OperationID, SessionName: providerControlScope, BindingHash: row.BindingHash, PayloadSHA256: id.Hash(), CreatedAt: terminalAt}); err != nil {
+				t.Fatal(err)
+			}
+			if err := owner.CompleteSendOperation(row.OperationID, providerControlScope, string(controlJSON), verification.CompletedAt); err != nil {
+				t.Fatal(err)
+			}
+			for _, mutate := range []func(*providerAssignmentRequest){func(r *providerAssignmentRequest) { r.CWD = "/other" }, func(r *providerAssignmentRequest) { r.ParentSession = "missing" }, func(r *providerAssignmentRequest) { r.OperationID = r.ParentSession }} {
+				wrong := request
+				mutate(&wrong)
+				if _, err := claimGrokSessionSuccessor(t.Context(), owner, profile, id, wrong, sig.KeyMetadata); err == nil {
+					t.Fatal("mismatched predecessor accepted")
+				}
+			}
+			if terminal != "completed" {
+				generation := request
+				generation.CloseSession = false
+				if _, err := claimGrokSessionSuccessor(t.Context(), owner, profile, id, generation, sig.KeyMetadata); err == nil {
+					t.Fatal("cancelled parent authorized generation")
+				}
+			}
+			if terminal == "unacknowledged" {
+				if _, err := claimGrokSessionSuccessor(t.Context(), owner, profile, id, request, sig.KeyMetadata); err == nil {
+					t.Fatal("unconfirmed cancellation authorized close")
+				}
+				return
+			}
+			if _, err := claimGrokSessionSuccessor(t.Context(), owner, profile, id, request, sig.KeyMetadata); err != nil {
+				t.Fatal(err)
+			}
+			restarted, err := state.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restarted.Close()
+			if _, err := claimGrokSessionSuccessor(t.Context(), restarted, profile, id, request, sig.KeyMetadata); err != nil {
+				t.Fatal("same claim changed after restart", err)
+			}
+			request.OperationID = "forked-turn"
+			if _, err := claimGrokSessionSuccessor(t.Context(), restarted, profile, id, request, sig.KeyMetadata); err == nil {
+				t.Fatal("controller restart forked an owned session")
+			}
+		})
+	}
+}
 
 func TestProviderWorkspaceCompletionBindsRuntimeReceiptAndRejectsUnsignedOrStaleProof(t *testing.T) {
 	id, err := provider.NewIdentity("xai", "fixture", "grok-4.6", "https://api.x.ai/v1", "grok", strings.Repeat("a", 64))

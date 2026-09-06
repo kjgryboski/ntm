@@ -118,6 +118,7 @@ type subscriptionUsageEvent struct {
 	// authorization to a legacy unbound accounting repair. It is never model
 	// identity or automatic operation-to-usage evidence.
 	RecoveryAuthorizationSHA256 string `json:"recovery_authorization_sha256,omitempty"`
+	SettlementReviewSHA256      string `json:"settlement_review_sha256,omitempty"`
 	OperationBindingSHA256      string `json:"operation_binding_sha256,omitempty"`
 	NonceSHA256                 string `json:"nonce_sha256,omitempty"`
 	// Unknown records that a dispatched request could not be reconciled to
@@ -497,6 +498,50 @@ func (c *SubscriptionAdmissionController) RecordUnknownUsage(identity provider.I
 	}
 	if !updated {
 		return errors.New("subscription usage reservation is unavailable or already reconciled")
+	}
+	return nil
+}
+
+// SettleReviewedUsage atomically replaces one exactly bound unknown usage row.
+// The caller must first authenticate and persist the signed source review.
+// Replays are idempotent; conflicting reviews, unbound legacy rows and active
+// leases cannot be settled. A committed receipt survives controller crashes.
+func (c *SubscriptionAdmissionController) SettleReviewedUsage(identity provider.Identity, binding, nonce string, credits float64, completedAt time.Time, review string) error {
+	if c == nil || c.plan == nil || !validIdentity(identity) || !validSubscriptionEvidenceDigest(binding) || !validSubscriptionEvidenceDigest(nonce) || !validSubscriptionEvidenceDigest(review) || math.IsNaN(credits) || math.IsInf(credits, 0) || credits < 0 || completedAt.IsZero() || completedAt.After(c.plan.now()) {
+		return errors.New("invalid reviewed usage settlement")
+	}
+	accepted := false
+	if !c.plan.withAuthoritativeState(identity.SubscriptionCapacityScope(), c.plan.now(), func(s *admissionState) {
+		candidate := -1
+		for i, e := range s.subscriptionUsage {
+			if e.OperationBindingSHA256 == binding && e.NonceSHA256 == nonce {
+				if candidate >= 0 {
+					return
+				}
+				candidate = i
+			}
+		}
+		if candidate < 0 {
+			return
+		}
+		e := &s.subscriptionUsage[candidate]
+		if _, active := s.leases[e.LeaseID]; active {
+			return
+		}
+		if e.SettlementReviewSHA256 != "" {
+			accepted = e.SettlementReviewSHA256 == review && e.Credits == credits && e.ObservedAt.Equal(completedAt) && !e.Unknown
+			return
+		}
+		if !e.Unknown || !e.Reconciled {
+			return
+		}
+		e.Credits, e.ObservedAt, e.Unknown, e.Conservative, e.SettlementReviewSHA256 = credits, completedAt.UTC(), false, false, review
+		accepted = true
+	}) {
+		return errors.New("shared reviewed usage transaction is unavailable")
+	}
+	if !accepted {
+		return errors.New("reviewed usage binding is missing, active, duplicated or conflicts with settlement")
 	}
 	return nil
 }

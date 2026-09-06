@@ -182,6 +182,26 @@ func TestProviderSpawnAndResumeUseBoundedAssignmentDispatcher(t *testing.T) {
 	}
 }
 
+func TestProviderSessionCloseUsesSharedDispatcherWithoutGenerationPrompt(t *testing.T) {
+	previous := dispatchProviderAssignment
+	t.Cleanup(func() { dispatchProviderAssignment = previous })
+	calls := 0
+	dispatchProviderAssignment = func(_ *cobra.Command, request providerAssignmentRequest) error {
+		calls++
+		if !request.CloseSession || request.Profile != "grok" || request.OperationID != "close-turn" || request.ParentSession != "last-turn" || request.CWD != "/isolated" || request.Timeout != 30*time.Second {
+			t.Fatalf("close binding lost: %+v", request)
+		}
+		return nil
+	}
+	cmd := newProviderSessionCmd()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"close", "--profile", "grok", "--operation-id", "close-turn", "--parent-operation", "last-turn", "--cwd", "/isolated"})
+	if err := cmd.Execute(); err != nil || calls != 1 {
+		t.Fatalf("close calls=%d err=%v", calls, err)
+	}
+}
+
 func TestProviderStatusRequiresSignedExactOperation(t *testing.T) {
 	root := t.TempDir()
 	profile := providerCodexProfile(root)

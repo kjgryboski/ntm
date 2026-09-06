@@ -126,6 +126,42 @@ func TestEvidenceContractNeverInspectsOrAuthorizesWork(t *testing.T) {
 	}
 }
 
+func TestEvidenceSurfaceRequiresVerifiedGrokSessionResume(t *testing.T) {
+	parent := providerAssignmentStatus{Provider: "xai", IdentitySHA256: strings.Repeat("a", 64), IdentityBindingVerified: true, OutcomeSHA256: strings.Repeat("b", 64), OperationIDSHA256: sha256StringCLI("parent"), ControllerFinalized: true, State: "completed", CompletionConfirmed: true, WorkspaceVerified: true, LocalCleanupVerified: true}
+	parent.CapacityObservation = &provider.CapacityReleaseObservation{IdentitySHA256: parent.IdentitySHA256, Scope: provider.CapacityControlScopeLocalShared, LocalSlotReleased: true, ObservedAt: time.Now()}
+	for _, scenario := range []string{"valid", "not-resumed", "closed", "wrong-parent", "unverified-parent", "wrong-identity"} {
+		t.Run(scenario, func(t *testing.T) {
+			p, child := parent, parent
+			child.OperationIDSHA256, child.ParentOperationSHA256, child.SessionResumed = sha256StringCLI("child"), p.OperationIDSHA256, true
+			switch scenario {
+			case "not-resumed":
+				child.SessionResumed = false
+			case "closed":
+				child.SessionClosed = true
+			case "wrong-parent":
+				child.ParentOperationSHA256 = sha256StringCLI("other")
+			case "unverified-parent":
+				p.WorkspaceVerified = false
+			case "wrong-identity":
+				p.IdentitySHA256 = strings.Repeat("c", 64)
+			}
+			cmd := providerEvidenceCommand(func(_ *cobra.Command, _ string, operation string, visit func(providerAssignmentStatus) error) error {
+				if operation == "parent" {
+					return visit(p)
+				}
+				return visit(child)
+			})
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			cmd.SetArgs([]string{"--profile", "exact", "--operation", "child", "--require", "session-resume", "--restart-of", "parent"})
+			if err := cmd.Execute(); (err == nil) != (scenario == "valid") {
+				t.Fatalf("resume evidence: %v; %s", err, out.String())
+			}
+		})
+	}
+}
+
 func TestRecoveryDispositionDistinguishesFailureFromUnknownOwnership(t *testing.T) {
 	out := providerAssignmentStatus{State: "failed", IdentityBindingVerified: true, ControllerFinalized: true}
 	if providerRecoveryDisposition(out) != "verified_terminal_result_requires_review" {

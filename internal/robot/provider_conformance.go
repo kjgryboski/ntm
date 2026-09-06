@@ -143,7 +143,7 @@ func (syntheticProviderRuntime) Recover(context.Context, string) (provider.Recov
 }
 
 func (r syntheticProviderRuntime) Resume(context.Context, string) (provider.ResumeObservation, error) {
-	if r.transport == "xai_headless_session" || r.transport == "zai_codex_runtime" {
+	if r.transport == "xai_acp" || r.transport == "xai_headless_session" || r.transport == "zai_codex_runtime" {
 		return provider.ResumeObservation{Resumed: true, SameSessionID: true}, nil
 	}
 	return provider.ResumeObservation{}, nil

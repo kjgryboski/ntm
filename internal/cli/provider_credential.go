@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,12 +70,15 @@ func newProviderCredentialCmd() *cobra.Command {
 // Refresh uses an already refreshed account-owner snapshot. It does not rotate
 // OAuth tokens from a disposable home or switch the user's active account.
 func newProviderCredentialRefreshSnapshotCmd() *cobra.Command {
-	var name, sourceHome string
-	var apply bool
+	var name, sourceHome, accountBindingFile, accountBindingSHA256 string
+	var apply, verifyAccount bool
 	cmd := &cobra.Command{Use: "refresh-snapshot", Short: "Preview or copy a fresh primary OAuth snapshot with unchanged local account binding", Args: cobra.NoArgs}
 	cmd.Flags().StringVar(&name, "profile", "", "Exact primary provider profile")
 	cmd.Flags().StringVar(&sourceHome, "source-home", "", "Absolute account-owner runtime home containing an already refreshed snapshot")
 	cmd.Flags().BoolVar(&apply, "apply", false, "Apply after continuity and freshness checks, preserving a private backup")
+	cmd.Flags().BoolVar(&verifyAccount, "verify-account", false, "Authenticate the fresh Claude token to its fixed profile endpoint without generation")
+	cmd.Flags().StringVar(&accountBindingFile, "account-binding-file", "", "Original reviewed account binding for this exact identity")
+	cmd.Flags().StringVar(&accountBindingSHA256, "account-binding-sha256", "", "Reviewed original binding file digest")
 	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
 		cfg := loadSelectedConfigOrDefault()
 		if cfg == nil {
@@ -107,10 +111,35 @@ func newProviderCredentialRefreshSnapshotCmd() *cobra.Command {
 		}
 		defer zeroProviderSecret(next)
 		scope, err := primaryCredentialRefreshContinuity(old, next, id.Runtime(), time.Now())
+		if verifyAccount {
+			if id.Runtime() != "claude" || !filepath.IsAbs(accountBindingFile) || !validProviderNativeDigest(accountBindingSHA256) {
+				return errors.New("account verification requires Claude and an exact reviewed binding file digest")
+			}
+			binding, readErr := readProviderUsageFile(accountBindingFile)
+			if readErr != nil || sha256TextCLI(binding) != accountBindingSHA256 {
+				return errors.New("original account binding digest differs")
+			}
+			var original struct {
+				Identity string `json:"identity_sha256"`
+				Account  string `json:"account_uuid_sha256"`
+				Runtime  string `json:"runtime_sha256"`
+			}
+			if json.Unmarshal(binding, &original) != nil || original.Identity != id.Hash() || original.Runtime != p.RuntimeSHA256 || !validProviderNativeDigest(original.Account) {
+				return errors.New("account binding does not match the qualified runtime identity")
+			}
+			client := &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("account profile redirect refused") }}
+			scope, err = primaryClaudeAccountContinuity(providerCommandContext(cmd), old, next, original.Account, time.Now(), client.Do)
+		} else if accountBindingFile != "" || accountBindingSHA256 != "" {
+			return errors.New("account binding flags require explicit account verification")
+		}
 		if err != nil {
 			return err
 		}
 		out := map[string]any{"profile": name, "identity_sha256": id.Hash(), "continuity_scope": scope, "applied": false, "generation_calls": 0, "qualification_rewritten": false}
+		out["authentication_calls"] = 0
+		if verifyAccount {
+			out["authentication_calls"] = 1
+		}
 		if apply {
 			backup, err := applyPrimaryCredentialSnapshot(destination, old, next)
 			if err != nil {
@@ -121,6 +150,64 @@ func newProviderCredentialRefreshSnapshotCmd() *cobra.Command {
 		return encodeIndentedJSON(cmd.OutOrStdout(), out)
 	}
 	return cmd
+}
+
+// The expected account is pinned to the original reviewed identity. The fresh
+// token is sent only to Claude's profile endpoint; response bodies, identifiers
+// and credentials never enter diagnostics. Local metadata is not the response.
+func primaryClaudeAccountContinuity(ctx context.Context, old, next []byte, expectedAccount string, now time.Time, do func(*http.Request) (*http.Response, error)) (string, error) {
+	if !validProviderNativeDigest(expectedAccount) || !primaryComparisonCredentialValid(old, "claude") || !primaryComparisonCredentialValid(next, "claude") || !primaryCredentialSnapshotFresh(next, "claude", now) {
+		return "", errors.New("fresh subscription OAuth and original account binding required")
+	}
+	var before, after struct {
+		OAuth struct {
+			Access       string `json:"accessToken"`
+			Subscription string `json:"subscriptionType"`
+		} `json:"claudeAiOauth"`
+	}
+	if json.Unmarshal(old, &before) != nil || json.Unmarshal(next, &after) != nil || before.OAuth.Subscription != after.OAuth.Subscription {
+		return "", errors.New("subscription identity changed")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.anthropic.com/api/oauth/profile", nil)
+	if err != nil {
+		return "", errors.New("account request unavailable")
+	}
+	req.Header.Set("Authorization", "Bearer "+after.OAuth.Access)
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	req.Header.Set("User-Agent", "ntm/provider-account-verification")
+	resp, err := do(req)
+	if err != nil {
+		return "", errors.New("authenticated account profile unavailable")
+	}
+	if resp == nil || resp.Body == nil {
+		return "", errors.New("account profile response missing")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", errors.New("account profile authentication rejected")
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+	defer zeroProviderSecret(data)
+	if err != nil || len(data) > 1<<20 {
+		return "", errors.New("account profile response invalid")
+	}
+	var remote struct {
+		Account struct {
+			UUID string `json:"uuid"`
+			Max  bool   `json:"has_claude_max"`
+			Pro  bool   `json:"has_claude_pro"`
+		} `json:"account"`
+		Organization struct {
+			Type string `json:"organization_type"`
+		} `json:"organization"`
+	}
+	if json.Unmarshal(data, &remote) != nil || remote.Account.UUID == "" || sha256StringCLI(remote.Account.UUID) != expectedAccount {
+		return "", errors.New("provider account does not match the original qualified account")
+	}
+	if (after.OAuth.Subscription == "max" && (!remote.Account.Max || remote.Organization.Type != "claude_max")) || (after.OAuth.Subscription == "pro" && (!remote.Account.Pro || remote.Organization.Type != "claude_pro")) || (after.OAuth.Subscription != "max" && after.OAuth.Subscription != "pro") {
+		return "", errors.New("provider subscription identity not verified")
+	}
+	return "provider_authenticated_account_matches_original_profile", nil
 }
 
 func readPrimaryCredentialSnapshot(path string) ([]byte, error) {

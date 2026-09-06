@@ -551,9 +551,20 @@ type PrimaryRuntimeEvents struct {
 	Other         int `json:"other"`
 }
 
+// PrimaryRuntimeErrorCode accepts only categories from CodexErrorInfo. Details,
+// status text and unknown future variants never enter retained diagnostics.
+func PrimaryRuntimeErrorCode(code string) string {
+	switch code {
+	case "contextWindowExceeded", "sessionBudgetExceeded", "usageLimitExceeded", "rateLimitExceeded", "serverOverloaded", "cyberPolicy", "misalignmentPolicyViolation", "httpConnectionFailed", "responseStreamConnectionFailed", "internalServerError", "unauthorized", "badRequest", "threadRollbackFailed", "sandboxError", "responseStreamDisconnected", "responseTooManyFailedAttempts", "activeTurnNotSteerable", "other":
+		return code
+	default:
+		return "unavailable"
+	}
+}
+
 func (d PrimaryComparisonDiagnostic) validateRuntimeDiagnostics() error {
 	if f := d.RuntimeFailure; f != nil {
-		if (f.EventCategory != "error" && f.EventCategory != "turn.failed") || f.ErrorCode != "unavailable" || f.Retryability != "unknown" {
+		if (f.EventCategory != "error" && f.EventCategory != "turn.failed") || (f.ErrorCode != "unavailable" && PrimaryRuntimeErrorCode(f.ErrorCode) != f.ErrorCode) || (f.Retryability != "unknown" && f.Retryability != "retrying" && f.Retryability != "not_retrying") {
 			return errors.New("invalid primary runtime failure metadata")
 		}
 		switch f.MessageCategory {

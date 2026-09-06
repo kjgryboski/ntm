@@ -76,6 +76,43 @@ func TestPrimaryDiagnosticProjectionPreservesAssignmentObservations(t *testing.T
 	}
 }
 
+func TestPrimaryCodexStructuredRetryThenCompletion(t *testing.T) {
+	var o primaryComparisonObservation
+	for _, line := range []string{
+		`{"type":"error","message":"private-canary","codex_error_info":{"responseStreamDisconnected":{"httpStatusCode":503,"extra":"private-canary"}},"will_retry":true}`,
+		`{"type":"item.completed","item":{"type":"agent_message","text":"nonce"}}`,
+		`{"type":"turn.completed","server_model":"gpt-6-astra"}`,
+	} {
+		o.observe([]byte(line), "codex", "nonce")
+	}
+	o.ExitOK = true
+	if !o.exactModelVerified("gpt-6-astra") || o.RuntimeFailure.ErrorCode != "responseStreamDisconnected" || o.RuntimeFailure.Retryability != "retrying" {
+		t.Fatalf("retry lost or completion incorrectly rejected: %+v", o)
+	}
+	now := time.Now().UTC()
+	path, err := providerqualification.StorePrimaryComparisonDiagnostics(t.TempDir(), "openai_codex_comparison", sha256StringCLI("id"), sha256StringCLI("policy"), sha256StringCLI("runtime"), now, now, "before_cleanup", o.diagnostic("gpt-6-astra"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || strings.Contains(string(data), "private-canary") || strings.Contains(string(data), "httpStatusCode") {
+		t.Fatalf("unsafe diagnostic: %s %v", data, err)
+	}
+	// A terminal failure overrides retry intent even if the producer contradicts itself.
+	var failed primaryComparisonObservation
+	failed.observe([]byte(`{"type":"turn.failed","error":{"message":"private-canary","codex_error_info":"unauthorized","will_retry":true}}`), "codex", "nonce")
+	if !failed.Malformed || failed.RuntimeFailure.Retryability != "not_retrying" || failed.RuntimeFailure.ErrorCode != "unauthorized" {
+		t.Fatalf("terminal failure accepted: %+v", failed)
+	}
+	for _, code := range []string{`"private-canary"`, `{"private-canary":{}}`, `{"unauthorized":{},"other":{}}`} {
+		var rejected primaryComparisonObservation
+		rejected.observe([]byte(`{"type":"error","codex_error_info":`+code+`,"will_retry":false}`), "codex", "nonce")
+		if rejected.RuntimeFailure.ErrorCode != "unavailable" {
+			t.Fatal("unknown category retained")
+		}
+	}
+}
+
 func TestPrimaryCodexMessageCategoriesAreHintsOnly(t *testing.T) {
 	for _, tc := range []struct{ message, category string }{
 		{"rate limit exceeded: private-canary", "rate_limit"},

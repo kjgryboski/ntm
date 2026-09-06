@@ -52,9 +52,9 @@ Controller restart preserves uncertain ownership and usage. It cannot replay or
 take over an operation based on PID death or age. Subprocess crash tests cover
 all four provider routes after reservation, dispatch, signing, receipt persistence
 and forced controller death. These demonstrate quarantine, not automatic recovery.
-The common assignment workflow does not implement provider session resume. Adding
-that capability requires provider-specific session persistence and identity-bound
-protocol evidence. Local cancellation and fresh restart do not establish remote
+The common assignment workflow implements Grok ACP resume with provider-specific
+session persistence and identity-bound predecessor evidence. Successful coding
+after resume requires its own live evidence. Local cancellation and fresh restart do not establish remote
 generation termination or final billing settlement.
 
 For a bounded operational pilot, record the exact binary, fixture, account/model,
@@ -215,8 +215,19 @@ account/request merely because the record says so. Even a valid record remains
 `external_source_review_required` with `provider_association=unverified_source_claim`.
 No import changes accounting, releases unknown usage, grants admission or creates
 a qualification. Original-request settlement does not cover other outstanding
-requests or an entire account. Authoritative source verification and atomic
-reconciliation remain separate work once genuine evidence is available.
+requests or an entire account.
+
+`provider codex settle-reviewed-usage --profile NAME --operation-id ID
+--evidence-file FILE --source-file FILE --review-file FILE` verifies a separate
+pinned-owner signed source review. The review must bind the exact source bytes,
+evidence, identity, request/account references, operation binding and reservation
+nonce. Its authentication and request-association statements are the reviewer's
+attestation, not a provider signature. The importer cannot create that authority.
+Only `--apply` settles the exact matching reservation under the shared store lock.
+Duplicate identical settlement is idempotent; conflicting settlement, active
+leases and legacy reservations without a matching binding/nonce are refused.
+Neither a successful preview nor local settlement grants qualification. The
+original unbound Z.ai reservation still needs an authoritative request association.
 
 ## Credential continuity findings
 
@@ -229,12 +240,15 @@ so their identities differ. A rotated opaque Claude token fails the existing
 continuity test; local account-owner metadata can support a fresh binding but
 does not authenticate the replacement token's provider account.
 
-Separating stable account identity from credential leases therefore needs an
-authenticated account-binding observation tied to each replacement token, plus
-an explicit runtime-state migration policy. Keep qualification and credential
-expiry separate, but do not extend the 24-hour qualification window or transfer
-evidence across runtime homes simply because account aliases match. The current
-investigation does not relax these rules.
+`provider credential refresh-snapshot --verify-account` supports rotated Claude
+tokens when `--account-binding-file` and `--account-binding-sha256` pin the
+original reviewed binding for the exact profile and runtime. It sends the fresh
+token only to Claude's fixed authenticated profile endpoint, refuses redirects,
+and requires the returned account and subscription to match. No generation is
+requested. Diagnostics contain no response body, account UUID or token. Apply
+preserves a private backup and checks the destination has not changed before
+replacement. Runtime home, identity and qualification remain unchanged; neither
+credential refresh nor account verification extends qualification expiry.
 
 ## Grok session capability inspection
 
@@ -245,13 +259,44 @@ on September 6, 2026. The inspection used an empty credential-free home, sent
 only `initialize`, created no session and made no generation calls. The process
 was reaped. These are advertised capabilities, not successful lifecycle tests.
 
-The shared controls still do not implement persistent-session resume. Connecting
-it requires a durable checkpoint bound to the exact identity, runtime, workspace
-and session; exclusive ownership across controllers; and a distinct ledger
-operation for each resumed turn. Unknown outcomes must remain quarantined.
-Qualification must prove a second turn uses the original session, preserves the
-permission boundary and releases local capacity. It must test refused or missing
-sessions and controller interruption without duplicate work.
+Shared `resume --provider-profile NAME --operation-id CHILD --parent-session
+PREDECESSOR --cwd WORKTREE --prompt TEXT --timeout DURATION` uses the completed
+predecessor operation ID for Grok ACP. Its signed session, exact identity/runtime,
+workspace verification and cleanup must pass before an immutable successor claim
+is created. A second owner cannot fork that predecessor after controller restart.
+Uncertain claims remain quarantined. The runtime must advertise and acknowledge
+`session/resume`; mismatched sessions and replayed history are rejected before a
+new prompt. `provider session close --profile NAME --operation-id CLOSE
+--parent-operation PREDECESSOR --cwd WORKTREE` uses the same ownership path and
+requires advertised close. It sends no generation prompt and cannot dispatch to
+another provider. Each turn has a distinct signed receipt and operation binding.
+An acknowledged, identity-bound cancellation with observed cleanup and capacity
+release can authorize close, but cannot authorize another resumed coding turn.
+The pinned Grok response must report `x.ai/closeOutcome=closed`; empty,
+`notResident`, and `superseded` responses do not establish a successful close.
+
+`provider evidence --require session-resume --restart-of PREDECESSOR` requires a
+verified next-turn completion linked to its verified predecessor. Implemented or
+advertised capabilities remain untested until actual evidence is recorded. A
+live two-turn exercise must still establish permission boundaries and capacity
+release; offline fixtures do not establish live provider readiness.
+
+On September 6, the reliability campaign completed the common order importer
+through Grok and Claude in approximately 50 and 31 seconds respectively, including
+controller overhead. Both completion-evidence checks passed and original tests
+remained unchanged. Claude's existing home first moved from expired to eligible
+through one authenticated same-account refresh, without rewriting qualification.
+The second Grok turn acknowledged the original session but produced no tool or
+assistant events before its 180-second deadline. Its signed cancellation was
+acknowledged, local cleanup observed zero residuals, and local capacity released.
+This is failed resumed coding, not a successful two-turn acceptance. Both Grok
+attempts and the single Claude attempt are spent; billing cost remains unknown.
+The earlier campaign-route rejection occurred before any operation was dispatched.
+The subsequent close-only operation timed out during initialization, before
+authentication or a generation prompt. Its signed diagnostic records that stage
+and observed local cleanup. Provider session closure remains unproven, and its
+successor claim remains held; neither elapsed time nor local cleanup authorizes
+another owner to reuse the session.
 
 ACP distinguishes [resume](https://agentclientprotocol.com/announcements/session-resume-stabilized)
 from [close](https://agentclientprotocol.com/announcements/session-close-stabilized).
@@ -297,14 +342,28 @@ Unknown event names and all error text, arguments, paths and credentials are
 discarded. The unsigned observation is saved before cleanup/signing; the ordinary
 assignment also binds these fields into its signed outcome. Unsigned diagnostics
 never qualify a provider. Optional fields leave historical signed hashes intact.
+Grok ordinary receipts also carry the redacted protocol observation, including
+broker-rejected-call counts even without a qualification audit file. The counter
+records rejected tool calls; it does not identify the protected resource or prove
+that every permission boundary was exercised.
 
-Source baseline: Codex fork commit `b194851`, `codex-rs/exec/src/exec_events.rs`
-and `event_processor_with_jsonl_output.rs`. Its `ThreadErrorEvent` contains only
-`message`; the formatter discards structured error information and retryability.
-Consequently this adapter explicitly reports `error_code=unavailable` and
-`retryability=unknown`, even if an unreviewed event supplies extra fields. Message
-hints match fixed strings in `codex-rs/protocol/src/error.rs`; they are not provider
-error codes or permission to retry. Runtime failures remain fail-closed.
+Codex baseline `b194851` discarded structured error information and retryability
+in its exec formatter. The corrected fork emits optional closed error categories
+and `will_retry`; the NTM adapter retains only known categories and a boolean
+retry observation. It discards nested details and unknown values. Older producers
+still report unavailable/unknown. A retry notification is not terminal; a later
+terminal failure always ends retrying. Message hints remain separate from error
+codes, and neither field authorizes another paid attempt.
+
+The September 6 corrected-runtime qualification recorded `unauthorized` with
+`not_retrying`, before any tool event. Only local cleanup passed (one of nine
+checks); no ordinary Codex task followed. This identifies an authorization
+failure, not a demonstrated tool-registration failure. The new runtime hash was
+`4765e0e3e4792b8de5cf9781ecaad5bee6f385545b6eddbe24b052ed4eda7cf1`.
+It used the already verified official 0.153.0 tool host, pinned independently:
+the local tool-host rebuild could not download its V8 150.4.0 archive (HTTP 404).
+The account home and model were unchanged, and this result does not qualify the
+new profile or authorize an automatic retry after credential changes.
 
 The common diagnostic projection also preserves tool counters, startup warnings
 and model-conflict observations for ordinary assignments. `event_after_terminal`

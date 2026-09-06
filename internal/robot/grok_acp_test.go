@@ -92,6 +92,30 @@ func TestRunGrokACPOperationBindsNonceAndEmitsSafeReceipt(t *testing.T) {
 	}
 }
 
+func TestRunGrokACPOperationResumeBindsSessionAndRejectsChangedReplay(t *testing.T) {
+	for _, mismatch := range []bool{false, true} {
+		engine := &recordingGrokACPEngine{result: grok.Result{Success: true, State: grok.StateCompleted, SessionResumed: true, ProviderSessionID: "same-session", StopReason: "end_turn", CompletionConfirmed: true, AcknowledgementVerified: true, RuntimeEventContract: passingGrokRuntimeContract()}}
+		engine.result.Model, engine.result.ModelEvidence = "grok-code", "completion_metadata"
+		if mismatch {
+			engine.result.ProviderSessionID = "different-session"
+		}
+		opts := GrokACPOperationOptions{Prompt: "continue", CWD: "/repo", OperationID: "resume-op", Nonce: testGrokACPNonce, Identity: testGrokACPIdentity(t), ResumeSession: "same-session", ParentOperation: "first-op"}
+		deps := GrokACPOperationDeps{Engine: engine, Admission: allowingAdmission{}, Ledger: testGrokACPLedger(t)}
+		out, err := RunGrokACPOperation(t.Context(), opts, deps)
+		if (err == nil) == mismatch || engine.request.ResumeSession != "same-session" || out.ParentOperationSHA256 != sha256Hex("first-op") {
+			t.Fatalf("resume binding: %+v %v", out, err)
+		}
+		if mismatch && out.State != grok.StateOutcomeUnknown {
+			t.Fatal("mismatched session completed")
+		}
+		calls := engine.calls
+		opts.ParentOperation = "other-parent"
+		if _, err := RunGrokACPOperation(t.Context(), opts, deps); err == nil || engine.calls != calls {
+			t.Fatal("changed predecessor replay dispatched")
+		}
+	}
+}
+
 func TestRunGrokACPOperationBindsWorkspacePolicyInDisposableWorktree(t *testing.T) {
 	engine := &recordingGrokACPEngine{result: grok.Result{
 		Success: true, State: grok.StateCompleted, StopReason: "end_turn",
@@ -676,7 +700,8 @@ func TestRunGrokACPOperationSignsCancelledOutcomeWithBoundedFinalization(t *test
 					}
 				},
 				result: grok.Result{State: grok.StateCancelled, StopReason: "cancelled", CompletionConfirmed: true,
-					Cancellation: grok.ACPCancellationReceipt{Requested: true, AgentACPAcknowledged: true}},
+					ProtocolObservation: provider.ProtocolObservation{BrokerRejectedCalls: 1, Stage: "prompt_response", Method: "private-provider-method"},
+					Cancellation:        grok.ACPCancellationReceipt{Requested: true, AgentACPAcknowledged: true}},
 				err: &grok.Error{Code: grok.ErrCancelled, Err: context.Canceled},
 			}
 			var signingContext context.Context
@@ -728,6 +753,14 @@ func TestRunGrokACPOperationSignsCancelledOutcomeWithBoundedFinalization(t *test
 				if err != nil || !ValidGrokACPOperationSignature(*queried, trusted) {
 					t.Fatalf("query invalidated signature: %v", err)
 				}
+				if queried.ProtocolObservation == nil || queried.ProtocolObservation.BrokerRejectedCalls != 1 || queried.ProtocolObservation.Method != "unknown" {
+					t.Fatal("signed receipt lost redacted broker diagnostics")
+				}
+				queried.ProtocolObservation.BrokerRejectedCalls++
+				if ValidGrokACPOperationSignature(*queried, trusted) {
+					t.Fatal("changed broker diagnostics retained signature validity")
+				}
+				queried.ProtocolObservation.BrokerRejectedCalls--
 				stdout, printErr := captureStdout(t, func() error {
 					return encodeTerminalRobotOutput(queried, queried.RobotResponse, "cancelled")
 				})

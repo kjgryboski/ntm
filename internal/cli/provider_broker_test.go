@@ -99,6 +99,17 @@ func TestProviderBrokerControllerUsesRealWorkspaceAndIsolatedVerifier(t *testing
 	if !checks.ReadObserved || !checks.EditObserved || !checks.SecretDenied || !checks.TestObserved {
 		t.Fatalf("controller evidence incomplete: %+v", checks)
 	}
+	if broker.RejectedCalls() != 1 {
+		t.Fatal("protected read rejection missing from controller counters")
+	}
+	// Ordinary assignments have no audit sink; their signed counter must still
+	// capture the same broker-enforced boundary.
+	savedAudit := broker.audit
+	broker.audit = nil
+	if _, err := broker.Call(t.Context(), json.RawMessage(requests[2])); err != nil || broker.RejectedCalls() != 2 {
+		t.Fatal("ordinary assignment lost its rejection counter")
+	}
+	broker.audit = savedAudit
 	if err := broker.Close(); err != nil {
 		t.Fatal(err)
 	}

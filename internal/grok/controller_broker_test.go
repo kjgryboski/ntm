@@ -11,15 +11,17 @@ import (
 )
 
 type fakeControllerBroker struct {
-	calls  int
-	closed bool
+	calls    int
+	closed   bool
+	rejected int
 }
 
 func (b *fakeControllerBroker) Call(context.Context, json.RawMessage) (json.RawMessage, error) {
 	b.calls++
 	return json.RawMessage(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`), nil
 }
-func (b *fakeControllerBroker) Close() error { b.closed = true; return nil }
+func (b *fakeControllerBroker) Close() error       { b.closed = true; return nil }
+func (b *fakeControllerBroker) RejectedCalls() int { return b.rejected }
 
 func TestControllerMCPRejectsWrongBindingReplayAndUnapprovedMethods(t *testing.T) {
 	for _, tc := range []struct {
@@ -96,7 +98,7 @@ func TestControllerBrokerRunsThroughRegisteredACPReverseChannel(t *testing.T) {
 	defer writer.Close()
 	proc := newFakeProcess(reader, strings.NewReader(""))
 	proc.kill = func() { _ = writer.Close() }
-	broker := &fakeControllerBroker{}
+	broker := &fakeControllerBroker{rejected: 1}
 	descriptor, err := NewWorkspaceBrokerDescriptor("/tmp/linked", strings.Repeat("a", 40), []string{"go-test"})
 	if err != nil {
 		t.Fatal(err)
@@ -130,7 +132,10 @@ func TestControllerBrokerRunsThroughRegisteredACPReverseChannel(t *testing.T) {
 			emit(`{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn","_meta":{"modelId":"grok-4.6","usage":{"inputTokens":1,"outputTokens":1,"modelUsage":{"grok-4.6-build":{}}}}}}`)
 		}
 	}
-	_, err = Run(t.Context(), &fakeRunner{proc: proc}, Request{Prompt: "test", CWD: "/tmp/linked", Model: "grok-4.6", RuntimeVersion: "1.0.13", Broker: descriptor})
+	result, err := Run(t.Context(), &fakeRunner{proc: proc}, Request{Prompt: "test", CWD: "/tmp/linked", Model: "grok-4.6", RuntimeVersion: "1.0.13", Broker: descriptor})
+	if result.ProtocolObservation.BrokerRejectedCalls != 1 {
+		t.Fatal("controller rejection count lost before diagnostic persistence")
+	}
 	if err != nil || broker.calls != 1 || !broker.closed || serverID == "" {
 		t.Fatalf("reverse broker lifecycle: calls=%d closed=%v err=%v", broker.calls, broker.closed, err)
 	}

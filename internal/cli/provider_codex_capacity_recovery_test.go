@@ -22,6 +22,17 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/zai"
 )
 
+func TestProviderUsageReviewRejectsAmbiguousNestedSignature(t *testing.T) {
+	for _, data := range []string{`{"attestation":{"key_id":"a","key_id":"b"}}`, `{"attestation":{"Key_id":"a"}}`, `{"attestation":[]}`, `{} {}`, `null`} {
+		if validateProviderUsageObject(json.NewDecoder(strings.NewReader(data)), 0) == nil {
+			t.Fatalf("ambiguous review accepted: %s", data)
+		}
+	}
+	if err := validateProviderUsageObject(json.NewDecoder(strings.NewReader(`{"attestation":{"key_id":"a"},"schema_version":"fixture"}`)), 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func providerUsageFixture(t *testing.T) (provider.Identity, *state.SendOperation, providerUsageEvidence, []byte, time.Time) {
 	t.Helper()
 	id, err := providerCodexProfile(t.TempDir()).Identity()
@@ -34,6 +45,48 @@ func providerUsageFixture(t *testing.T) (provider.Identity, *state.SendOperation
 	source := []byte("Synthetic provider source for offline testing; private-source-canary")
 	e := providerUsageEvidence{SchemaVersion: "ntm.provider-usage-evidence.v1", IdentitySHA256: id.Hash(), AccountAliasSHA256: sha256StringCLI(id.AccountAlias()), OperationIDSHA256: sha256StringCLI(row.OperationID), OperationBinding: row.BindingHash, ProviderAccount: strings.Repeat("b", 64), ProviderRequest: strings.Repeat("c", 64), SourceKind: "provider_support_reply", SourceSHA256: sha256TextCLI(source), TerminalStatus: "completed", BillingUnits: "coding_plan_credit", FinalUsage: &usage, SettlementScope: "original_request_only", OutstandingUsage: &outstanding, RequestCompletedAt: now.Add(-30 * time.Minute), SettledThrough: now.Add(-time.Minute), ObservedAt: now}
 	return id, row, e, source, now
+}
+
+func TestProviderUsageSettlementRequiresSignedExactSourceReview(t *testing.T) {
+	id, row, e, source, now := providerUsageFixture(t)
+	data, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imported := validateProviderUsageEvidence(data, source, id, row.OperationID, row, now)
+	review := providerUsageSourceReview{Schema: "ntm.provider-usage-source-review.v1", EvidenceSHA256: imported.EvidenceSHA256, SourceSHA256: imported.SourceSHA256, IdentitySHA256: id.Hash(), OperationBinding: row.BindingHash, NonceSHA256: strings.Repeat("d", 64), ProviderAccount: e.ProviderAccount, ProviderRequest: e.ProviderRequest, SourceAuthentication: "authenticated_support_reply_reviewed", RequestAssociation: "original_request_confirmed_by_provider_source", ReviewedAt: now}
+	sign := newProviderNativeTestSigner()
+	payload, err := json.Marshal(review)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := sign(t.Context(), payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	review.Attestation = &sig
+	if err := verifyProviderUsageSourceReview(review, imported, sig.KeyMetadata, now); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*providerUsageSourceReview){
+		func(r *providerUsageSourceReview) { r.Attestation = nil },
+		func(r *providerUsageSourceReview) { r.ProviderAccount = strings.Repeat("f", 64) },
+		func(r *providerUsageSourceReview) { r.ProviderRequest = strings.Repeat("f", 64) },
+		func(r *providerUsageSourceReview) { r.SourceSHA256 = strings.Repeat("f", 64) },
+		func(r *providerUsageSourceReview) { r.SourceAuthentication = "unverified_source_claim" },
+		func(r *providerUsageSourceReview) { r.NonceSHA256 = "" },
+	} {
+		changed := review
+		mutate(&changed)
+		if verifyProviderUsageSourceReview(changed, imported, sig.KeyMetadata, now) == nil {
+			t.Fatal("altered source review accepted")
+		}
+	}
+	cmd := newProviderUsageSettlementCmd()
+	cmd.SetArgs([]string{"--profile", "zai", "--operation-id", "original-request", "--apply"})
+	if cmd.Execute() == nil {
+		t.Fatal("surface settled without evidence")
+	}
 }
 
 func TestProviderUsageImporterRejectsMismatchedOrIncompleteSettlement(t *testing.T) {

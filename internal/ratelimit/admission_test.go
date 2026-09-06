@@ -388,6 +388,64 @@ func TestSubscriptionAdmissionSnapshotReportsConfiguredScopeBeforeFirstUse(t *te
 	}
 }
 
+func TestReviewedSettlementSurvivesRestartAndRejectsConflicts(t *testing.T) {
+	now := time.Now().UTC()
+	path := filepath.Join(t.TempDir(), "capacity.json")
+	cfg := DefaultSubscriptionAdmissionConfig()
+	open := func() *SubscriptionAdmissionController {
+		c, err := NewSubscriptionAdmissionController(cfg, path, func() time.Time { return now }, func() float64 { return .5 })
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	c := open()
+	id := subscriptionIdentity(t, "kevin", "glm-5.3", "https://api.z.ai/api/v1")
+	d := c.Acquire(id)
+	if !d.Allowed {
+		t.Fatal(d)
+	}
+	binding, nonce, review := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
+	if err := c.BindReservation(id, d, binding, nonce); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RecordUnknownUsage(id, d); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SettleReviewedUsage(id, binding, nonce, 2.5, now, review); err == nil {
+		t.Fatal("active lease settled")
+	}
+	c.Release(id, d)
+	// Reopening before settlement simulates a controller crash after source
+	// review persistence. The reservation must still block admission.
+	restarted := open()
+	if !restarted.Snapshot(id).UnknownUsageReserved {
+		t.Fatal("restart released uncertain usage")
+	}
+	if err := restarted.SettleReviewedUsage(id, binding, nonce, 2.5, now, review); err != nil {
+		t.Fatal(err)
+	}
+	after := open()
+	if err := after.SettleReviewedUsage(id, binding, nonce, 2.5, now, review); err != nil {
+		t.Fatal("committed settlement replay failed", err)
+	}
+	snapshot := after.Snapshot(id)
+	if snapshot.UnknownUsageReserved || snapshot.WeeklyCreditsUsed != 2.5 {
+		t.Fatalf("wrong settlement: %+v", snapshot)
+	}
+	for _, values := range [][3]string{{binding, nonce, strings.Repeat("d", 64)}, {binding, strings.Repeat("e", 64), review}, {"", nonce, review}} {
+		if err := after.SettleReviewedUsage(id, values[0], values[1], 2.5, now, values[2]); err == nil {
+			t.Fatal("conflicting settlement accepted")
+		}
+	}
+	if err := after.SettleReviewedUsage(id, binding, nonce, 0, now, review); err == nil {
+		t.Fatal("settled usage refunded")
+	}
+	if after.Snapshot(id).WeeklyCreditsUsed != 2.5 {
+		t.Fatal("rejected review mutated accounting")
+	}
+}
+
 func TestSubscriptionAdmissionUnknownUsageConservativelyReservesWeeklyScope(t *testing.T) {
 	now := time.Date(2026, 9, 7, 7, 0, 0, 0, time.UTC)
 	cfg := DefaultSubscriptionAdmissionConfig()

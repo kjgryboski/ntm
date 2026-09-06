@@ -81,10 +81,14 @@ func TestProviderCampaignRejectsUnmanagedPaneRoutes(t *testing.T) {
 	defer func() { providerCampaignID = prior }()
 	providerCampaignID = "bound-campaign"
 	root := &cobra.Command{Use: "ntm"}
-	for _, name := range []string{"spawn", "send", "assign", "respawn", "interrupt"} {
+	for _, name := range []string{"spawn", "send", "assign", "respawn", "resume", "interrupt"} {
 		cmd := &cobra.Command{Use: name}
+		if name == "resume" {
+			cmd = newResumeCmd()
+		} else {
+			cmd.Flags().String("provider-profile", "", "")
+		}
 		root.AddCommand(cmd)
-		cmd.Flags().String("provider-profile", "", "")
 		if validateProviderCampaignRoute(cmd) == nil {
 			t.Fatalf("%s raw route accepted", name)
 		}

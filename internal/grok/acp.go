@@ -190,11 +190,15 @@ func (p osProcess) Kill() error {
 	return p.cmd.Process.Kill()
 }
 
-// Request is one direct, single-prompt ACP execution.
+// Request is one direct ACP execution: a fresh/resumed prompt or a session close.
 type Request struct {
-	Prompt string
-	CWD    string
-	Binary string
+	// ResumeSession is supplied from a verified predecessor. Closing also
+	// permits a verified cancellation; it never authorizes another prompt.
+	ResumeSession string
+	CloseSession  bool
+	Prompt        string
+	CWD           string
+	Binary        string
 	// RuntimeHome is the dedicated GROK_HOME selected by the exact provider
 	// profile. Production runners reject an absent or relative value so user
 	// auth/config, compatibility scanners, and session state cannot bleed in.
@@ -438,9 +442,11 @@ type StderrDigest struct {
 // Result is a redaction-safe provider receipt. Assistant output is never
 // retained, only counted and hashed.
 type Result struct {
-	Success     bool      `json:"success"`
-	State       string    `json:"state"`
-	FailureCode ErrorCode `json:"failure_code,omitempty"`
+	SessionResumed bool      `json:"session_resumed,omitempty"`
+	SessionClosed  bool      `json:"session_closed,omitempty"`
+	Success        bool      `json:"success"`
+	State          string    `json:"state"`
+	FailureCode    ErrorCode `json:"failure_code,omitempty"`
 	// FailureStage is a bounded controller label, never provider text. It lets
 	// operators distinguish setup/handshake/tooling failures without retaining
 	// stderr, RPC payloads, prompts, paths, or credentials.
@@ -676,6 +682,9 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 		observation.ToolRequests = updates.toolRequestCount
 		observation.ToolCompletions = updates.toolCompleteCount
 		observation.PermissionDenials = updates.permissionDenials
+		if observed, ok := controller.(interface{ RejectedCalls() int }); ok {
+			observation.BrokerRejectedCalls = observed.RejectedCalls()
+		}
 		observation.AssistantTextChunks = updates.chunks
 		observation.AssistantTextBytes = updates.bytes
 		observation.ReplyBoundaries = updates.replyBoundaries
@@ -791,6 +800,9 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	if err := json.Unmarshal(initRaw, &init); err != nil {
 		return finishFailure(result, ErrProtocol, protocolError(provider.ProtocolInvalidResult))
 	}
+	if (req.ResumeSession != "" && init.AgentCapabilities.SessionCapabilities.Resume == nil) || (req.CloseSession && (req.ResumeSession == "" || init.AgentCapabilities.SessionCapabilities.Close == nil)) {
+		return finishFailure(result, ErrProtocol, errors.New("required ACP session capability is unavailable"))
+	}
 	methodID, err := selectAuthMethod(init.AuthMethods)
 	if err != nil {
 		failureStage = "auth_method_selection"
@@ -810,19 +822,59 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	cachedTokenAuthenticated = true
 
 	failureStage = "session_new"
-	newRaw, err := call("session/new", sessionNewParams{
+	method := "session/new"
+	params := sessionNewParams{
 		CWD: req.CWD, MCPServers: mcpServers,
 		Meta: sessionNewMeta{StartupHints: ntmStartupHints(), ModelID: strings.TrimSpace(req.Model), MCPServers: controllerServers},
-	})
+	}
+	if req.ResumeSession != "" {
+		method, failureStage, params.SessionID = "session/resume", "session_resume", req.ResumeSession
+		updates.providerSessionID = req.ResumeSession
+	}
+	newRaw, err := call(method, params)
 	if err != nil {
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
 	}
 	var session sessionNewResult
-	if err := json.Unmarshal(newRaw, &session); err != nil || strings.TrimSpace(session.SessionID) == "" {
+	if err := json.Unmarshal(newRaw, &session); err != nil {
+		return finishFailure(result, ErrProtocol, protocolError(provider.ProtocolInvalidResult))
+	}
+	if req.ResumeSession != "" {
+		if session.SessionID != "" && session.SessionID != req.ResumeSession {
+			return finishFailure(result, ErrProtocol, protocolError(provider.ProtocolInvalidResult))
+		}
+		if len(newRaw) == 0 || strings.TrimSpace(string(newRaw)) == "null" || updates.chunks != 0 || updates.toolRequestCount != 0 {
+			return finishFailure(result, ErrProtocol, protocolError(provider.ProtocolInvalidResult))
+		}
+		session.SessionID = req.ResumeSession
+		result.SessionResumed = true
+	}
+	if strings.TrimSpace(session.SessionID) == "" {
 		return finishFailure(result, ErrProtocol, protocolError(provider.ProtocolInvalidResult))
 	}
 	result.ProviderSessionID = session.SessionID
 	updates.providerSessionID = session.SessionID
+	if req.CloseSession {
+		failureStage = "session_close"
+		raw, err := call("session/close", sessionCancelParams{SessionID: session.SessionID})
+		if err != nil {
+			return contextAwareFailure(result, false, err)
+		}
+		var closed map[string]json.RawMessage
+		if json.Unmarshal(raw, &closed) != nil || closed == nil {
+			return finishFailure(result, ErrProtocol, protocolError(provider.ProtocolInvalidResult))
+		}
+		// Reviewed Grok 1.0.13 session_lifecycle.rs distinguishes an actual
+		// close from notResident and superseded. An empty reply proves neither.
+		var meta struct {
+			Outcome string `json:"x.ai/closeOutcome"`
+		}
+		if json.Unmarshal(closed["_meta"], &meta) != nil || meta.Outcome != "closed" {
+			return finishFailure(result, ErrProtocol, protocolError(provider.ProtocolInvalidResult))
+		}
+		result.SessionClosed, result.Success, result.State = true, true, "session_closed"
+		return result, nil
+	}
 	sessionConfigModel, sessionConfigModelObserved := sessionConfigExactModel(session.ConfigOptions, strings.TrimSpace(req.Model))
 	sessionModelStateModel, sessionModelStateObserved := sessionModelsExactModel(session.Models, strings.TrimSpace(req.Model))
 
@@ -1335,7 +1387,13 @@ type authMethod struct {
 }
 
 type initializeResult struct {
-	AuthMethods []authMethod `json:"authMethods"`
+	AuthMethods       []authMethod `json:"authMethods"`
+	AgentCapabilities struct {
+		SessionCapabilities struct {
+			Resume *struct{} `json:"resume"`
+			Close  *struct{} `json:"close"`
+		} `json:"sessionCapabilities"`
+	} `json:"agentCapabilities"`
 }
 
 type authenticateParams struct {
@@ -1344,6 +1402,7 @@ type authenticateParams struct {
 }
 
 type sessionNewParams struct {
+	SessionID  string                      `json:"sessionId,omitempty"`
 	CWD        string                      `json:"cwd"`
 	MCPServers []WorkspaceBrokerDescriptor `json:"mcpServers"`
 	Meta       sessionNewMeta              `json:"_meta"`

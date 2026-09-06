@@ -326,8 +326,8 @@ func TestAuthorizeProviderOperationRequiresLocalSupportAndSignedEvidence(t *test
 			if err == nil {
 				t.Fatalf("lifecycle authority error = %v", err)
 			}
-			if loaded != (transport != "xai_acp") {
-				t.Fatal("supported local lifecycle must consult signed evidence; ACP without resume must stop first")
+			if !loaded {
+				t.Fatal("supported local lifecycle must consult signed evidence")
 			}
 		})
 	}

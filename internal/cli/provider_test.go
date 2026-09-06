@@ -34,7 +34,7 @@ func TestProviderReadinessSeparatesOfflineWorkspaceEvidenceFromAdmission(t *test
 	}
 	report.Promotion = providerDoctorPromotionForReport(report, providerOperationWorkspaceWrite)
 	report.Readiness = providerReadinessForReport(report)
-	if report.Readiness.WorkspaceEvidence != "qualified" || report.Readiness.WorkspaceAdmission || report.Readiness.Lifecycle[providerqualification.CheckResume] != "unsupported" || report.Readiness.Lifecycle[providerqualification.CheckCrashRecovery] != "untested" || report.Readiness.Lifecycle[providerqualification.CheckCancellation] != "failed" {
+	if report.Readiness.WorkspaceEvidence != "qualified" || report.Readiness.WorkspaceAdmission || report.Readiness.Lifecycle[providerqualification.CheckResume] != "untested" || report.Readiness.Lifecycle[providerqualification.CheckCrashRecovery] != "untested" || report.Readiness.Lifecycle[providerqualification.CheckCancellation] != "failed" {
 		t.Fatalf("readiness conflates evidence and admission: %+v", report.Readiness)
 	}
 	var out bytes.Buffer
@@ -116,8 +116,8 @@ func TestProviderBaselineSeparatesCapabilitySupportFromLiveEvidence(t *testing.T
 	}
 	report.Capabilities = provider.CapabilityMatrix()["xai_acp"]
 	for _, check := range providerBaselineForReport(report).Checks {
-		if check.Operation == "resume" && check.State != "unsupported" {
-			t.Fatal("unsupported ACP resume hidden")
+		if check.Operation == "resume" && check.State != "untested" {
+			t.Fatal("ACP resume support mistaken for live qualification")
 		}
 	}
 }

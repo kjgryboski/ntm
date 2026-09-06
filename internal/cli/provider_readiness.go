@@ -91,8 +91,8 @@ func providerEvidenceCommand(inspect func(*cobra.Command, string, string, func(p
 	cmd := &cobra.Command{Use: "evidence", Short: "Verify saved task evidence and export acceptance results without generation", Args: cobra.NoArgs}
 	cmd.Flags().StringVar(&profile, "profile", "", "Exact configured profile")
 	cmd.Flags().StringVar(&operation, "operation", "", "Existing operation ID")
-	cmd.Flags().StringVar(&require, "require", "completion", "Required result: completion, local-cancellation, guarded-restart")
-	cmd.Flags().StringVar(&parent, "restart-of", "", "Exact original operation required for guarded-restart")
+	cmd.Flags().StringVar(&require, "require", "completion", "Required result: completion, local-cancellation, guarded-restart, session-resume")
+	cmd.Flags().StringVar(&parent, "restart-of", "", "Exact predecessor operation required for guarded-restart or session-resume")
 	cmd.Flags().StringVar(&output, "output", "", "Optional new absolute JSON file; never replaces existing evidence")
 	cmd.Flags().BoolVar(&contract, "contract", false, "Describe lifecycle guarantees and evidence requirements without inspecting a task")
 	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
@@ -106,7 +106,7 @@ func providerEvidenceCommand(inspect func(*cobra.Command, string, string, func(p
 				"local_cancellation":    "exact signed canceled outcome, observed controller cancellation, cleanup and local slot release",
 				"guarded_fresh_restart": "verified eligible parent and distinct completed child with matching exact identity and parent digest; fresh dispatch admission required",
 				"controller_crash":      "quarantine uncertain ownership; never replay, infer completion, release uncertain usage or take over from PID/age alone",
-				"session_resume":        "unsupported by the common managed assignment workflow; requires provider-specific persisted session, exact identity and protocol evidence",
+				"session_resume":        "Grok ACP requires a signed completed predecessor, exact identity and workspace, exclusive successor ownership, advertised resume and verified next-turn completion",
 				"remote_termination":    "requires provider-authoritative terminal request evidence; local process exit is insufficient",
 				"billing_settlement":    "requires authoritative exact request/account usage and settlement coverage; local slot release and aggregate quota are insufficient",
 			})
@@ -114,11 +114,12 @@ func providerEvidenceCommand(inspect func(*cobra.Command, string, string, func(p
 		if strings.TrimSpace(profile) == "" || !validProviderNativeOperationID(operation) || (output != "" && !filepath.IsAbs(output)) {
 			return errors.New("evidence requires exact profile, operation and optional absolute output path")
 		}
-		if require != "completion" && require != "local-cancellation" && require != "guarded-restart" {
+		if require != "completion" && require != "local-cancellation" && require != "guarded-restart" && require != "session-resume" {
 			return errors.New("unsupported evidence requirement")
 		}
-		if (require == "guarded-restart" && (!validProviderNativeOperationID(parent) || parent == operation)) || (require != "guarded-restart" && parent != "") {
-			return errors.New("guarded-restart requires a distinct exact parent operation")
+		needsParent := require == "guarded-restart" || require == "session-resume"
+		if (needsParent && (!validProviderNativeOperationID(parent) || parent == operation)) || (!needsParent && parent != "") {
+			return errors.New("restart or resume requires a distinct exact predecessor operation; other requirements do not accept a predecessor")
 		}
 		var current, original providerAssignmentStatus
 		if err := inspect(cmd, profile, operation, func(s providerAssignmentStatus) error { current = s; return nil }); err != nil {
@@ -176,6 +177,8 @@ func providerTaskRequirementPassed(current, parent providerAssignmentStatus, req
 		return current.CancellationObserved && !current.CompletionConfirmed && (current.State == "cancelled_local" || current.State == "cancelled" || current.State == "cancelled_acknowledged")
 	case "guarded-restart":
 		return current.CompletionConfirmed && current.WorkspaceVerified && current.RestartOfSHA256 == parentSHA && parent.OperationIDSHA256 == parentSHA && parent.ControllerFinalized && parent.OutcomeSHA256 != "" && parent.IdentitySHA256 == current.IdentitySHA256 && providerRestartAllowed(parent)
+	case "session-resume":
+		return current.Provider == "xai" && current.SessionResumed && !current.SessionClosed && current.CompletionConfirmed && current.WorkspaceVerified && current.ParentOperationSHA256 == parentSHA && parent.OperationIDSHA256 == parentSHA && parent.CompletionConfirmed && parent.WorkspaceVerified && parent.ControllerFinalized && parent.OutcomeSHA256 != "" && parent.IdentitySHA256 == current.IdentitySHA256 && providerRestartAllowed(parent)
 	default:
 		return false
 	}
@@ -659,13 +662,16 @@ func providerTaskEvidence(operations []providerAssignmentStatus) []providerReadi
 		observations["ordinary_task"] = providerTaskRequirementPassed(op, providerAssignmentStatus{}, "completion", "")
 		observations["local_cancellation"] = providerTaskRequirementPassed(op, providerAssignmentStatus{}, "local-cancellation", "")
 		observations["guarded_fresh_restart"] = false
+		observations["resume"] = false
 		for _, parent := range operations {
+			if op.ParentOperationSHA256 != "" && parent.OperationIDSHA256 == op.ParentOperationSHA256 {
+				observations["resume"] = providerTaskRequirementPassed(op, parent, "session-resume", op.ParentOperationSHA256)
+			}
 			if op.RestartOfSHA256 != "" && parent.OperationIDSHA256 == op.RestartOfSHA256 {
 				observations["guarded_fresh_restart"] = providerTaskRequirementPassed(op, parent, "guarded-restart", op.RestartOfSHA256)
-				break
 			}
 		}
-		for _, name := range []string{"launch", "assignment", "prompt_delivery", "workspace_edit", "test_execution", "completion_detection", "cleanup", "ordinary_task", "local_cancellation", "local_slot_release", "guarded_fresh_restart"} {
+		for _, name := range []string{"launch", "assignment", "prompt_delivery", "workspace_edit", "test_execution", "completion_detection", "cleanup", "ordinary_task", "local_cancellation", "local_slot_release", "guarded_fresh_restart", "resume"} {
 			state := "untested"
 			if observations[name] {
 				state = "passed"
