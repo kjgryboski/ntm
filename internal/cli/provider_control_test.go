@@ -190,17 +190,19 @@ func TestProviderRestartRequiresTerminalCleanupAndCapacityEvidence(t *testing.T)
 }
 
 func TestProviderControllerExitCannotReplayUnknownAssignment(t *testing.T) {
-	for _, phase := range []string{"reservation", "dispatch", "signing", "receipt", "killed"} {
-		t.Run(phase, func(t *testing.T) { testProviderControllerExitPhase(t, phase) })
+	for _, vendor := range []string{"xai", "zai", "openai", "anthropic"} {
+		for _, phase := range []string{"reservation", "dispatch", "signing", "receipt", "killed"} {
+			t.Run(vendor+"/"+phase, func(t *testing.T) { testProviderControllerExitPhase(t, vendor, phase) })
+		}
 	}
 }
 
-func testProviderControllerExitPhase(t *testing.T, phase string) {
+func testProviderControllerExitPhase(t *testing.T, vendor, phase string) {
 	root := t.TempDir()
 	childCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	child := exec.CommandContext(childCtx, os.Args[0], "-test.run=^TestProviderControllerExitHelper$")
-	child.Env = append(os.Environ(), "NTM_PROVIDER_CONTROLLER_EXIT_HELPER="+root, "NTM_PROVIDER_CONTROLLER_EXIT_PHASE="+phase)
+	child.Env = append(os.Environ(), "NTM_PROVIDER_CONTROLLER_EXIT_HELPER="+root, "NTM_PROVIDER_CONTROLLER_EXIT_PHASE="+phase, "NTM_PROVIDER_CONTROLLER_EXIT_VENDOR="+vendor)
 	if phase == "killed" {
 		if err := child.Start(); err != nil {
 			t.Fatal(err)
@@ -231,7 +233,7 @@ func testProviderControllerExitPhase(t *testing.T, phase string) {
 		t.Fatal(err)
 	}
 	defer ledger.Close()
-	identity, _ := provider.NewIdentity("xai", "test-account", "grok-4.6", "https://api.x.ai/v1", "grok", strings.Repeat("a", 64))
+	identity := providerControllerExitTestIdentity(t, vendor)
 	request := providerAssignmentRequest{OperationID: "crashed-task", CWD: root, Prompt: "bounded work"}
 	if _, _, err := beginProviderControl(context.Background(), ledger, identity, request); err == nil || !strings.Contains(err.Error(), "outcome unknown") {
 		t.Fatalf("orphaned assignment replay: %v", err)
@@ -250,6 +252,20 @@ func testProviderControllerExitPhase(t *testing.T, phase string) {
 	if err != nil || row == nil || row.Status != wantStatus {
 		t.Fatalf("unknown adapter row changed: %+v %v", row, err)
 	}
+	control, err := ledger.GetSendOperation(request.OperationID, providerControlScope)
+	if err != nil || control == nil || control.Status != state.SendOperationInProgress || control.OutcomeJSON != "" {
+		t.Fatal("controller restart fabricated completion or capacity release")
+	}
+}
+
+func providerControllerExitTestIdentity(t *testing.T, vendor string) provider.Identity {
+	t.Helper()
+	runtime := map[string]string{"xai": "grok", "zai": "codex", "openai": "codex", "anthropic": "claude"}[vendor]
+	identity, err := provider.NewIdentity(vendor, "test-account", "test-model", "https://example.com/v1", runtime, strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
 }
 
 func TestProviderControllerExitHelper(t *testing.T) {
@@ -264,7 +280,7 @@ func TestProviderControllerExitHelper(t *testing.T) {
 	if err = ledger.Migrate(); err != nil {
 		t.Fatal(err)
 	}
-	identity, _ := provider.NewIdentity("xai", "test-account", "grok-4.6", "https://api.x.ai/v1", "grok", strings.Repeat("a", 64))
+	identity := providerControllerExitTestIdentity(t, os.Getenv("NTM_PROVIDER_CONTROLLER_EXIT_VENDOR"))
 	request := providerAssignmentRequest{OperationID: "crashed-task", CWD: root, Prompt: "bounded work"}
 	if _, _, err = beginProviderControl(context.Background(), ledger, identity, request); err != nil {
 		t.Fatal(err)

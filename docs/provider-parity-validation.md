@@ -28,6 +28,42 @@ reset its ceiling. Unknown operations cannot be replayed. A new campaign require
 its own explicit scope and authorization record; never use one to silently refund
 or replay an exhausted campaign.
 
+## Saved task evidence and lifecycle contract
+
+`provider evidence --profile NAME --operation ID --require completion` checks a
+saved task through the same pinned-signer and exact-binding status owner used by
+readiness. Use `--require local-cancellation` for an observed canceled task or
+`--require guarded-restart --restart-of PARENT_ID` to verify both parent and child.
+The parent must have the same exact identity, a verified terminal result, cleanup
+and local capacity release; a restart digest alone is insufficient. The child
+must independently complete workspace verification. Unknown or incompletely
+finalized controllers fail acceptance even when a signed runtime result exists.
+
+`--output ABSOLUTE_NEW_FILE` saves a redacted result before returning a failed
+acceptance verdict. Existing files are never replaced. This is a local observation
+of the signed ledger, not a new signature or dispatch authorization. The original
+signed receipt remains the authority; rerun this read-only command to repair an
+export rather than replaying generation. Local elapsed time is measured from the
+ledger timestamps and is separate from billed runtime. Human intervention is
+reported as unmeasured unless recorded separately by the pilot owner.
+
+`provider evidence --contract` describes the common lifecycle acceptance rules.
+Controller restart preserves uncertain ownership and usage. It cannot replay or
+take over an operation based on PID death or age. Subprocess crash tests cover
+all four provider routes after reservation, dispatch, signing, receipt persistence
+and forced controller death. These demonstrate quarantine, not automatic recovery.
+The common assignment workflow does not implement provider session resume. Adding
+that capability requires provider-specific session persistence and identity-bound
+protocol evidence. Local cancellation and fresh restart do not establish remote
+generation termination or final billing settlement.
+
+For a bounded operational pilot, record the exact binary, fixture, account/model,
+qualification expiry, campaign limit and intended task duration before dispatch.
+Check local startup and compiled verifier prerequisites first. Preserve failed
+attempts, original tests and all exhausted campaigns. Compare completion, local
+elapsed time, recorded human interventions and local capacity release through
+`provider evidence`; keep blocked providers in the denominator as not attempted.
+
 ## Credential refresh
 
 `provider credential refresh-snapshot --profile NAME --source-home DIRECTORY`

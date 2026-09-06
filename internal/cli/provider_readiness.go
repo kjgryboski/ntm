@@ -2,8 +2,10 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -52,6 +54,108 @@ type providerReadinessCapability struct {
 	Operation          string `json:"operation"`
 	State              string `json:"state"`
 	ObservationIndexes []int  `json:"observation_indexes"`
+}
+
+// Evidence exports use the same signature and binding verifier as status and
+// readiness. They contain observations, not portable dispatch authority.
+func newProviderEvidenceCmd() *cobra.Command {
+	return providerEvidenceCommand(withProviderAssignmentStatus)
+}
+
+func providerEvidenceCommand(inspect func(*cobra.Command, string, string, func(providerAssignmentStatus) error) error) *cobra.Command {
+	var profile, operation, require, parent, output string
+	var contract bool
+	cmd := &cobra.Command{Use: "evidence", Short: "Verify saved task evidence and export acceptance results without generation", Args: cobra.NoArgs}
+	cmd.Flags().StringVar(&profile, "profile", "", "Exact configured profile")
+	cmd.Flags().StringVar(&operation, "operation", "", "Existing operation ID")
+	cmd.Flags().StringVar(&require, "require", "completion", "Required result: completion, local-cancellation, guarded-restart")
+	cmd.Flags().StringVar(&parent, "restart-of", "", "Exact original operation required for guarded-restart")
+	cmd.Flags().StringVar(&output, "output", "", "Optional new absolute JSON file; never replaces existing evidence")
+	cmd.Flags().BoolVar(&contract, "contract", false, "Describe lifecycle guarantees and evidence requirements without inspecting a task")
+	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		if contract {
+			if profile != "" || operation != "" || parent != "" || output != "" || cmd.Flags().Changed("require") {
+				return errors.New("contract cannot be combined with task evidence options")
+			}
+			return encodeIndentedJSON(cmd.OutOrStdout(), map[string]any{
+				"schema_version": "ntm.provider-lifecycle-contract.v1", "generation_calls": 0, "dispatch_authorized": false,
+				"completion":            "exact signed terminal outcome, independent workspace verification, cleanup and local slot release",
+				"local_cancellation":    "exact signed canceled outcome, observed controller cancellation, cleanup and local slot release",
+				"guarded_fresh_restart": "verified eligible parent and distinct completed child with matching exact identity and parent digest; fresh dispatch admission required",
+				"controller_crash":      "quarantine uncertain ownership; never replay, infer completion, release uncertain usage or take over from PID/age alone",
+				"session_resume":        "unsupported by the common managed assignment workflow; requires provider-specific persisted session, exact identity and protocol evidence",
+				"remote_termination":    "requires provider-authoritative terminal request evidence; local process exit is insufficient",
+				"billing_settlement":    "requires authoritative exact request/account usage and settlement coverage; local slot release and aggregate quota are insufficient",
+			})
+		}
+		if strings.TrimSpace(profile) == "" || !validProviderNativeOperationID(operation) || (output != "" && !filepath.IsAbs(output)) {
+			return errors.New("evidence requires exact profile, operation and optional absolute output path")
+		}
+		if require != "completion" && require != "local-cancellation" && require != "guarded-restart" {
+			return errors.New("unsupported evidence requirement")
+		}
+		if (require == "guarded-restart" && (!validProviderNativeOperationID(parent) || parent == operation)) || (require != "guarded-restart" && parent != "") {
+			return errors.New("guarded-restart requires a distinct exact parent operation")
+		}
+		var current, original providerAssignmentStatus
+		if err := inspect(cmd, profile, operation, func(s providerAssignmentStatus) error { current = s; return nil }); err != nil {
+			return err
+		}
+		if parent != "" {
+			if err := inspect(cmd, profile, parent, func(s providerAssignmentStatus) error { original = s; return nil }); err != nil {
+				return err
+			}
+		}
+		passed := providerTaskRequirementPassed(current, original, require, sha256StringCLI(parent))
+		observations := []providerAssignmentStatus{current}
+		if parent != "" {
+			observations = append(observations, original)
+		}
+		result := map[string]any{"schema_version": "ntm.provider-task-evidence.v1", "generated_at": time.Now().UTC(), "generation_calls": 0, "dispatch_authorized": false, "requirement": require, "passed": passed, "operation_id_sha256": sha256StringCLI(operation), "status": current, "checks": providerTaskEvidence(observations), "human_interventions": "not_measured", "note": "Verified from the live ledger and pinned signer. Export is a local observation, not a new signed receipt, qualification or billing settlement."}
+		if parent != "" {
+			result["parent_status"] = original
+		}
+		data, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return err
+		}
+		data = append(data, '\n')
+		if output != "" {
+			file, err := os.OpenFile(output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+			if err != nil {
+				return errors.New("evidence export requires a new writable file; existing evidence is preserved")
+			}
+			_, writeErr := file.Write(data)
+			err = errors.Join(writeErr, file.Sync(), file.Close())
+			if err != nil {
+				return errors.New("evidence export failed; partial file retained, no replay required")
+			}
+		}
+		if _, err := cmd.OutOrStdout().Write(data); err != nil {
+			return err
+		}
+		if !passed {
+			return errors.New("saved evidence does not satisfy the requested result; inspect it without replaying generation")
+		}
+		return nil
+	}
+	return cmd
+}
+
+func providerTaskRequirementPassed(current, parent providerAssignmentStatus, require, parentSHA string) bool {
+	if !current.IdentityBindingVerified || current.OutcomeSHA256 == "" || !current.ControllerFinalized || !providerRestartAllowed(current) {
+		return false
+	}
+	switch require {
+	case "completion":
+		return current.CompletionConfirmed && current.WorkspaceVerified
+	case "local-cancellation":
+		return current.CancellationObserved && !current.CompletionConfirmed && (current.State == "cancelled_local" || current.State == "cancelled" || current.State == "cancelled_acknowledged")
+	case "guarded-restart":
+		return current.CompletionConfirmed && current.WorkspaceVerified && current.RestartOfSHA256 == parentSHA && parent.OperationIDSHA256 == parentSHA && parent.ControllerFinalized && parent.OutcomeSHA256 != "" && parent.IdentitySHA256 == current.IdentitySHA256 && providerRestartAllowed(parent)
+	default:
+		return false
+	}
 }
 
 // This is a single read surface over existing admission and receipt owners.
@@ -406,6 +510,15 @@ func providerTaskEvidence(operations []providerAssignmentStatus) []providerReadi
 			continue
 		}
 		observations := map[string]bool{"launch": op.CompletionConfirmed, "assignment": op.CompletionConfirmed, "prompt_delivery": op.CompletionConfirmed, "workspace_edit": op.WorkspaceVerified, "test_execution": op.WorkspaceVerified, "completion_detection": op.CompletionConfirmed, "cleanup": op.LocalCleanupVerified, "ordinary_task": op.CompletionConfirmed, "local_cancellation": op.CancellationObserved && op.LocalCleanupVerified, "local_slot_release": op.CapacityObservation != nil && op.CapacityObservation.LocalSlotReleased, "guarded_fresh_restart": op.CompletionConfirmed && op.RestartOfSHA256 != ""}
+		observations["ordinary_task"] = providerTaskRequirementPassed(op, providerAssignmentStatus{}, "completion", "")
+		observations["local_cancellation"] = providerTaskRequirementPassed(op, providerAssignmentStatus{}, "local-cancellation", "")
+		observations["guarded_fresh_restart"] = false
+		for _, parent := range operations {
+			if op.RestartOfSHA256 != "" && parent.OperationIDSHA256 == op.RestartOfSHA256 {
+				observations["guarded_fresh_restart"] = providerTaskRequirementPassed(op, parent, "guarded-restart", op.RestartOfSHA256)
+				break
+			}
+		}
 		for _, name := range []string{"launch", "assignment", "prompt_delivery", "workspace_edit", "test_execution", "completion_detection", "cleanup", "ordinary_task", "local_cancellation", "local_slot_release", "guarded_fresh_restart"} {
 			state := "untested"
 			if observations[name] {

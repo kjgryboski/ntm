@@ -50,6 +50,7 @@ type providerAssignmentStatus struct {
 	Runtime                    string                               `json:"runtime"`
 	AccountSHA256              string                               `json:"account_sha256"`
 	IdentitySHA256             string                               `json:"identity_sha256"`
+	OperationIDSHA256          string                               `json:"operation_id_sha256"`
 	BillingClass               string                               `json:"billing_class"`
 	RequestedModel             string                               `json:"requested_model"`
 	ServedModel                string                               `json:"served_model,omitempty"`
@@ -64,6 +65,10 @@ type providerAssignmentStatus struct {
 	CancellationObserved       bool                                 `json:"local_cancellation_observed"`
 	OutcomeSHA256              string                               `json:"signed_outcome_sha256,omitempty"`
 	CompletedAt                *time.Time                           `json:"completed_at,omitempty"`
+	StartedAt                  time.Time                            `json:"started_at"`
+	ElapsedSeconds             *float64                             `json:"local_elapsed_seconds,omitempty"`
+	ControllerFinalized        bool                                 `json:"local_controller_finalized"`
+	RecoveryDisposition        string                               `json:"recovery_disposition"`
 	RestartOfSHA256            string                               `json:"local_restart_of_sha256,omitempty"`
 	CapacityUnits              map[string]any                       `json:"capacity_units"`
 }
@@ -126,6 +131,8 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 		return errors.New("provider assignment was not found")
 	}
 	out := providerAssignmentStatus{Schema: "ntm.provider-assignment-status.v1", Profile: profileName, Provider: identity.Provider(), Runtime: identity.Runtime(), AccountSHA256: sha256StringCLI(identity.AccountAlias()), IdentitySHA256: identity.Hash(), BillingClass: identity.BillingClass(), RequestedModel: identity.Model(), State: "outcome_unknown", RemoteTermination: "unverified"}
+	out.StartedAt = row.CreatedAt
+	out.OperationIDSHA256 = sha256StringCLI(operationID)
 	var trustedKey providerattestation.KeyMetadata
 	if row.Status == state.SendOperationCompleted {
 		sign, err := providerProfilePinnedSigner(profile)
@@ -187,6 +194,7 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 			return errors.New("provider control observation binding is invalid")
 		}
 		out.CancellationObserved = observation.CancelObserved
+		out.ControllerFinalized = true
 		out.RestartOfSHA256 = observation.RestartOfSHA256
 		if identity.Provider() == "xai" || identity.Provider() == "zai" {
 			out.WorkspaceVerified = validProviderWorkspaceCompletion(observation.WorkspaceCompletion, row, identity, trustedKey)
@@ -200,7 +208,25 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 		out.State = "runtime_completed_workspace_unverified"
 	}
 	out.CapacityUnits = map[string]any{"execution_slots": "local controller process leases", "experiment_attempts": "separate durable campaign; not billing requests", "billing_usage": "not inferred from local slot release", "billing_settlement": "unverified"}
+	if out.CompletedAt != nil && !out.StartedAt.IsZero() && !out.CompletedAt.Before(out.StartedAt) {
+		elapsed := out.CompletedAt.Sub(out.StartedAt).Seconds()
+		out.ElapsedSeconds = &elapsed
+	}
+	out.RecoveryDisposition = providerRecoveryDisposition(out)
 	return visit(out)
+}
+
+func providerRecoveryDisposition(out providerAssignmentStatus) string {
+	if !out.IdentityBindingVerified {
+		return "quarantined_unknown_outcome"
+	}
+	if !out.ControllerFinalized {
+		return "quarantined_controller_incomplete"
+	}
+	if providerRestartAllowed(out) {
+		return "guarded_fresh_restart_eligible"
+	}
+	return "verified_terminal_result_requires_review"
 }
 
 func providerWorkspaceStatusCompleted(out providerAssignmentStatus) bool {

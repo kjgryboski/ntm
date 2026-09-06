@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,7 +13,133 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/state"
+	"github.com/spf13/cobra"
 )
+
+func TestEvidenceSurfaceExportsFailureWithoutReplayAndPreservesExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "evidence.json")
+	calls := 0
+	inspect := func(_ *cobra.Command, profile, operation string, visit func(providerAssignmentStatus) error) error {
+		calls++
+		if profile != "exact" || operation != "uncertain" {
+			t.Fatal("changed exact task selection")
+		}
+		return visit(providerAssignmentStatus{State: "outcome_unknown"})
+	}
+	cmd := providerEvidenceCommand(inspect)
+	var stdout bytes.Buffer
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stdout)
+	cmd.SetArgs([]string{"--profile", "exact", "--operation", "uncertain", "--output", path})
+	if err := cmd.Execute(); err == nil || calls != 1 {
+		t.Fatal("unknown task passed or inspector replayed")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Passed          bool
+		GenerationCalls int  `json:"generation_calls"`
+		Dispatch        bool `json:"dispatch_authorized"`
+	}
+	if json.Unmarshal(data, &result) != nil || result.Passed || result.Dispatch || result.GenerationCalls != 0 {
+		t.Fatal("failure export granted authority")
+	}
+	cmd = providerEvidenceCommand(inspect)
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stdout)
+	cmd.SetArgs([]string{"--profile", "exact", "--operation", "uncertain", "--output", path})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("existing evidence overwritten")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(data, after) {
+		t.Fatal("retained evidence changed")
+	}
+}
+
+func TestEvidenceSurfaceBindsRestartParentAndRejectsIncompleteController(t *testing.T) {
+	identity := strings.Repeat("a", 64)
+	parent := providerAssignmentStatus{Provider: "anthropic", IdentitySHA256: identity, IdentityBindingVerified: true, OutcomeSHA256: strings.Repeat("b", 64), ControllerFinalized: true, State: "cancelled_local", LocalCleanupVerified: true, CancellationObserved: true, CapacityObservation: &provider.CapacityReleaseObservation{IdentitySHA256: identity, Scope: provider.CapacityControlScopeLocalShared, LocalSlotReleased: true, ObservedAt: time.Now()}}
+	parent.OperationIDSHA256 = sha256StringCLI("parent")
+	child := parent
+	child.State, child.CompletionConfirmed, child.WorkspaceVerified = "completed", true, true
+	child.RestartOfSHA256 = sha256StringCLI("parent")
+	child.OperationIDSHA256 = sha256StringCLI("child")
+	if !providerTaskRequirementPassed(parent, providerAssignmentStatus{}, "local-cancellation", "") {
+		t.Fatal("verified cancellation rejected")
+	}
+	for _, scenario := range []string{"valid", "wrong-parent", "wrong-identity", "no-release", "incomplete-controller"} {
+		t.Run(scenario, func(t *testing.T) {
+			p, c := parent, child
+			switch scenario {
+			case "wrong-parent":
+				c.RestartOfSHA256 = sha256StringCLI("another")
+			case "wrong-identity":
+				p.IdentitySHA256 = strings.Repeat("c", 64)
+			case "no-release":
+				p.CapacityObservation = nil
+			case "incomplete-controller":
+				c.ControllerFinalized = false
+			}
+			calls := 0
+			cmd := providerEvidenceCommand(func(_ *cobra.Command, profile, operation string, visit func(providerAssignmentStatus) error) error {
+				calls++
+				if profile != "exact" {
+					t.Fatal("profile drift")
+				}
+				if operation == "child" {
+					return visit(c)
+				}
+				if operation == "parent" {
+					return visit(p)
+				}
+				t.Fatal("unexpected operation")
+				return nil
+			})
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			cmd.SetArgs([]string{"--profile", "exact", "--operation", "child", "--require", "guarded-restart", "--restart-of", "parent"})
+			err := cmd.Execute()
+			if (err == nil) != (scenario == "valid") || calls != 2 {
+				t.Fatalf("unexpected verdict: %v calls=%d", err, calls)
+			}
+		})
+	}
+}
+
+func TestEvidenceContractNeverInspectsOrAuthorizesWork(t *testing.T) {
+	cmd := providerEvidenceCommand(func(*cobra.Command, string, string, func(providerAssignmentStatus) error) error {
+		t.Fatal("contract inspected a task")
+		return nil
+	})
+	var output bytes.Buffer
+	cmd.SetOut(&output)
+	cmd.SetArgs([]string{"--contract"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "quarantine uncertain ownership") || !strings.Contains(output.String(), `"dispatch_authorized": false`) {
+		t.Fatal("missing lifecycle boundary")
+	}
+}
+
+func TestRecoveryDispositionDistinguishesFailureFromUnknownOwnership(t *testing.T) {
+	out := providerAssignmentStatus{State: "failed", IdentityBindingVerified: true, ControllerFinalized: true}
+	if providerRecoveryDisposition(out) != "verified_terminal_result_requires_review" {
+		t.Fatal("known failure labeled unknown")
+	}
+	out.ControllerFinalized = false
+	if providerRecoveryDisposition(out) != "quarantined_controller_incomplete" {
+		t.Fatal("missing controller hidden")
+	}
+	out.IdentityBindingVerified = false
+	if providerRecoveryDisposition(out) != "quarantined_unknown_outcome" {
+		t.Fatal("unknown owner promoted")
+	}
+}
 
 func TestReadinessDiscoversOnlyExactIdentityWithBoundedHistory(t *testing.T) {
 	store, err := state.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -111,6 +240,8 @@ func TestSharedReadinessKeepsQualifiedEvidenceSeparateFromCredentialsAndAdmissio
 func TestTaskEvidenceDoesNotRenewQualificationEraseSuccessOrInventResume(t *testing.T) {
 	observed := time.Now().Add(-48 * time.Hour)
 	good := providerAssignmentStatus{IdentityBindingVerified: true, OutcomeSHA256: strings.Repeat("a", 64), CompletedAt: &observed, CompletionConfirmed: true, WorkspaceVerified: true, LocalCleanupVerified: true, RestartOfSHA256: strings.Repeat("b", 64), CapacityObservation: &provider.CapacityReleaseObservation{LocalSlotReleased: true}}
+	good.Provider, good.IdentitySHA256, good.State, good.ControllerFinalized = "openai", strings.Repeat("c", 64), "completed", true
+	good.CapacityObservation.IdentitySHA256, good.CapacityObservation.Scope, good.CapacityObservation.ObservedAt = good.IdentitySHA256, provider.CapacityControlScopeLocalShared, observed
 	failed := providerAssignmentStatus{IdentityBindingVerified: true, OutcomeSHA256: strings.Repeat("c", 64), State: "failed"}
 	checks := providerTaskEvidence([]providerAssignmentStatus{good, failed})
 	successes, failures := 0, 0
