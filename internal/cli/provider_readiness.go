@@ -49,6 +49,25 @@ type providerReadinessLane struct {
 	Checks                 []providerReadinessEvidence   `json:"checks"`
 	Operations             []providerAssignmentStatus    `json:"operations"`
 	RemoteTermination      string                        `json:"remote_generation_termination"`
+	AssignmentPreview      providerAssignmentPreview     `json:"assignment_preview"`
+	TaskStatistics         providerTaskStatistics        `json:"task_statistics"`
+}
+
+type providerAssignmentPreview struct {
+	Eligible     bool     `json:"eligible"`
+	Requirements []string `json:"requirements"`
+	Reasons      []string `json:"reasons"`
+}
+
+type providerTaskStatistics struct {
+	Completed               int      `json:"completed"`
+	Failed                  int      `json:"failed"`
+	Cancelled               int      `json:"cancelled"`
+	Unresolved              int      `json:"unresolved"`
+	MeasuredDurations       int      `json:"measured_durations"`
+	MeanLocalElapsedSeconds *float64 `json:"mean_local_elapsed_seconds,omitempty"`
+	BillingCost             string   `json:"billing_cost"`
+	HumanInterventions      string   `json:"human_interventions"`
 }
 
 type providerReadinessCapability struct {
@@ -165,15 +184,19 @@ func providerTaskRequirementPassed(current, parent providerAssignmentStatus, req
 // This is a single read surface over existing admission and receipt owners.
 // It never reserves capacity, sends a prompt, or manufactures a qualification.
 func newProviderReadinessCmd() *cobra.Command {
-	var profiles, operations []string
+	var profiles, operations, requirements []string
 	var cwd string
 	var duration time.Duration
-	cmd := &cobra.Command{Use: "readiness", Short: "Compare exact provider readiness, capability evidence and separate capacity units without generation", Args: cobra.NoArgs}
+	cmd := &cobra.Command{Use: "readiness", Aliases: []string{"preview"}, Short: "Compare exact provider readiness, capability evidence and separate capacity units without generation", Args: cobra.NoArgs}
+	cmd.Flags().StringSliceVar(&requirements, "require", []string{"model_identity", "workspace_edit", "test_execution", "permission_denial", "cleanup"}, "Required demonstrated capabilities for the read-only assignment preview")
 	cmd.Flags().StringSliceVar(&profiles, "profile", nil, "Exact provider profiles; repeat to compare providers")
 	cmd.Flags().StringSliceVar(&operations, "operation", nil, "Existing task evidence as PROFILE=OPERATION_ID; repeat for completion and cancellation")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "Absolute intended workspace for local policy inspection; defaults to current directory")
 	cmd.Flags().DurationVar(&duration, "task-timeout", 5*time.Minute, "Intended task duration for credential and qualification window checks")
 	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		if err := validateProviderPreviewRequirements(requirements); err != nil {
+			return err
+		}
 		if len(profiles) == 0 || len(profiles) > 16 {
 			return errors.New("readiness requires 1-16 exact profiles")
 		}
@@ -231,6 +254,8 @@ func newProviderReadinessCmd() *cobra.Command {
 			lane.Checks = append(lane.Checks, providerTaskEvidence(lane.Operations)...)
 			lane.CapabilitySummary = summarizeProviderReadiness(lane.Checks)
 			applyProviderReadinessWindow(&lane, duration, time.Now().UTC())
+			lane.AssignmentPreview = previewProviderAssignment(lane, requirements)
+			lane.TaskStatistics = summarizeProviderTasks(lane.Operations)
 			lanes = append(lanes, lane)
 		}
 		if IsJSONOutput() {
@@ -240,6 +265,8 @@ func newProviderReadinessCmd() *cobra.Command {
 			fmt.Fprintf(cmd.OutOrStdout(), "%s (%s / %s): workspace evidence %s; admission %s\n", lane.Profile, lane.Identity.Provider, lane.Identity.Model, lane.WorkspaceEvidence, lane.AdmissionState)
 			fmt.Fprintf(cmd.OutOrStdout(), "Credential: %v; blockers: %s\n", lane.Credential["state"], strings.Join(lane.Blockers, ", "))
 			fmt.Fprintf(cmd.OutOrStdout(), "Usable until: %v; task duration fits: %t\n", lane.UsableUntil, lane.DurationFits)
+			fmt.Fprintf(cmd.OutOrStdout(), "Assignment preview: eligible=%t; reasons: %s\n", lane.AssignmentPreview.Eligible, strings.Join(lane.AssignmentPreview.Reasons, ", "))
+			fmt.Fprintf(cmd.OutOrStdout(), "Verified task history: %d completed, %d failed, %d cancelled, %d unresolved; billing cost and human interventions unavailable\n", lane.TaskStatistics.Completed, lane.TaskStatistics.Failed, lane.TaskStatistics.Cancelled, lane.TaskStatistics.Unresolved)
 			if lane.EvidenceTruncated || len(lane.EvidenceErrors) > 0 {
 				fmt.Fprintf(cmd.OutOrStdout(), "Task evidence: history truncated=%t; unverifiable references=%d (see JSON details)\n", lane.EvidenceTruncated, len(lane.EvidenceErrors))
 			}
@@ -251,6 +278,92 @@ func newProviderReadinessCmd() *cobra.Command {
 		return nil
 	}
 	return cmd
+}
+
+func validateProviderPreviewRequirements(requirements []string) error {
+	allowed := map[string]bool{}
+	for _, name := range []string{"model_identity", "launch", "assignment", "prompt_delivery", "workspace_edit", "test_execution", "permission_denial", "completion_detection", "cleanup", "ordinary_task", "local_cancellation", "local_slot_release", "guarded_fresh_restart", "resume", "recovery", "remote_generation_termination", "billing_settlement", "capacity_accounting"} {
+		allowed[name] = true
+	}
+	if len(requirements) == 0 || len(requirements) > len(allowed) {
+		return errors.New("assignment preview requires a nonempty bounded capability list")
+	}
+	seen := map[string]bool{}
+	for _, name := range requirements {
+		if !allowed[name] || seen[name] {
+			return errors.New("assignment preview contains an unknown or duplicate capability")
+		}
+		seen[name] = true
+	}
+	return nil
+}
+
+// Selection is an observation, never dispatch authority or automatic fallback.
+// Admission and freshness remain mandatory even for a smaller requested subset.
+func previewProviderAssignment(lane providerReadinessLane, requirements []string) providerAssignmentPreview {
+	out := providerAssignmentPreview{Requirements: append([]string{}, requirements...), Reasons: append([]string{}, lane.Blockers...)}
+	if err := validateProviderPreviewRequirements(requirements); err != nil {
+		out.Reasons = append(out.Reasons, "invalid_requirements")
+	}
+	if lane.AdmissionState != "ready_for_dispatch_checks" || !lane.DurationFits {
+		out.Reasons = append(out.Reasons, "admission_or_duration_blocked")
+	}
+	if lane.EvidenceTruncated || len(lane.EvidenceErrors) > 0 {
+		out.Reasons = append(out.Reasons, "incomplete_task_history")
+	}
+	states := map[string]string{}
+	requested := map[string]bool{}
+	for _, name := range requirements {
+		requested[name] = true
+	}
+	for _, capability := range lane.CapabilitySummary {
+		states[capability.Operation] = capability.State
+		if capability.Operation == "ordinary_task" || requested[capability.Operation] {
+			for _, latest := range capability.LatestDatedStates {
+				if latest == "failed" {
+					out.Reasons = append(out.Reasons, "latest_failure_requires_review:"+capability.Operation)
+				}
+			}
+		}
+	}
+	for _, name := range requirements {
+		if states[name] != "passed" {
+			out.Reasons = append(out.Reasons, "capability_not_proven:"+name)
+		}
+	}
+	out.Eligible = len(out.Reasons) == 0
+	return out
+}
+
+// Comparisons use only exact verified operations in the inspected history.
+// Cancellations and uncertain outcomes are not successful coding assignments.
+func summarizeProviderTasks(operations []providerAssignmentStatus) providerTaskStatistics {
+	out := providerTaskStatistics{BillingCost: "unavailable", HumanInterventions: "not_recorded"}
+	var elapsed float64
+	for _, operation := range operations {
+		measurable := false
+		switch {
+		case providerTaskRequirementPassed(operation, providerAssignmentStatus{}, "completion", ""):
+			out.Completed++
+			measurable = true
+		case providerTaskRequirementPassed(operation, providerAssignmentStatus{}, "local-cancellation", ""):
+			out.Cancelled++
+		case operation.IdentityBindingVerified && operation.OutcomeSHA256 != "" && operation.ControllerFinalized && operation.State == "failed":
+			out.Failed++
+			measurable = true
+		default:
+			out.Unresolved++
+		}
+		if measurable && operation.ElapsedSeconds != nil && *operation.ElapsedSeconds >= 0 {
+			elapsed += *operation.ElapsedSeconds
+			out.MeasuredDurations++
+		}
+	}
+	if out.MeasuredDurations > 0 {
+		mean := elapsed / float64(out.MeasuredDurations)
+		out.MeanLocalElapsedSeconds = &mean
+	}
+	return out
 }
 
 // Candidate discovery is not verification. Every selected row is subsequently

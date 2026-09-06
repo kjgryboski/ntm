@@ -6,9 +6,14 @@ package cli
 // into model-identity or qualification evidence.
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -25,6 +30,225 @@ import (
 )
 
 const providerCodexCapacityRecoverySchema = "ntm.provider-codex-capacity-recovery.v1"
+
+// This is a source-bound review record, not provider attestation. Matching a
+// caller's claims to local ledger fields cannot establish remote authenticity.
+type providerUsageEvidence struct {
+	SchemaVersion      string    `json:"schema_version"`
+	IdentitySHA256     string    `json:"identity_sha256"`
+	AccountAliasSHA256 string    `json:"account_alias_sha256"`
+	OperationIDSHA256  string    `json:"operation_id_sha256"`
+	OperationBinding   string    `json:"operation_binding_sha256"`
+	ProviderAccount    string    `json:"provider_account_sha256"`
+	ProviderRequest    string    `json:"provider_request_sha256"`
+	SourceKind         string    `json:"source_kind"`
+	SourceSHA256       string    `json:"source_sha256"`
+	TerminalStatus     string    `json:"terminal_status"`
+	BillingUnits       string    `json:"billing_units"`
+	FinalUsage         *float64  `json:"final_usage"`
+	SettlementScope    string    `json:"settlement_scope"`
+	OutstandingUsage   *float64  `json:"outstanding_usage"`
+	RequestCompletedAt time.Time `json:"request_completed_at"`
+	SettledThrough     time.Time `json:"settled_through"`
+	ObservedAt         time.Time `json:"observed_at"`
+}
+
+type providerUsageImportResult struct {
+	SchemaVersion       string                 `json:"schema_version"`
+	ValidationPassed    bool                   `json:"validation_passed"`
+	Reasons             []string               `json:"reasons"`
+	EvidenceSHA256      string                 `json:"evidence_sha256"`
+	SourceSHA256        string                 `json:"source_sha256"`
+	Authority           string                 `json:"authority"`
+	ProviderAssociation string                 `json:"provider_association"`
+	GenerationCalls     int                    `json:"generation_calls"`
+	AccountingMutated   bool                   `json:"accounting_mutated"`
+	AdmissionGranted    bool                   `json:"admission_granted"`
+	Evidence            *providerUsageEvidence `json:"evidence,omitempty"`
+}
+
+func newProviderUsageImportCmd() *cobra.Command {
+	return providerUsageImportCommand(resolveProviderUsageTarget)
+}
+
+func resolveProviderUsageTarget(profile, operation string) (provider.Identity, *state.SendOperation, error) {
+	cfg := loadSelectedConfigOrDefault()
+	if cfg == nil {
+		return provider.Identity{}, nil, errors.New("configuration unavailable")
+	}
+	p, err := cfg.ProviderProfile(profile)
+	if err != nil {
+		return provider.Identity{}, nil, err
+	}
+	id, err := p.Identity()
+	if err != nil {
+		return provider.Identity{}, nil, err
+	}
+	if id.Provider() != "zai" || id.Runtime() != "codex" || id.Entitlement() != provider.EntitlementCodexResponses {
+		return provider.Identity{}, nil, errors.New("usage import requires an exact Z.ai Coding Plan Codex identity")
+	}
+	ledger, closeLedger, err := openProviderNativeLedger()
+	if err != nil {
+		return provider.Identity{}, nil, err
+	}
+	defer closeLedger()
+	row, err := ledger.GetSendOperation(operation, providerCodexOperationScope)
+	if err != nil {
+		return provider.Identity{}, nil, err
+	}
+	if row == nil {
+		return provider.Identity{}, nil, errors.New("original operation was not found")
+	}
+	return id, row, nil
+}
+
+func providerUsageImportCommand(resolve func(string, string) (provider.Identity, *state.SendOperation, error)) *cobra.Command {
+	var profile, operation, evidenceFile, sourceFile, output string
+	var template bool
+	cmd := &cobra.Command{Use: "import-usage-evidence", Short: "Validate and retain request usage evidence for external-source review; never release capacity", Args: cobra.NoArgs}
+	cmd.Flags().StringVar(&profile, "profile", "", "Exact Z.ai Codex profile")
+	cmd.Flags().StringVar(&operation, "operation-id", "", "Original operation in the selected ledger")
+	cmd.Flags().StringVar(&evidenceFile, "evidence-file", "", "Absolute structured review record")
+	cmd.Flags().StringVar(&sourceFile, "source-file", "", "Absolute original provider export or support reply; only its digest is retained")
+	cmd.Flags().StringVar(&output, "output", "", "New absolute output file; existing evidence is never replaced")
+	cmd.Flags().BoolVar(&template, "template", false, "Print a locally bound template with missing provider evidence left empty")
+	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		if !validProviderNativeOperationID(operation) || (template && (evidenceFile != "" || sourceFile != "" || output != "")) || (!template && (!filepath.IsAbs(evidenceFile) || !filepath.IsAbs(sourceFile) || !filepath.IsAbs(output))) {
+			return errors.New("usage import requires exact operation and either template or absolute evidence, source and new output paths")
+		}
+		id, row, err := resolve(profile, operation)
+		if err != nil {
+			return err
+		}
+		if row == nil {
+			return errors.New("original operation was not found")
+		}
+		if template {
+			return encodeIndentedJSON(cmd.OutOrStdout(), map[string]any{"authority": "external_source_review_required", "accounting_mutated": false, "admission_granted": false, "generation_calls": 0, "template": providerUsageEvidence{SchemaVersion: "ntm.provider-usage-evidence.v1", IdentitySHA256: id.Hash(), AccountAliasSHA256: sha256StringCLI(id.AccountAlias()), OperationIDSHA256: sha256StringCLI(operation), OperationBinding: row.BindingHash, BillingUnits: "coding_plan_credit", SettlementScope: "original_request_only"}})
+		}
+		evidence, err := readProviderUsageFile(evidenceFile)
+		if err != nil {
+			return err
+		}
+		source, err := readProviderUsageFile(sourceFile)
+		if err != nil {
+			return err
+		}
+		result := validateProviderUsageEvidence(evidence, source, id, operation, row, time.Now().UTC())
+		data, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return err
+		}
+		data = append(data, '\n')
+		file, err := os.OpenFile(output, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			return errors.New("usage import requires a new writable output; existing evidence is preserved")
+		}
+		_, writeErr := file.Write(data)
+		if err := errors.Join(writeErr, file.Sync(), file.Close()); err != nil {
+			return errors.New("usage evidence export failed; partial record retained")
+		}
+		if _, err := cmd.OutOrStdout().Write(data); err != nil {
+			return err
+		}
+		if !result.ValidationPassed {
+			return errors.New("usage evidence failed consistency checks; capacity unchanged")
+		}
+		return nil
+	}
+	return cmd
+}
+
+func readProviderUsageFile(path string) ([]byte, error) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > 1<<20 {
+		return nil, errors.New("usage evidence requires a bounded regular file")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, errors.New("usage evidence could not be opened")
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, (1<<20)+1))
+	if err != nil || len(b) == 0 || len(b) > 1<<20 {
+		return nil, errors.New("usage evidence size is invalid")
+	}
+	return b, nil
+}
+
+func decodeProviderUsageEvidence(data []byte) (providerUsageEvidence, error) {
+	// Detect duplicate top-level keys before normal typed decoding. All record
+	// values are scalar, so nested objects are rejected by the typed decoder.
+	var evidence providerUsageEvidence
+	if len(data) == 0 || len(data) > 1<<20 {
+		return evidence, errors.New("invalid usage record size")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return evidence, errors.New("invalid usage record")
+	}
+	seen := map[string]bool{}
+	for decoder.More() {
+		token, err = decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok || seen[key] || key != strings.ToLower(key) {
+			return evidence, errors.New("ambiguous usage record")
+		}
+		seen[key] = true
+		var value json.RawMessage
+		if decoder.Decode(&value) != nil {
+			return evidence, errors.New("invalid usage field")
+		}
+	}
+	decoder = json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&evidence) != nil {
+		return evidence, errors.New("invalid usage record fields")
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return evidence, errors.New("trailing usage data")
+	}
+	return evidence, nil
+}
+
+func validateProviderUsageEvidence(data, source []byte, id provider.Identity, operation string, row *state.SendOperation, now time.Time) providerUsageImportResult {
+	out := providerUsageImportResult{SchemaVersion: "ntm.provider-usage-import.v1", Reasons: []string{}, EvidenceSHA256: sha256TextCLI(data), SourceSHA256: sha256TextCLI(source), Authority: "external_source_review_required", ProviderAssociation: "unverified_source_claim"}
+	e, err := decodeProviderUsageEvidence(data)
+	if err != nil {
+		out.Reasons = append(out.Reasons, "malformed_or_ambiguous_record")
+		return out
+	}
+	if e.SchemaVersion != "ntm.provider-usage-evidence.v1" {
+		out.Reasons = append(out.Reasons, "unsupported_schema")
+	}
+	if row == nil || row.OperationID != operation || e.IdentitySHA256 != id.Hash() || e.AccountAliasSHA256 != sha256StringCLI(id.AccountAlias()) || e.OperationIDSHA256 != sha256StringCLI(operation) || e.OperationBinding != row.BindingHash {
+		out.Reasons = append(out.Reasons, "local_identity_or_operation_mismatch")
+	}
+	if !validProviderNativeDigest(e.ProviderAccount) || !validProviderNativeDigest(e.ProviderRequest) || !validProviderNativeDigest(e.OperationBinding) {
+		out.Reasons = append(out.Reasons, "provider_binding_fields_missing")
+	}
+	if (e.SourceKind != "provider_support_reply" && e.SourceKind != "provider_account_export") || e.SourceSHA256 != out.SourceSHA256 || len(source) == 0 {
+		out.Reasons = append(out.Reasons, "source_binding_mismatch")
+	}
+	if e.TerminalStatus != "completed" && e.TerminalStatus != "failed" && e.TerminalStatus != "cancelled" {
+		out.Reasons = append(out.Reasons, "terminal_status_missing")
+	}
+	if e.BillingUnits != "coding_plan_credit" || e.FinalUsage == nil || math.IsNaN(*e.FinalUsage) || math.IsInf(*e.FinalUsage, 0) || *e.FinalUsage < 0 {
+		out.Reasons = append(out.Reasons, "invalid_usage_or_units")
+	}
+	if e.SettlementScope != "original_request_only" || e.OutstandingUsage == nil || *e.OutstandingUsage != 0 {
+		out.Reasons = append(out.Reasons, "request_settlement_incomplete")
+	}
+	if row == nil || e.RequestCompletedAt.IsZero() || e.RequestCompletedAt.Before(row.CreatedAt) || e.SettledThrough.Before(e.RequestCompletedAt) || e.ObservedAt.Before(e.SettledThrough) || e.ObservedAt.After(now) {
+		out.Reasons = append(out.Reasons, "settlement_window_invalid")
+	}
+	out.ValidationPassed = len(out.Reasons) == 0
+	if out.ValidationPassed {
+		out.Evidence = &e
+	}
+	return out
+}
 
 func newProviderCodexReconciliationPlanCmd() *cobra.Command {
 	var name, operation string

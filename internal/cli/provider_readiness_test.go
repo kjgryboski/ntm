@@ -187,6 +187,74 @@ func TestReadinessSummaryRetainsConflictingObservationsWithoutPromotingAdmission
 	}
 }
 
+func TestProviderPreviewRequiresAdmissionCapabilitiesAndCompleteHistory(t *testing.T) {
+	for _, scenario := range []string{"ready", "expired", "duration", "unsupported", "missing", "failed", "required-failed", "truncated", "unverifiable", "invalid"} {
+		t.Run(scenario, func(t *testing.T) {
+			lane := providerReadinessLane{AdmissionState: "ready_for_dispatch_checks", DurationFits: true, CapabilitySummary: []providerReadinessCapability{{Operation: "workspace_edit", State: "passed"}, {Operation: "local_cancellation", State: "passed"}, {Operation: "ordinary_task", State: "passed", LatestDatedStates: []string{"passed"}}}}
+			require := []string{"workspace_edit", "local_cancellation"}
+			switch scenario {
+			case "expired":
+				lane.AdmissionState = "blocked"
+			case "duration":
+				lane.DurationFits = false
+			case "unsupported":
+				lane.CapabilitySummary[1].State = "unsupported"
+			case "missing":
+				require = append(require, "resume")
+			case "failed":
+				lane.CapabilitySummary[2].LatestDatedStates = []string{"failed", "passed"}
+			case "required-failed":
+				lane.CapabilitySummary[0].LatestDatedStates = []string{"failed", "passed"}
+			case "truncated":
+				lane.EvidenceTruncated = true
+			case "unverifiable":
+				lane.EvidenceErrors = []string{"unverifiable_task_reference"}
+			case "invalid":
+				require = []string{"invented"}
+			}
+			before, _ := json.Marshal(lane)
+			preview := previewProviderAssignment(lane, require)
+			after, _ := json.Marshal(lane)
+			if preview.Eligible != (scenario == "ready") || !bytes.Equal(before, after) || lane.DispatchAuthorized {
+				t.Fatalf("preview admitted missing evidence or changed authority: %+v", preview)
+			}
+		})
+	}
+	for _, requirements := range [][]string{nil, {"workspace_edit", "workspace_edit"}, {"resume-now"}} {
+		if validateProviderPreviewRequirements(requirements) == nil {
+			t.Fatal("invalid capability selection accepted")
+		}
+	}
+	cmd := newProviderReadinessCmd()
+	cmd.SetArgs([]string{"--profile", "example", "--require", "invented"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("surface accepted unknown capability")
+	}
+	if len(cmd.Aliases) != 1 || cmd.Aliases[0] != "preview" {
+		t.Fatal("preview surface missing")
+	}
+}
+
+func TestProviderTaskComparisonExcludesCancellationAndUnknownFromCompletion(t *testing.T) {
+	now := time.Now().UTC()
+	elapsed := 10.0
+	good := providerAssignmentStatus{Provider: "openai", IdentitySHA256: strings.Repeat("a", 64), IdentityBindingVerified: true, OutcomeSHA256: strings.Repeat("b", 64), ControllerFinalized: true, State: "completed", CompletionConfirmed: true, WorkspaceVerified: true, LocalCleanupVerified: true, ElapsedSeconds: &elapsed}
+	good.CapacityObservation = &provider.CapacityReleaseObservation{IdentitySHA256: good.IdentitySHA256, Scope: provider.CapacityControlScopeLocalShared, LocalSlotReleased: true, ObservedAt: now}
+	cancelled := good
+	cancelled.State, cancelled.CompletionConfirmed, cancelled.CancellationObserved = "cancelled_local", false, true
+	failed := good
+	failed.State, failed.CompletionConfirmed, failed.WorkspaceVerified = "failed", false, false
+	unknown := good
+	unknown.IdentityBindingVerified = false
+	stats := summarizeProviderTasks([]providerAssignmentStatus{good, failed, cancelled, unknown})
+	if stats.Completed != 1 || stats.Failed != 1 || stats.Cancelled != 1 || stats.Unresolved != 1 || stats.MeasuredDurations != 2 || stats.MeanLocalElapsedSeconds == nil || *stats.MeanLocalElapsedSeconds != 10 || stats.BillingCost != "unavailable" || stats.HumanInterventions != "not_recorded" {
+		t.Fatalf("comparison invented evidence: %+v", stats)
+	}
+	if summarizeProviderTasks(nil).MeanLocalElapsedSeconds != nil {
+		t.Fatal("empty history invented zero duration")
+	}
+}
+
 func TestReadinessUsesEarliestExpiryAndRequiresTaskToFit(t *testing.T) {
 	now := time.Unix(1800000000, 0)
 	qualification := now.Add(time.Hour)

@@ -3,7 +3,10 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +21,141 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/zai"
 )
+
+func providerUsageFixture(t *testing.T) (provider.Identity, *state.SendOperation, providerUsageEvidence, []byte, time.Time) {
+	t.Helper()
+	id, err := providerCodexProfile(t.TempDir()).Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Add(-time.Minute)
+	row := &state.SendOperation{OperationID: "original-request", BindingHash: strings.Repeat("a", 64), CreatedAt: now.Add(-time.Hour), Status: state.SendOperationInProgress}
+	usage, outstanding := 2.5, 0.0
+	source := []byte("Synthetic provider source for offline testing; private-source-canary")
+	e := providerUsageEvidence{SchemaVersion: "ntm.provider-usage-evidence.v1", IdentitySHA256: id.Hash(), AccountAliasSHA256: sha256StringCLI(id.AccountAlias()), OperationIDSHA256: sha256StringCLI(row.OperationID), OperationBinding: row.BindingHash, ProviderAccount: strings.Repeat("b", 64), ProviderRequest: strings.Repeat("c", 64), SourceKind: "provider_support_reply", SourceSHA256: sha256TextCLI(source), TerminalStatus: "completed", BillingUnits: "coding_plan_credit", FinalUsage: &usage, SettlementScope: "original_request_only", OutstandingUsage: &outstanding, RequestCompletedAt: now.Add(-30 * time.Minute), SettledThrough: now.Add(-time.Minute), ObservedAt: now}
+	return id, row, e, source, now
+}
+
+func TestProviderUsageImporterRejectsMismatchedOrIncompleteSettlement(t *testing.T) {
+	for _, scenario := range []string{"valid", "identity", "account", "operation", "binding", "provider-request", "source", "status", "units", "negative", "missing-usage", "outstanding", "scope", "cutoff", "future", "before-request", "missing-row"} {
+		t.Run(scenario, func(t *testing.T) {
+			id, row, e, source, now := providerUsageFixture(t)
+			switch scenario {
+			case "identity":
+				e.IdentitySHA256 = strings.Repeat("f", 64)
+			case "account":
+				e.AccountAliasSHA256 = strings.Repeat("f", 64)
+			case "operation":
+				e.OperationIDSHA256 = sha256StringCLI("another")
+			case "binding":
+				e.OperationBinding = strings.Repeat("f", 64)
+			case "provider-request":
+				e.ProviderRequest = ""
+			case "source":
+				source = []byte("tampered")
+			case "status":
+				e.TerminalStatus = "running"
+			case "units":
+				e.BillingUnits = "tokens"
+			case "negative":
+				*e.FinalUsage = -1
+			case "missing-usage":
+				e.FinalUsage = nil
+			case "outstanding":
+				*e.OutstandingUsage = 1
+			case "scope":
+				e.SettlementScope = "entire_account"
+			case "cutoff":
+				e.SettledThrough = e.RequestCompletedAt.Add(-time.Second)
+			case "future":
+				e.ObservedAt = now.Add(time.Minute)
+			case "before-request":
+				e.RequestCompletedAt = row.CreatedAt.Add(-time.Second)
+			case "missing-row":
+				row = nil
+			}
+			data, err := json.Marshal(e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := validateProviderUsageEvidence(data, source, id, "original-request", row, now)
+			if out.ValidationPassed != (scenario == "valid") || out.AccountingMutated || out.AdmissionGranted || out.GenerationCalls != 0 || out.Authority != "external_source_review_required" || out.ProviderAssociation != "unverified_source_claim" {
+				t.Fatalf("false authority or wrong result: %+v", out)
+			}
+			if row != nil && row.Status != state.SendOperationInProgress {
+				t.Fatal("import released uncertain operation")
+			}
+			encoded, _ := json.Marshal(out)
+			if bytes.Contains(encoded, []byte("private-source-canary")) {
+				t.Fatal("provider source text retained")
+			}
+		})
+	}
+}
+
+func TestProviderUsageImporterRejectsAmbiguousJSON(t *testing.T) {
+	for _, data := range []string{`{}`, `null`, `{"final_usage":1,"final_usage":2}`, `{"final_usage":1,"Final_Usage":2}`, `{"unknown":"secret-canary"}`, `{"final_usage":1} {}`, `{"final_usage":1e999}`, `{"final_usage":{}}`} {
+		id, row, _, source, now := providerUsageFixture(t)
+		out := validateProviderUsageEvidence([]byte(data), source, id, row.OperationID, row, now)
+		if out.ValidationPassed || out.Evidence != nil {
+			t.Fatalf("ambiguous record accepted: %s", data)
+		}
+	}
+}
+
+func TestProviderUsageImportSurfacePersistsReviewWithoutGrantingAuthorityOrOverwriting(t *testing.T) {
+	id, row, e, source, _ := providerUsageFixture(t)
+	dir := t.TempDir()
+	recordPath, sourcePath, output := filepath.Join(dir, "record.json"), filepath.Join(dir, "source.txt"), filepath.Join(dir, "review.json")
+	data, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(recordPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(sourcePath, source, 0600); err != nil {
+		t.Fatal(err)
+	}
+	resolve := func(profile, operation string) (provider.Identity, *state.SendOperation, error) {
+		if profile != "exact" || operation != row.OperationID {
+			t.Fatal("changed target")
+		}
+		return id, row, nil
+	}
+	run := func() error {
+		cmd := providerUsageImportCommand(resolve)
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs([]string{"--profile", "exact", "--operation-id", row.OperationID, "--evidence-file", recordPath, "--source-file", sourcePath, "--output", output})
+		return cmd.Execute()
+	}
+	if err = run(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out providerUsageImportResult
+	if json.Unmarshal(before, &out) != nil || !out.ValidationPassed || out.AdmissionGranted || out.AccountingMutated {
+		t.Fatal("surface promoted source claim")
+	}
+	if err = run(); err == nil {
+		t.Fatal("existing review overwritten")
+	}
+	after, err := os.ReadFile(output)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("prior review changed")
+	}
+	cmd := providerUsageImportCommand(resolve)
+	var text bytes.Buffer
+	cmd.SetOut(&text)
+	cmd.SetArgs([]string{"--profile", "exact", "--operation-id", row.OperationID, "--template"})
+	if cmd.Execute() != nil || !strings.Contains(text.String(), "external_source_review_required") || !strings.Contains(text.String(), `"provider_request_sha256": ""`) {
+		t.Fatal("template fabricated missing evidence")
+	}
+}
 
 func TestProviderReconciliationPlanCannotGrantAdmissionOrMutateUnknownUsage(t *testing.T) {
 	id, err := provider.NewIdentity("zai", "fixture", "glm-5.3", "https://api.z.ai/api/v1", "codex", strings.Repeat("a", 64))

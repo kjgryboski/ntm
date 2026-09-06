@@ -174,6 +174,90 @@ primary tasks are bounded to five minutes and require a Claude credential snapsh
 valid beyond the five-minute freshness margin. Unknown provider authentication
 and historical task success cannot extend those windows.
 
+## Assignment previews and task comparisons
+
+`provider preview` is an alias of the existing read-only readiness command.
+Use `--profile NAME` repeatedly, `--require workspace_edit,test_execution,local_cancellation`
+for the needed capabilities and `--task-timeout 180s` for the intended duration.
+The default requirements cover identity, editing, tests, permission denial and
+cleanup. Admission and freshness are mandatory even if fewer capabilities are
+requested. Unknown/duplicate requirements fail before profile inspection.
+
+Each lane's `assignment_preview` explains eligibility. Expired admission,
+insufficient duration, missing capability evidence, incomplete history and a
+latest dated failure of ordinary work or a requested capability prevent preview eligibility. It does not
+select a winner, launch a task, reserve capacity, or enable automatic fallback.
+Actual assignment continues through the existing exact provider adapter and
+its fresh admission checks.
+
+`task_statistics` counts verified completions, failures, cancellations and
+unresolved observations separately. Mean local elapsed seconds covers only
+measured completed/failed attempts in the inspected history. These are descriptive
+samples, not a representative provider ranking. Billing cost remains unavailable;
+human interventions remain unrecorded unless an external acceptance record
+actually measured them. Local slots, attempts and billed usage stay separate.
+
+## Request usage evidence imports
+
+`provider codex import-usage-evidence --profile NAME --operation-id ID --template`
+prints a local ledger-bound template. Provider account/request digests, source
+digest, usage and timestamps remain empty until actual evidence is supplied.
+To retain a review, provide absolute `--evidence-file`, `--source-file` and a new
+`--output` path. Inputs must be regular files no larger than one MiB. The strict
+record rejects unknown/duplicate/case-ambiguous keys, mismatched local references,
+changed source bytes, absent provider reference digests, nonterminal states,
+wrong units, negative/missing usage and incomplete settlement windows.
+
+The importer hashes the supplied source without retaining its text. It reports
+consistency against the selected local profile and operation; it cannot prove
+that the selected profile owns a legacy operation or authenticate a provider
+account/request merely because the record says so. Even a valid record remains
+`external_source_review_required` with `provider_association=unverified_source_claim`.
+No import changes accounting, releases unknown usage, grants admission or creates
+a qualification. Original-request settlement does not cover other outstanding
+requests or an entire account. Authoritative source verification and atomic
+reconciliation remain separate work once genuine evidence is available.
+
+## Credential continuity findings
+
+The canonical primary profile manifest includes runtime home, account alias,
+runtime/model/policy and broker selections; it excludes credential contents.
+The existing refresh path already preserves identity for an unchanged Codex
+account ID or an unchanged Claude refresh-token lineage, while enforcing a
+fresh subscription snapshot. The refreshed Claude profiles use different homes,
+so their identities differ. A rotated opaque Claude token fails the existing
+continuity test; local account-owner metadata can support a fresh binding but
+does not authenticate the replacement token's provider account.
+
+Separating stable account identity from credential leases therefore needs an
+authenticated account-binding observation tied to each replacement token, plus
+an explicit runtime-state migration policy. Keep qualification and credential
+expiry separate, but do not extend the 24-hour qualification window or transfer
+evidence across runtime homes simply because account aliases match. The current
+investigation does not relax these rules.
+
+## Grok session capability inspection
+
+The pinned Grok 1.0.13 runtime (SHA-256
+`edf79521581bb5e6b95abef848491a6a742e860da3e237ebe86a280d30dce4c1`)
+advertised session loading, resume and close in a valid protocol-1 initialization
+on September 6, 2026. The inspection used an empty credential-free home, sent
+only `initialize`, created no session and made no generation calls. The process
+was reaped. These are advertised capabilities, not successful lifecycle tests.
+
+The shared controls still do not implement persistent-session resume. Connecting
+it requires a durable checkpoint bound to the exact identity, runtime, workspace
+and session; exclusive ownership across controllers; and a distinct ledger
+operation for each resumed turn. Unknown outcomes must remain quarantined.
+Qualification must prove a second turn uses the original session, preserves the
+permission boundary and releases local capacity. It must test refused or missing
+sessions and controller interruption without duplicate work.
+
+ACP distinguishes [resume](https://agentclientprotocol.com/announcements/session-resume-stabilized)
+from [close](https://agentclientprotocol.com/announcements/session-close-stabilized).
+An advertised method or a successful fresh restart cannot establish either
+provider session cleanup or remote generation termination.
+
 ## Explicit qualification scope and environmental failures
 
 `provider qualify --scope workspace` and `provider compare --scope workspace`
