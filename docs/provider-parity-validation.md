@@ -159,6 +159,13 @@ termination and billing settlement remain distinct. A later failed task does
 not erase an independently successful earlier task. `capability_summary` contains
 one row per capability and indexes every contributing observation in `checks`.
 Its passed state means demonstrated at least once; admission remains independent.
+The same row also reports `failed_observations`, `latest_dated_states` and
+`latest_observed_at`. Human output labels the aggregate as historical and shows
+the failure count and latest dated result. Dates, rather than selection order,
+determine recency; conflicting states at the same timestamp are both retained.
+Undated observations remain in the counts and references but cannot establish
+recency. These summaries cover only the inspected history; truncation and
+unverifiable references remain visible and no summary grants dispatch authority.
 
 Use `--task-timeout 180s` to compare the intended duration with the earliest known
 credential or qualification expiry in `usable_until`. A task ending at or after

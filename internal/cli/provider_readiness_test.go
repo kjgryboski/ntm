@@ -208,6 +208,57 @@ func TestReadinessUsesEarliestExpiryAndRequiresTaskToFit(t *testing.T) {
 	}
 }
 
+func TestReadinessShowsLatestFailureWithoutErasingHistoricalSuccess(t *testing.T) {
+	old := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	recent := old.Add(time.Hour)
+	for _, reversed := range []bool{false, true} {
+		checks := []providerReadinessEvidence{
+			{Operation: "ordinary_task", State: "passed", ObservedAt: &old},
+			{Operation: "ordinary_task", State: "failed", ObservedAt: &recent},
+		}
+		if reversed {
+			checks[0], checks[1] = checks[1], checks[0]
+		}
+		summary := summarizeProviderReadiness(checks)[0]
+		if summary.State != "passed" || summary.FailedObservations != 1 || len(summary.LatestDatedStates) != 1 || summary.LatestDatedStates[0] != "failed" || !summary.LatestObservedAt.Equal(recent) {
+			t.Fatalf("historical pass hid recent failure: %+v", summary)
+		}
+		text := providerReadinessCapabilityText(summary)
+		if !strings.Contains(text, "passed historically (2 retained observations, 1 failed)") || !strings.Contains(text, "latest dated observation: failed at 2026-09-05T13:00:00Z") {
+			t.Fatalf("human readiness hid failure: %s", text)
+		}
+		data, err := json.Marshal(summary)
+		if err != nil || !bytes.Contains(data, []byte(`"latest_dated_states":["failed"]`)) || !bytes.Contains(data, []byte(`"failed_observations":1`)) {
+			t.Fatalf("structured readiness hid failure: %s %v", data, err)
+		}
+	}
+}
+
+func TestReadinessLatestObservationPreservesTiesAndDoesNotInventDates(t *testing.T) {
+	recent := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
+	zero := time.Time{}
+	checks := []providerReadinessEvidence{
+		{Operation: "ordinary_task", State: "passed", ObservedAt: &recent},
+		{Operation: "ordinary_task", State: "failed", ObservedAt: &recent},
+		{Operation: "ordinary_task", State: "passed", ObservedAt: &recent},
+		{Operation: "ordinary_task", State: "untested"},
+		{Operation: "ordinary_task", State: "untested", ObservedAt: &zero},
+		{Operation: "resume", State: "unsupported"},
+	}
+	summary := summarizeProviderReadiness(checks)
+	if len(summary[0].LatestDatedStates) != 2 || strings.Join(summary[0].LatestDatedStates, ",") != "failed,passed" || len(summary[0].ObservationIndexes) != 5 || summary[0].FailedObservations != 1 {
+		t.Fatalf("same-time conflict or undated evidence lost: %+v", summary[0])
+	}
+	if summary[1].LatestObservedAt != nil || len(summary[1].LatestDatedStates) != 0 || !strings.Contains(providerReadinessCapabilityText(summary[1]), "latest dated observation: unknown") {
+		t.Fatal("undated observation acquired a date")
+	}
+	// Summary timestamps must not alias the caller's retained evidence.
+	*summary[0].LatestObservedAt = zero
+	if recent.IsZero() {
+		t.Fatal("summary mutation rewrote source evidence")
+	}
+}
+
 func TestSharedReadinessKeepsQualifiedEvidenceSeparateFromCredentialsAndAdmission(t *testing.T) {
 	for _, vendor := range []string{"openai", "anthropic", "xai", "zai"} {
 		t.Run(vendor, func(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -51,9 +52,12 @@ type providerReadinessLane struct {
 }
 
 type providerReadinessCapability struct {
-	Operation          string `json:"operation"`
-	State              string `json:"state"`
-	ObservationIndexes []int  `json:"observation_indexes"`
+	Operation          string     `json:"operation"`
+	State              string     `json:"state"`
+	ObservationIndexes []int      `json:"observation_indexes"`
+	FailedObservations int        `json:"failed_observations"`
+	LatestDatedStates  []string   `json:"latest_dated_states"`
+	LatestObservedAt   *time.Time `json:"latest_observed_at,omitempty"`
 }
 
 // Evidence exports use the same signature and binding verifier as status and
@@ -240,7 +244,7 @@ func newProviderReadinessCmd() *cobra.Command {
 				fmt.Fprintf(cmd.OutOrStdout(), "Task evidence: history truncated=%t; unverifiable references=%d (see JSON details)\n", lane.EvidenceTruncated, len(lane.EvidenceErrors))
 			}
 			for _, check := range lane.CapabilitySummary {
-				fmt.Fprintf(cmd.OutOrStdout(), "  %s: %s (%d retained observations)\n", check.Operation, check.State, len(check.ObservationIndexes))
+				fmt.Fprintln(cmd.OutOrStdout(), providerReadinessCapabilityText(check))
 			}
 			fmt.Fprintln(cmd.OutOrStdout(), "Execution slots, experiment attempts and billing usage are separate. This inspection grants no dispatch.")
 		}
@@ -300,11 +304,40 @@ func summarizeProviderReadiness(observations []providerReadinessEvidence) []prov
 		}
 		entry := &result[position]
 		entry.ObservationIndexes = append(entry.ObservationIndexes, i)
+		if observation.State == "failed" {
+			entry.FailedObservations++
+		}
+		// Explicit task selection can precede automatic discovery. Compare signed
+		// observation times, never slice order, and retain conflicting time ties.
+		if observation.ObservedAt != nil && !observation.ObservedAt.IsZero() {
+			if entry.LatestObservedAt == nil || observation.ObservedAt.After(*entry.LatestObservedAt) {
+				observed := *observation.ObservedAt
+				entry.LatestObservedAt = &observed
+				entry.LatestDatedStates = []string{observation.State}
+			} else if observation.ObservedAt.Equal(*entry.LatestObservedAt) {
+				found := false
+				for _, value := range entry.LatestDatedStates {
+					found = found || value == observation.State
+				}
+				if !found {
+					entry.LatestDatedStates = append(entry.LatestDatedStates, observation.State)
+					sort.Strings(entry.LatestDatedStates)
+				}
+			}
+		}
 		if rank[observation.State] > rank[entry.State] {
 			entry.State = observation.State
 		}
 	}
 	return result
+}
+
+func providerReadinessCapabilityText(check providerReadinessCapability) string {
+	latest := "unknown"
+	if check.LatestObservedAt != nil {
+		latest = strings.Join(check.LatestDatedStates, ", ") + " at " + check.LatestObservedAt.UTC().Format(time.RFC3339Nano)
+	}
+	return fmt.Sprintf("  %s: %s historically (%d retained observations, %d failed); latest dated observation: %s", check.Operation, check.State, len(check.ObservationIndexes), check.FailedObservations, latest)
 }
 
 func applyProviderReadinessWindow(lane *providerReadinessLane, duration time.Duration, now time.Time) {
