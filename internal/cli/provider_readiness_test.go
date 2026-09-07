@@ -16,6 +16,52 @@ import (
 	"github.com/spf13/cobra"
 )
 
+func TestOperatorViewNeverPromotesConditionalAttemptCeiling(t *testing.T) {
+	for _, remaining := range []int{-1, 0, 1, 2} {
+		lane := providerReadinessLane{WorkspaceEvidence: "qualified", Capacity: map[string]any{"experiment_attempts": map[string]any{"remaining": remaining}}, AssignmentPreview: providerAssignmentPreview{Eligible: true}}
+		out := providerOperatorView(lane)
+		if out.AttemptCeilingRemaining == nil || *out.AttemptCeilingRemaining != remaining {
+			t.Fatal("attempt ceiling lost")
+		}
+		if remaining > 0 {
+			if out.AuthorizedAttempts != nil || out.AttemptAuthorization != "conditions_require_review_of_bound_authorization" {
+				t.Fatal("conditional slot was promoted to dispatch authority")
+			}
+		} else if out.AuthorizedAttempts == nil || *out.AuthorizedAttempts != 0 {
+			t.Fatal("exhausted campaign did not report zero authorized attempts")
+		}
+	}
+	missing := providerOperatorView(providerReadinessLane{})
+	if missing.AuthorizedAttempts == nil || *missing.AuthorizedAttempts != 0 || missing.AttemptCeilingRemaining != nil {
+		t.Fatal("missing campaign invented a budget")
+	}
+}
+
+func TestOperatorViewKeepsWorkspaceAndLifecycleActionsSeparate(t *testing.T) {
+	lane := providerReadinessLane{WorkspaceEvidence: "qualified", AssignmentPreview: providerAssignmentPreview{Eligible: true}, CapabilitySummary: []providerReadinessCapability{{Operation: "resume", State: "failed", FailedObservations: 1}}}
+	out := providerOperatorView(lane)
+	joined := strings.Join(out.NextActions, " ")
+	if !strings.Contains(joined, "ordinary workspace work") || !strings.Contains(joined, "preserve uncertain session ownership") {
+		t.Fatal("workspace success or lifecycle limit hidden")
+	}
+	lane.CapabilitySummary[0].State = "passed"
+	lane.CapabilitySummary[0].LatestDatedStates = []string{"passed"}
+	if strings.Contains(strings.Join(providerOperatorView(lane).NextActions, " "), "Keep resumed work unavailable") {
+		t.Fatal("historical failure hid a later proven resume")
+	}
+	lane.CapabilitySummary[0].LatestDatedStates = []string{"failed"}
+	if !strings.Contains(strings.Join(providerOperatorView(lane).NextActions, " "), "Keep resumed work unavailable") {
+		t.Fatal("latest failure hidden by historical success")
+	}
+	lane.Identity.Provider = "zai"
+	lane.Blockers = []string{"unknown_usage_reserved"}
+	lane.AssignmentPreview.Eligible = false
+	joined = strings.Join(providerOperatorView(lane).NextActions, " ")
+	if !strings.Contains(joined, "authenticated account/request evidence") || strings.Contains(joined, "Assign ordinary") {
+		t.Fatal("held usage obscured or dispatch suggested")
+	}
+}
+
 func TestEvidenceSurfaceExportsFailureWithoutReplayAndPreservesExistingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "evidence.json")
 	calls := 0

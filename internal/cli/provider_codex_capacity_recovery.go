@@ -446,6 +446,19 @@ func providerCodexReconciliationPlan(id provider.Identity, snapshot ratelimit.Su
 		"insufficient_evidence": []string{"aggregate model usage or quota alone", "elapsed time or controller reset estimate", "local process exit without provider settlement", "a local signer repeating an unverified provider claim", "a legacy unbound rollout treated as authoritative settlement"},
 		"next_generation":       "strict exact served-model preflight only after authoritative admission",
 		"legacy_recovery":       "recover-capacity is an explicit owner-authorized unbound accounting exception; it is not this authoritative settlement path",
+		"legacy_authoritative_resolution": map[string]any{
+			"state":                   "evidence_required_no_automatic_migration",
+			"nonce_may_be_fabricated": false,
+			"current_settlement_accepts_nonce_less_rows": false,
+			"required_provider_evidence": []string{
+				"authenticated provider account identity and immutable source/export or support response",
+				"provider request identifier correlated to the original operation timestamp and recorded binding; timestamp proximity alone is insufficient",
+				"terminal status, final Coding Plan charge and units, and settlement coverage of the request",
+				"if request correlation is unavailable: provider-authoritative accounting of all requests in the affected account/window, including outstanding liabilities and settlement cutoff",
+			},
+			"required_review": "Preserve the original nonce-less row; review authenticated correlation or full-window coverage before implementing a separate atomic migration. Do not invent a nonce or pass this row through exact nonce settlement.",
+			"next_action":     "Obtain the account-bound provider response/export and retain its source digest; keep the unknown reservation until its coverage can be verified.",
+		},
 		"evidence_sources": []map[string]string{
 			{"source": "account-owner provider dashboard/export or provider support", "obtain": "account-bound request/usage identifier, terminal usage in Coding Plan credits, final status and settlement cutoff covering outstanding requests", "limitation": "a local operation hash is only a correlation reference until the provider binds it"},
 			{"source": "official aggregate quota and model-usage endpoints", "obtain": "fresh quota/units plus account scope", "limitation": "existing aggregate responses do not identify or settle the uncertain operation; no public per-request settlement endpoint has been established by this integration"},

@@ -223,6 +223,10 @@ func TestProviderReconciliationPlanCannotGrantAdmissionOrMutateUnknownUsage(t *t
 	if len(out["insufficient_evidence"].([]string)) == 0 || len(out["settlement_path"].([]string)) == 0 {
 		t.Fatal("missing actionable evidence requirements")
 	}
+	legacy := out["legacy_authoritative_resolution"].(map[string]any)
+	if legacy["nonce_may_be_fabricated"] != false || legacy["current_settlement_accepts_nonce_less_rows"] != false || len(legacy["required_provider_evidence"].([]string)) != 4 {
+		t.Fatal("legacy plan weakened exact settlement or lost its evidence requirements")
+	}
 }
 
 type providerCodexCapacityRecoveryAdmissionFake struct {

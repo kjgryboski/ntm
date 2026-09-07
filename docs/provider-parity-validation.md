@@ -372,3 +372,52 @@ the observation. Regression fixtures cover nested/flat errors, malformed shapes,
 unknown text, credential redaction, first-error retention, invalid counters and
 pre-signing storage without readiness promotion. Another paid Codex attempt still
 requires new authorization and a relevant change or diagnostic evidence.
+
+## Operator actions and conditional attempts
+
+`provider readiness` / `provider preview` includes an `operator` projection in
+JSON and plain-language next actions in the existing display. Workspace evidence,
+credential expiry, lifecycle evidence and current admission remain separate.
+`attempt_ceiling_remaining` is the campaign's unused ceiling. `authorized_attempts`
+is zero for a missing or exhausted campaign and null when positive unused slots
+have conditions the controller cannot evaluate. Inspect the bound authorization
+before dispatch: a slot reserved for an ordinary task after successful
+qualification is never a retry allowance after qualification fails.
+
+The September 6 resolution inspection authenticated the owner's newer Codex o08
+snapshot against the fixed usage endpoint and verified the original account.
+The older isolated snapshot returned 401 despite a future claimed expiry. The
+existing refresh command preserved a private backup and the same runtime identity.
+One newly scoped qualification then returned `usageLimitExceeded`, not retrying,
+before tools. The same account's authenticated usage response confirmed the weekly
+window at 100%, `allowed=false`. The conditional ordinary task remains unspent.
+
+## Historical Z.ai reservations without nonces
+
+The existing reconciliation plan now spells out the missing historical evidence.
+Exact nonce settlement cannot accept the original nonce-less reservation. Do not
+manufacture a nonce, rewrite its identity, or infer provider correlation from a
+nearby timestamp. Obtain either authenticated original request correlation and
+terminal charge/units/settlement coverage, or authoritative coverage of every
+request and outstanding liability in the affected account/window. Preserve the
+source and review its digest before designing a separate atomic migration.
+Current aggregate quota, local reset estimates and an unsigned support claim do
+not satisfy that requirement. This plan makes no ledger mutation or admission grant.
+
+## Repeatable scanner disposition checks
+
+`go run ./scripts/provider-scan-review --root ABSOLUTE_PROJECT_ROOT
+--review REVIEW.csv --review-sha256 SHA --findings CURRENT.csv
+--findings-sha256 SHA --raw RAW_REPORT --raw-sha256 SHA` verifies pinned artifacts
+and matches every current finding to a reviewed disposition on exact source bytes.
+Both CSV files use the existing seven-column schema:
+`severity,rule,file,line,source_sha256,disposition,reason`.
+Use the complete current scanner inventory; its disposition/reason columns may
+be empty because only the pinned review grants a disposition. Preserve raw output
+and the inventory extraction alongside it. The checker does not itself extract
+or prove completeness of a scanner report; the extraction must be independently
+reviewed. It rejects an empty inventory, changed source, new/changed locations or
+rules, extra duplicates, invalid dispositions, changed artifact hashes and paths
+outside the source root. It never edits reports, changes severity or grants
+provider readiness. Success means the reviewed inventory matches, not that the
+raw scanner passed. A raw report with no findings should use its own clean result.

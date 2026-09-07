@@ -51,6 +51,14 @@ type providerReadinessLane struct {
 	RemoteTermination      string                        `json:"remote_generation_termination"`
 	AssignmentPreview      providerAssignmentPreview     `json:"assignment_preview"`
 	TaskStatistics         providerTaskStatistics        `json:"task_statistics"`
+	Operator               providerOperatorReadiness     `json:"operator"`
+}
+
+type providerOperatorReadiness struct {
+	AuthorizedAttempts      *int     `json:"authorized_attempts"`
+	AttemptCeilingRemaining *int     `json:"attempt_ceiling_remaining"`
+	AttemptAuthorization    string   `json:"attempt_authorization"`
+	NextActions             []string `json:"next_actions"`
 }
 
 type providerAssignmentPreview struct {
@@ -259,6 +267,7 @@ func newProviderReadinessCmd() *cobra.Command {
 			applyProviderReadinessWindow(&lane, duration, time.Now().UTC())
 			lane.AssignmentPreview = previewProviderAssignment(lane, requirements)
 			lane.TaskStatistics = summarizeProviderTasks(lane.Operations)
+			lane.Operator = providerOperatorView(lane)
 			lanes = append(lanes, lane)
 		}
 		if IsJSONOutput() {
@@ -269,6 +278,13 @@ func newProviderReadinessCmd() *cobra.Command {
 			fmt.Fprintf(cmd.OutOrStdout(), "Credential: %v; blockers: %s\n", lane.Credential["state"], strings.Join(lane.Blockers, ", "))
 			fmt.Fprintf(cmd.OutOrStdout(), "Usable until: %v; task duration fits: %t\n", lane.UsableUntil, lane.DurationFits)
 			fmt.Fprintf(cmd.OutOrStdout(), "Assignment preview: eligible=%t; reasons: %s\n", lane.AssignmentPreview.Eligible, strings.Join(lane.AssignmentPreview.Reasons, ", "))
+			fmt.Fprintf(cmd.OutOrStdout(), "Attempt authorization: %s\n", lane.Operator.AttemptAuthorization)
+			if lane.Operator.AttemptCeilingRemaining != nil {
+				fmt.Fprintf(cmd.OutOrStdout(), "Unused attempt ceiling: %d (conditional authorization still applies)\n", *lane.Operator.AttemptCeilingRemaining)
+			}
+			for _, action := range lane.Operator.NextActions {
+				fmt.Fprintf(cmd.OutOrStdout(), "Next: %s\n", action)
+			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Verified task history: %d completed, %d failed, %d cancelled, %d unresolved; billing cost and human interventions unavailable\n", lane.TaskStatistics.Completed, lane.TaskStatistics.Failed, lane.TaskStatistics.Cancelled, lane.TaskStatistics.Unresolved)
 			if lane.EvidenceTruncated || len(lane.EvidenceErrors) > 0 {
 				fmt.Fprintf(cmd.OutOrStdout(), "Task evidence: history truncated=%t; unverifiable references=%d (see JSON details)\n", lane.EvidenceTruncated, len(lane.EvidenceErrors))
@@ -281,6 +297,58 @@ func newProviderReadinessCmd() *cobra.Command {
 		return nil
 	}
 	return cmd
+}
+
+// A campaign records a ceiling and the digest of external authorization, not
+// its conditions. Never turn an unused conditional slot into permission to retry.
+func providerOperatorView(lane providerReadinessLane) providerOperatorReadiness {
+	out := providerOperatorReadiness{AttemptAuthorization: "no_campaign_selected", NextActions: []string{}}
+	zero := 0
+	out.AuthorizedAttempts = &zero
+	if attempts, ok := lane.Capacity["experiment_attempts"].(map[string]any); ok {
+		if remaining, ok := attempts["remaining"].(int); ok {
+			out.AttemptCeilingRemaining = &remaining
+			if remaining <= 0 {
+				out.AttemptAuthorization = "campaign_exhausted"
+			} else {
+				out.AuthorizedAttempts = nil
+				out.AttemptAuthorization = "conditions_require_review_of_bound_authorization"
+			}
+		}
+	}
+	if lane.Credential["state"] == "missing_or_expired" {
+		out.NextActions = append(out.NextActions, "Restore and verify the exact account's credential before generation.")
+	}
+	if lane.Identity.Provider == "zai" && len(lane.Blockers) > 0 {
+		out.NextActions = append(out.NextActions, "Resolve held usage with authenticated account/request evidence; then pass admission before the strict served-model preflight.")
+	} else if lane.WorkspaceEvidence != "qualified" {
+		out.NextActions = append(out.NextActions, "Inspect the latest qualification failure, correct its cause, and qualify this exact profile within a new authorized scope.")
+	} else if len(lane.Blockers) > 0 {
+		out.NextActions = append(out.NextActions, "Resolve the listed admission blockers and recheck the intended task duration.")
+	}
+	for _, capability := range lane.CapabilitySummary {
+		if capability.Operation == "resume" {
+			latestFailed := false
+			for _, state := range capability.LatestDatedStates {
+				latestFailed = latestFailed || state == "failed"
+			}
+			if capability.State != "passed" || latestFailed {
+				out.NextActions = append(out.NextActions, "Keep resumed work unavailable until its failed or missing lifecycle evidence is resolved; preserve uncertain session ownership.")
+			}
+		}
+	}
+	switch out.AttemptAuthorization {
+	case "no_campaign_selected":
+		out.NextActions = append(out.NextActions, "Select the exact campaign and review its authorization conditions before dispatch.")
+	case "campaign_exhausted":
+		out.NextActions = append(out.NextActions, "The selected campaign is spent; a new scoped authorization is required for further generation.")
+	default:
+		out.NextActions = append(out.NextActions, "Review the selected campaign's authorization digest and conditions; an unused slot alone does not authorize a retry.")
+	}
+	if lane.AssignmentPreview.Eligible {
+		out.NextActions = append(out.NextActions, "Assign ordinary workspace work through the shared controls after current dispatch checks and authorization pass.")
+	}
+	return out
 }
 
 func validateProviderPreviewRequirements(requirements []string) error {
