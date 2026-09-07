@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"github.com/spf13/cobra"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -18,8 +20,76 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/providerattestation"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/ratelimit"
+	"github.com/Dicklesworthstone/ntm/internal/robot"
+	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/zai"
 )
+
+func TestGrokAssignmentSetupFailureSpendsNoAttempt(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", root)
+	t.Setenv("HOME", root)
+	t.Setenv("USERPROFILE", root)
+	t.Setenv("NTM_CONFIG", filepath.Join(root, "config.toml"))
+	t.Setenv("XDG_CONFIG_HOME", root)
+	previousCampaign := providerCampaignID
+	providerCampaignID = "setup-fixture"
+	t.Cleanup(func() { providerCampaignID = previousCampaign })
+	campaign, err := openProviderCampaignStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer campaign.Close()
+	if err = campaign.ConfigureProviderCampaign(providerCampaignID, 1, 0, strings.Repeat("e", 64)); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", root}, {"-C", root, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "fixture"}} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git: %s %v", out, err)
+		}
+	}
+	p := config.ProviderProfileConfig{Provider: "xai", AccountAlias: "fixture", Model: "grok-4.6", Endpoint: "https://api.x.ai/v1", Runtime: "grok", RuntimeVersion: "1.0.13", Command: "grok", ConfigSHA256: strings.Repeat("a", 64), AutomationPolicy: agent.GrokWorkspaceWritePolicyName, ExactTargetOnly: true}
+	p.RuntimeHome = root
+	p.CredentialBridgeCommand = filepath.Join(root, "bridge")
+	p.CredentialBridgeCommandSHA256 = strings.Repeat("b", 64)
+	previous, previousPrepare := cfg, prepareProviderGrokAssignment
+	t.Cleanup(func() { cfg = previous; prepareProviderGrokAssignment = previousPrepare })
+	cfg = &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{"fixture": p}}
+	called := 0
+	prepareProviderGrokAssignment = func(context.Context, string, grokACPProfileResolution, string) (robot.GrokACPOperationOptions, robot.GrokACPOperationAuthorizer, error) {
+		called++
+		return robot.GrokACPOperationOptions{}, nil, errors.New("bind provider broker to disposable worktree: private-canary")
+	}
+	cmd := &cobra.Command{}
+	err = runProviderAssignment(cmd, providerAssignmentRequest{Profile: "fixture", OperationID: "refused-task", Prompt: "private-canary", CWD: root, Timeout: time.Minute})
+	if err == nil || called != 1 {
+		t.Fatalf("setup branch: calls=%d err=%v", called, err)
+	}
+	store, err := state.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var count int
+	if err = store.DB().QueryRow("SELECT count(*) FROM send_operations").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("setup-only assignment created %d ledger operations; expected controller and observation", count)
+	}
+	budget, err := campaign.ProviderCampaign(providerCampaignID)
+	if err != nil || budget.Used != 0 {
+		t.Fatalf("setup spent attempt: %+v %v", budget, err)
+	}
+	row, err := store.GetSendOperation("refused-task", providerControlScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outcome providerControlOutcome
+	if row == nil || json.Unmarshal([]byte(row.OutcomeJSON), &outcome) != nil || outcome.SetupFailure == nil || outcome.SetupFailure.Reason != "workspace_not_linked" || outcome.OperationBindingSHA256 != "" || outcome.Capacity != nil || outcome.WorkspaceCompletion != nil {
+		t.Fatal("ambiguous setup outcome")
+	}
+}
 
 func TestGrokOperationDiagnosticsPreflightAndCleanupBindVerifiedRuntime(t *testing.T) {
 	root := t.TempDir()

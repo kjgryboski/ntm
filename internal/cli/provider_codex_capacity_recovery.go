@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BurntSushi/toml"
+
 	"github.com/spf13/cobra"
 
 	"github.com/Dicklesworthstone/ntm/internal/config"
@@ -75,24 +77,26 @@ func newProviderUsageImportCmd() *cobra.Command {
 // This is an operator's signed review of an authenticated source, not a
 // provider signature. The importer deliberately cannot manufacture it.
 type providerUsageSourceReview struct {
-	Schema                  string                                 `json:"schema_version"`
-	EvidenceSHA256          string                                 `json:"evidence_sha256"`
-	SourceSHA256            string                                 `json:"source_sha256"`
-	IdentitySHA256          string                                 `json:"identity_sha256"`
-	OperationBinding        string                                 `json:"operation_binding_sha256"`
-	NonceSHA256             string                                 `json:"nonce_sha256"`
-	LegacyReservationSHA256 string                                 `json:"legacy_reservation_sha256,omitempty"`
-	LegacyAssociation       string                                 `json:"legacy_association,omitempty"`
-	OrphanReservationSHA256 string                                 `json:"orphan_reservation_sha256,omitempty"`
-	SubscriptionScopeSHA256 string                                 `json:"subscription_scope_sha256,omitempty"`
-	LedgerPathSHA256        string                                 `json:"ledger_path_sha256,omitempty"`
-	OrphanAssociation       string                                 `json:"orphan_association,omitempty"`
-	ProviderAccount         string                                 `json:"provider_account_sha256"`
-	ProviderRequest         string                                 `json:"provider_request_sha256"`
-	SourceAuthentication    string                                 `json:"source_authentication"`
-	RequestAssociation      string                                 `json:"request_association"`
-	ReviewedAt              time.Time                              `json:"reviewed_at"`
-	Attestation             *providerattestation.SignatureMetadata `json:"attestation,omitempty"`
+	Envelope                        *providerqualification.Receipt         `json:"attestation_envelope,omitempty"`
+	HistoricalIdentityMappingSHA256 string                                 `json:"historical_identity_mapping_sha256,omitempty"`
+	Schema                          string                                 `json:"schema_version"`
+	EvidenceSHA256                  string                                 `json:"evidence_sha256"`
+	SourceSHA256                    string                                 `json:"source_sha256"`
+	IdentitySHA256                  string                                 `json:"identity_sha256"`
+	OperationBinding                string                                 `json:"operation_binding_sha256"`
+	NonceSHA256                     string                                 `json:"nonce_sha256"`
+	LegacyReservationSHA256         string                                 `json:"legacy_reservation_sha256,omitempty"`
+	LegacyAssociation               string                                 `json:"legacy_association,omitempty"`
+	OrphanReservationSHA256         string                                 `json:"orphan_reservation_sha256,omitempty"`
+	SubscriptionScopeSHA256         string                                 `json:"subscription_scope_sha256,omitempty"`
+	LedgerPathSHA256                string                                 `json:"ledger_path_sha256,omitempty"`
+	OrphanAssociation               string                                 `json:"orphan_association,omitempty"`
+	ProviderAccount                 string                                 `json:"provider_account_sha256"`
+	ProviderRequest                 string                                 `json:"provider_request_sha256"`
+	SourceAuthentication            string                                 `json:"source_authentication"`
+	RequestAssociation              string                                 `json:"request_association"`
+	ReviewedAt                      time.Time                              `json:"reviewed_at"`
+	Attestation                     *providerattestation.SignatureMetadata `json:"attestation,omitempty"`
 }
 
 func verifyProviderUsageSourceReview(review providerUsageSourceReview, imported providerUsageImportResult, trusted providerattestation.KeyMetadata, now time.Time) error {
@@ -103,8 +107,20 @@ func verifyProviderUsageSourceReview(review providerUsageSourceReview, imported 
 	if (bound || legacy) && (review.OrphanReservationSHA256 != "" || review.SubscriptionScopeSHA256 != "" || review.LedgerPathSHA256 != "" || review.OrphanAssociation != "") {
 		return errors.New("orphan fields require the separate orphan settlement contract")
 	}
-	if !imported.ValidationPassed || e == nil || (!bound && !legacy && !orphan) || review.Attestation == nil || review.Attestation.KeyMetadata != trusted || review.EvidenceSHA256 != imported.EvidenceSHA256 || review.SourceSHA256 != imported.SourceSHA256 || review.IdentitySHA256 != e.IdentitySHA256 || review.OperationBinding != e.OperationBinding || review.ProviderAccount != e.ProviderAccount || review.ProviderRequest != e.ProviderRequest || review.RequestAssociation != "original_request_confirmed_by_provider_source" || (review.SourceAuthentication != "authenticated_account_export_reviewed" && review.SourceAuthentication != "authenticated_support_reply_reviewed") || review.ReviewedAt.Before(e.ObservedAt) || review.ReviewedAt.After(now) {
+	if review.HistoricalIdentityMappingSHA256 != "" && (!orphan || !validProviderNativeDigest(review.HistoricalIdentityMappingSHA256)) {
+		return errors.New("historical identity mapping requires exact orphan review")
+	}
+	if !imported.ValidationPassed || e == nil || (!bound && !legacy && !orphan) || (review.Attestation == nil) == (review.Envelope == nil) || review.EvidenceSHA256 != imported.EvidenceSHA256 || review.SourceSHA256 != imported.SourceSHA256 || review.IdentitySHA256 != e.IdentitySHA256 || review.OperationBinding != e.OperationBinding || review.ProviderAccount != e.ProviderAccount || review.ProviderRequest != e.ProviderRequest || review.RequestAssociation != "original_request_confirmed_by_provider_source" || (review.SourceAuthentication != "authenticated_account_export_reviewed" && review.SourceAuthentication != "authenticated_support_reply_reviewed") || review.ReviewedAt.Before(e.ObservedAt) || review.ReviewedAt.After(now) {
 		return errors.New("authenticated source review and exact request association are required")
+	}
+	if review.Envelope != nil {
+		if !validProviderLocalReviewIdentity(review.Envelope, "zai", review.IdentitySHA256, providerUsageReviewPolicy, providerUsageReviewDigest(review), review.ReviewedAt, trusted, now) {
+			return errors.New("usage review envelope differs from the exact source review or pinned signer")
+		}
+		return nil
+	}
+	if review.Attestation.KeyMetadata != trusted {
+		return errors.New("usage review signer differs from pinned authority")
 	}
 	signature := *review.Attestation
 	review.Attestation = nil
@@ -125,7 +141,11 @@ func newProviderUsageSettlementCmd() *cobra.Command {
 		if err != nil {
 			return providerattestation.KeyMetadata{}, err
 		}
-		sign, err := providerProfilePinnedSigner(p)
+		reviewer, err := providerHistoricalReviewSignerProfile(cmd, p)
+		if err != nil {
+			return providerattestation.KeyMetadata{}, err
+		}
+		sign, err := providerProfilePinnedSigner(reviewer)
 		if err != nil {
 			return providerattestation.KeyMetadata{}, err
 		}
@@ -134,6 +154,83 @@ func newProviderUsageSettlementCmd() *cobra.Command {
 	}
 	cmd := providerUsageSettlementCommand(resolveProviderUsageTarget, defaultProviderCodexSubscriptionAdmission, trust)
 	cmd.AddCommand(providerOrphanUsageSettlementCommand(withProviderOrphanLedgerGuard, defaultProviderCodexSubscriptionAdmission, trust))
+	cmd.AddCommand(newProviderHistoricalIdentityMapCmd())
+	cmd.AddCommand(providerUsageSourceSigningCommand(withProviderLocalReviewTarget))
+	return cmd
+}
+
+const providerUsageReviewPolicy = "ntm.authenticated-provider-usage-source-review.v1"
+
+func providerUsageReviewDigest(r providerUsageSourceReview) string {
+	r.Attestation = nil
+	r.Envelope = nil
+	return digestSafeJSON(r)
+}
+
+// Signing records an explicit owner's source review only. The settlement
+// command independently checks source bytes, request evidence and current state.
+func providerUsageSourceSigningCommand(target func(*cobra.Command, string, func(config.ProviderProfileConfig, provider.Identity, providerNativeOperationLedger, func(context.Context, []byte) (providerattestation.SignatureMetadata, error), providerattestation.KeyMetadata) error) error) *cobra.Command {
+	var name, input, output string
+	var confirm bool
+	cmd := &cobra.Command{Use: "sign-source-review", Short: "Sign an explicitly authenticated orphan usage review without settling or granting admission", Args: cobra.NoArgs}
+	cmd.Flags().StringVar(&name, "profile", "", "Exact original Z.ai target")
+	cmd.Flags().String("reviewer-profile", "", "Explicit current protected reviewer for the same provider, account and subscription scope")
+	cmd.Flags().StringVar(&input, "review-file", "", "Absolute unsigned v3 review of authenticated provider evidence")
+	cmd.Flags().StringVar(&output, "output", "", "New absolute signed review file")
+	cmd.Flags().BoolVar(&confirm, "confirm-authenticated-source-review", false, "Attest that the actual provider source authenticates this exact request, account, explicit usage units and settlement coverage")
+	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		if !confirm || name == "" || !filepath.IsAbs(input) || !filepath.IsAbs(output) {
+			return errors.New("exact target, unsigned review, new output and explicit authenticated-source confirmation required")
+		}
+		data, err := readProviderUsageFile(input)
+		if err != nil {
+			return err
+		}
+		var r providerUsageSourceReview
+		if err = decodeProviderLocalReview(data, &r); err != nil {
+			return err
+		}
+		if r.Schema != "ntm.provider-usage-source-review.v3" || r.Attestation != nil || r.Envelope != nil || r.ReviewedAt.IsZero() || r.ReviewedAt.After(time.Now().UTC()) || r.LegacyReservationSHA256 != "" || r.LegacyAssociation != "" || r.OrphanAssociation != "original_runtime_identity_binding_nonce_and_exact_row_associated_with_authenticated_request" || r.RequestAssociation != "original_request_confirmed_by_provider_source" || (r.SourceAuthentication != "authenticated_support_reply_reviewed" && r.SourceAuthentication != "authenticated_account_export_reviewed") {
+			return errors.New("unsigned exact orphan authenticated-source review required")
+		}
+		for _, digest := range []string{r.IdentitySHA256, r.EvidenceSHA256, r.SourceSHA256, r.OperationBinding, r.NonceSHA256, r.OrphanReservationSHA256, r.SubscriptionScopeSHA256, r.LedgerPathSHA256, r.ProviderAccount, r.ProviderRequest} {
+			if !validProviderNativeDigest(digest) {
+				return errors.New("source review contains an invalid binding digest")
+			}
+		}
+		if r.HistoricalIdentityMappingSHA256 != "" && !validProviderNativeDigest(r.HistoricalIdentityMappingSHA256) {
+			return errors.New("invalid historical mapping digest")
+		}
+		return target(cmd, name, func(p config.ProviderProfileConfig, id provider.Identity, _ providerNativeOperationLedger, sign func(context.Context, []byte) (providerattestation.SignatureMetadata, error), trusted providerattestation.KeyMetadata) error {
+			if id.Provider() != "zai" || id.Runtime() != "codex" || id.Entitlement() != provider.EntitlementCodexResponses || r.SubscriptionScopeSHA256 != sha256StringCLI(string(id.SubscriptionCapacityScope())) {
+				return errors.New("source review differs from exact Z.ai subscription scope")
+			}
+			if r.IdentitySHA256 != id.Hash() {
+				old, err := provider.NewIdentityWithAuthorization(p.Provider, p.AccountAlias, p.Model, p.Endpoint, p.Runtime, p.CredentialClass, p.BillingClass, p.Entitlement, p.ConfigSHA256)
+				if err != nil || r.HistoricalIdentityMappingSHA256 == "" || old.Hash() != r.IdentitySHA256 {
+					return errors.New("source review identity differs from current or explicitly mapped historical target")
+				}
+				id = old
+			}
+			r.Envelope, err = signProviderLocalReview(providerCommandContext(cmd), p, id, providerUsageReviewPolicy, providerUsageReviewDigest(r), r.ReviewedAt, sign)
+			if err != nil {
+				return err
+			}
+			if !validProviderLocalReview(r.Envelope, id, providerUsageReviewPolicy, providerUsageReviewDigest(r), r.ReviewedAt, trusted, time.Now().UTC()) {
+				return errors.New("signed usage-source envelope could not be verified")
+			}
+			encoded, err := json.MarshalIndent(r, "", "  ")
+			if err != nil {
+				return err
+			}
+			f, err := os.OpenFile(output, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+			if err != nil {
+				return err
+			}
+			_, writeErr := f.Write(encoded)
+			return errors.Join(writeErr, f.Sync(), f.Close())
+		})
+	}
 	return cmd
 }
 
@@ -176,7 +273,7 @@ func providerUsageSettlementCommand(resolve func(string, string) (provider.Ident
 			return err
 		}
 		var review providerUsageSourceReview
-		if err := validateProviderUsageObject(json.NewDecoder(bytes.NewReader(reviewData)), 0); err != nil {
+		if err := validateProviderReviewJSON(json.NewDecoder(bytes.NewReader(reviewData)), 0); err != nil {
 			return errors.New("ambiguous source review")
 		}
 		decoder := json.NewDecoder(bytes.NewReader(reviewData))
@@ -276,6 +373,7 @@ func withProviderOrphanLedgerPathGuard(parent context.Context, path, binding str
 
 func providerOrphanUsageSettlementCommand(guard func(*cobra.Command, string, string, func(provider.Identity, string) error) error, admission func() *ratelimit.SubscriptionAdmissionController, trust func(*cobra.Command, string) (providerattestation.KeyMetadata, error)) *cobra.Command {
 	var profile, binding, evidenceFile, sourceFile, reviewFile string
+	var mappingFile, originalFile, requestFile, bridgeFile string
 	var inspect, apply bool
 	cmd := &cobra.Command{Use: "orphan", Short: "Inspect or settle an exact nonce-bound reservation absent from the selected ledger", Args: cobra.NoArgs}
 	cmd.Flags().StringVar(&profile, "profile", "", "Exact original runtime identity profile; a successor is not a substitute")
@@ -285,7 +383,19 @@ func providerOrphanUsageSettlementCommand(guard func(*cobra.Command, string, str
 	cmd.Flags().StringVar(&sourceFile, "source-file", "", "Absolute authenticated provider source")
 	cmd.Flags().StringVar(&reviewFile, "review-file", "", "Absolute pinned signed v3 source and original runtime association review")
 	cmd.Flags().BoolVar(&apply, "apply", false, "Apply the exact verified settlement; preview is the default")
+	cmd.Flags().StringVar(&mappingFile, "identity-map-file", "", "Absolute pinned signed historical identity mapping")
+	cmd.Flags().String("reviewer-profile", "", "Explicit current signing profile for the same historical provider, account and subscription scope")
+	cmd.Flags().StringVar(&originalFile, "original-profile-file", "", "Absolute preserved original profile projection")
+	cmd.Flags().StringVar(&requestFile, "request-evidence-file", "", "Absolute reviewed original request and bridge evidence")
+	cmd.Flags().StringVar(&bridgeFile, "request-bridge-file", "", "Absolute retained original request bridge binary")
 	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		mapped := mappingFile != ""
+		if reviewer, _ := cmd.Flags().GetString("reviewer-profile"); reviewer != "" && !mapped {
+			return errors.New("separate reviewer requires a historical identity mapping")
+		}
+		if (mapped && (inspect || !filepath.IsAbs(mappingFile) || !filepath.IsAbs(originalFile) || !filepath.IsAbs(requestFile) || !filepath.IsAbs(bridgeFile))) || (!mapped && (originalFile != "" || requestFile != "" || bridgeFile != "")) {
+			return errors.New("historical mapping requires all original evidence files and settlement mode")
+		}
 		if profile == "" || !validProviderNativeDigest(binding) || (inspect && (apply || evidenceFile != "" || sourceFile != "" || reviewFile != "")) || (!inspect && (!filepath.IsAbs(evidenceFile) || !filepath.IsAbs(sourceFile) || !filepath.IsAbs(reviewFile))) {
 			return errors.New("exact profile, binding and either inspection or absolute evidence/source/review required")
 		}
@@ -312,7 +422,7 @@ func providerOrphanUsageSettlementCommand(guard func(*cobra.Command, string, str
 				return err
 			}
 			var review providerUsageSourceReview
-			if validateProviderUsageObject(json.NewDecoder(bytes.NewReader(reviewData)), 0) != nil {
+			if validateProviderReviewJSON(json.NewDecoder(bytes.NewReader(reviewData)), 0) != nil {
 				return errors.New("ambiguous orphan source review")
 			}
 			decoder := json.NewDecoder(bytes.NewReader(reviewData))
@@ -328,7 +438,27 @@ func providerOrphanUsageSettlementCommand(guard func(*cobra.Command, string, str
 				return err
 			}
 			now := time.Now().UTC()
-			imported := validateProviderUsageTargetEvidence(data, source, id, "", binding, reservation.ObservedAt, now, true)
+			evidenceIdentity := id
+			if mapped {
+				mappingData, err := readProviderUsageFile(mappingFile)
+				if err != nil {
+					return err
+				}
+				var mapping providerHistoricalIdentityMap
+				if err = decodeProviderLocalReview(mappingData, &mapping); err != nil {
+					return err
+				}
+				evidenceIdentity, err = validateProviderHistoricalIdentityMap(mapping, profile, id, reservation, ledgerSHA, originalFile, requestFile, bridgeFile, trusted, now)
+				if err != nil {
+					return err
+				}
+				if review.HistoricalIdentityMappingSHA256 != sha256TextCLI(mappingData) {
+					return errors.New("usage source review does not bind this exact historical mapping")
+				}
+			} else if review.HistoricalIdentityMappingSHA256 != "" {
+				return errors.New("historical mapping evidence missing")
+			}
+			imported := validateProviderUsageTargetEvidence(data, source, evidenceIdentity, "", binding, reservation.ObservedAt, now, true)
 			if err := verifyProviderUsageSourceReview(review, imported, trusted, now); err != nil {
 				return err
 			}
@@ -336,6 +466,140 @@ func providerOrphanUsageSettlementCommand(guard func(*cobra.Command, string, str
 				return err
 			}
 			return encodeIndentedJSON(cmd.OutOrStdout(), map[string]any{"schema_version": "ntm.orphan-usage-settlement.v1", "review_verified": true, "settlement_applied_or_already_present": apply, "reservation_sha256": reservation.SHA256, "review_sha256": sha256TextCLI(reviewData), "authority": "pinned_owner_authenticated_source_review", "operation_created": false, "admission_granted": false, "generation_calls": 0})
+		})
+	}
+	return cmd
+}
+
+const providerHistoricalMapPolicy = "ntm.historical-provider-identity-map.v1"
+
+// This maps one reservation across the pre-bridge identity schema. It never
+// changes an active profile, runtime dispatch identity, or subscription scope.
+type providerHistoricalIdentityMap struct {
+	Schema                   string                         `json:"schema_version"`
+	Profile                  string                         `json:"profile"`
+	HistoricalIdentitySHA256 string                         `json:"historical_identity_sha256"`
+	CurrentIdentitySHA256    string                         `json:"current_identity_sha256"`
+	ConfigSHA256             string                         `json:"config_sha256"`
+	OriginalProfileSHA256    string                         `json:"original_profile_sha256"`
+	RequestEvidenceSHA256    string                         `json:"request_evidence_sha256"`
+	RequestBridgeSHA256      string                         `json:"request_bridge_sha256"`
+	Binding                  string                         `json:"operation_binding_sha256"`
+	Nonce                    string                         `json:"nonce_sha256"`
+	ReservationSHA256        string                         `json:"reservation_sha256"`
+	LedgerSHA256             string                         `json:"ledger_sha256"`
+	ScopeSHA256              string                         `json:"subscription_scope_sha256"`
+	Association              string                         `json:"association"`
+	ReviewedAt               time.Time                      `json:"reviewed_at"`
+	Envelope                 *providerqualification.Receipt `json:"attestation_envelope,omitempty"`
+}
+
+func providerHistoricalMapDigest(r providerHistoricalIdentityMap) string {
+	r.Envelope = nil
+	return digestSafeJSON(r)
+}
+
+func providerHistoricalIdentityFromFiles(name string, id provider.Identity, originalFile, requestFile, bridgeFile string) (provider.Identity, string, string, string, error) {
+	var zero provider.Identity
+	if id.Provider() != "zai" || id.Runtime() != "codex" || id.Entitlement() != provider.EntitlementCodexResponses || !filepath.IsAbs(originalFile) || !filepath.IsAbs(requestFile) || !filepath.IsAbs(bridgeFile) {
+		return zero, "", "", "", errors.New("exact original Z.ai Codex files required")
+	}
+	data, err := readProviderUsageFile(originalFile)
+	if err != nil {
+		return zero, "", "", "", err
+	}
+	var archived struct {
+		Profiles map[string]config.ProviderProfileConfig `toml:"provider_profiles"`
+	}
+	meta, err := toml.Decode(string(data), &archived)
+	if err != nil || len(meta.Undecoded()) != 0 || len(archived.Profiles) != 1 {
+		return zero, "", "", "", errors.New("one unambiguous original profile required")
+	}
+	p, ok := archived.Profiles[name]
+	if !ok {
+		return zero, "", "", "", errors.New("renamed historical profile refused")
+	}
+	old, err := provider.NewIdentityWithAuthorization(p.Provider, p.AccountAlias, p.Model, p.Endpoint, p.Runtime, p.CredentialClass, p.BillingClass, p.Entitlement, p.ConfigSHA256)
+	if err != nil || p.AccountAlias != id.AccountAlias() || p.Provider != id.Provider() || p.Model != id.Model() || p.Endpoint != id.Endpoint() || p.Runtime != id.Runtime() || p.ConfigSHA256 != id.ConfigSHA256() || p.CredentialClass != id.CredentialClass() || p.BillingClass != id.BillingClass() || p.Entitlement != id.Entitlement() || old.Hash() == id.Hash() || old.SubscriptionCapacityScope() != id.SubscriptionCapacityScope() {
+		return zero, "", "", "", errors.New("historical tuple differs from selected account, model, commercial scope or configuration")
+	}
+	request, err := readProviderUsageFile(requestFile)
+	if err != nil || len(bytes.TrimSpace(request)) == 0 {
+		return zero, "", "", "", errors.New("original request evidence unavailable")
+	}
+	bridgeSHA, err := hashProviderSessionExecutable(bridgeFile)
+	if err != nil {
+		return zero, "", "", "", err
+	}
+	return old, sha256TextCLI(data), sha256TextCLI(request), bridgeSHA, nil
+}
+
+func validateProviderHistoricalIdentityMap(r providerHistoricalIdentityMap, name string, id provider.Identity, row ratelimit.BoundUsageReservation, ledgerSHA, originalFile, requestFile, bridgeFile string, trusted providerattestation.KeyMetadata, now time.Time) (provider.Identity, error) {
+	old, originalSHA, requestSHA, bridgeSHA, err := providerHistoricalIdentityFromFiles(name, id, originalFile, requestFile, bridgeFile)
+	if err != nil {
+		return provider.Identity{}, err
+	}
+	if r.Schema != providerHistoricalMapPolicy || r.Profile != name || r.CurrentIdentitySHA256 != id.Hash() || r.HistoricalIdentitySHA256 != old.Hash() || r.ConfigSHA256 != id.ConfigSHA256() || r.OriginalProfileSHA256 != originalSHA || r.RequestEvidenceSHA256 != requestSHA || r.RequestBridgeSHA256 != bridgeSHA || r.Binding != row.Binding || r.Nonce != row.Nonce || r.ReservationSHA256 != row.SHA256 || r.LedgerSHA256 != ledgerSHA || r.ScopeSHA256 != sha256StringCLI(string(id.SubscriptionCapacityScope())) || r.Association != "reviewed_original_configuration_and_request_time_bridge_for_exact_reservation" || r.ReviewedAt.Before(row.ObservedAt) || !validProviderLocalReview(r.Envelope, id, providerHistoricalMapPolicy, providerHistoricalMapDigest(r), r.ReviewedAt, trusted, now) {
+		return provider.Identity{}, errors.New("historical identity mapping is unsigned, changed or bound to another reservation")
+	}
+	return old, nil
+}
+
+func newProviderHistoricalIdentityMapCmd() *cobra.Command {
+	return providerHistoricalIdentityMapCommand(withProviderLocalReviewTarget, withProviderOrphanLedgerGuard, defaultProviderCodexSubscriptionAdmission)
+}
+
+func providerHistoricalIdentityMapCommand(target func(*cobra.Command, string, func(config.ProviderProfileConfig, provider.Identity, providerNativeOperationLedger, func(context.Context, []byte) (providerattestation.SignatureMetadata, error), providerattestation.KeyMetadata) error) error, guard func(*cobra.Command, string, string, func(provider.Identity, string) error) error, admission func() *ratelimit.SubscriptionAdmissionController) *cobra.Command {
+	var name, binding, originalFile, requestFile, bridgeFile, output string
+	var confirm bool
+	cmd := &cobra.Command{Use: "identity-map", Short: "Inspect or explicitly sign an exact historical identity mapping without settling usage", Args: cobra.NoArgs}
+	cmd.Flags().StringVar(&name, "profile", "", "Exact original profile name under the current identity schema")
+	cmd.Flags().String("reviewer-profile", "", "Explicit current signing profile for the same historical provider, account and subscription scope")
+	cmd.Flags().StringVar(&binding, "binding-sha256", "", "Original reservation binding")
+	cmd.Flags().StringVar(&originalFile, "original-profile-file", "", "Absolute preserved profile projection")
+	cmd.Flags().StringVar(&requestFile, "request-evidence-file", "", "Absolute reviewed original request and bridge evidence")
+	cmd.Flags().StringVar(&bridgeFile, "request-bridge-file", "", "Absolute retained original request bridge")
+	cmd.Flags().StringVar(&output, "output", "", "New absolute signed mapping file")
+	cmd.Flags().BoolVar(&confirm, "confirm-reviewed-identity-mapping", false, "Attest the original configuration and request-time bridge association for this exact reservation")
+	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		if name == "" || !validProviderNativeDigest(binding) || !filepath.IsAbs(originalFile) || !filepath.IsAbs(requestFile) || !filepath.IsAbs(bridgeFile) || (confirm && !filepath.IsAbs(output)) || (!confirm && output != "") {
+			return errors.New("exact profile, original evidence and explicit signing output required; default is inspection")
+		}
+		return target(cmd, name, func(p config.ProviderProfileConfig, id provider.Identity, _ providerNativeOperationLedger, sign func(context.Context, []byte) (providerattestation.SignatureMetadata, error), trusted providerattestation.KeyMetadata) error {
+			return guard(cmd, name, binding, func(guardID provider.Identity, ledgerSHA string) error {
+				if guardID.Hash() != id.Hash() {
+					return errors.New("identity changed during mapping review")
+				}
+				row, err := admission().InspectBoundUsage(id, binding)
+				if err != nil {
+					return err
+				}
+				old, originalSHA, requestSHA, bridgeSHA, err := providerHistoricalIdentityFromFiles(name, id, originalFile, requestFile, bridgeFile)
+				if err != nil {
+					return err
+				}
+				r := providerHistoricalIdentityMap{Schema: providerHistoricalMapPolicy, Profile: name, HistoricalIdentitySHA256: old.Hash(), CurrentIdentitySHA256: id.Hash(), ConfigSHA256: id.ConfigSHA256(), OriginalProfileSHA256: originalSHA, RequestEvidenceSHA256: requestSHA, RequestBridgeSHA256: bridgeSHA, Binding: binding, Nonce: row.Nonce, ReservationSHA256: row.SHA256, LedgerSHA256: ledgerSHA, ScopeSHA256: sha256StringCLI(string(id.SubscriptionCapacityScope())), Association: "reviewed_original_configuration_and_request_time_bridge_for_exact_reservation", ReviewedAt: time.Now().UTC()}
+				if !confirm {
+					return encodeIndentedJSON(cmd.OutOrStdout(), map[string]any{"mapping": r, "trust": "unsigned_inspection_only", "accounting_mutated": false, "generation_calls": 0})
+				}
+				r.Envelope, err = signProviderLocalReview(providerCommandContext(cmd), p, id, providerHistoricalMapPolicy, providerHistoricalMapDigest(r), r.ReviewedAt, sign)
+				if err != nil {
+					return err
+				}
+				if _, err = validateProviderHistoricalIdentityMap(r, name, id, row, ledgerSHA, originalFile, requestFile, bridgeFile, trusted, time.Now().UTC()); err != nil {
+					return err
+				}
+				data, err := json.MarshalIndent(r, "", "  ")
+				if err != nil {
+					return err
+				}
+				f, err := os.OpenFile(output, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+				if err != nil {
+					return err
+				}
+				_, writeErr := f.Write(data)
+				return errors.Join(writeErr, f.Sync(), f.Close())
+			})
 		})
 	}
 	return cmd

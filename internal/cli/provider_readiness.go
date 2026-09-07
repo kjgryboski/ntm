@@ -150,6 +150,7 @@ type providerAssignmentPreview struct {
 }
 
 type providerTaskStatistics struct {
+	RefusedBeforeDispatch   int      `json:"refused_before_dispatch"`
 	Completed               int      `json:"completed"`
 	Failed                  int      `json:"failed"`
 	Cancelled               int      `json:"cancelled"`
@@ -172,7 +173,9 @@ type providerReadinessCapability struct {
 // Evidence exports use the same signature and binding verifier as status and
 // readiness. They contain observations, not portable dispatch authority.
 func newProviderEvidenceCmd() *cobra.Command {
-	return providerEvidenceCommand(withProviderAssignmentStatus)
+	cmd := providerEvidenceCommand(withProviderAssignmentStatus)
+	cmd.AddCommand(newProviderSetupRefusalCmd())
+	return cmd
 }
 
 func providerEvidenceCommand(inspect func(*cobra.Command, string, string, func(providerAssignmentStatus) error) error) *cobra.Command {
@@ -407,7 +410,7 @@ func providerReadinessCommand(run func(context.Context, []string) ([]byte, error
 			for _, action := range lane.Operator.NextActions {
 				fmt.Fprintf(cmd.OutOrStdout(), "Next: %s\n", action)
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "Verified task history: %d completed, %d failed, %d cancelled, %d unresolved; billing cost and human interventions unavailable\n", lane.TaskStatistics.Completed, lane.TaskStatistics.Failed, lane.TaskStatistics.Cancelled, lane.TaskStatistics.Unresolved)
+			fmt.Fprintf(cmd.OutOrStdout(), "Verified task history: %d completed, %d failed, %d cancelled, %d refused before dispatch, %d unresolved; billing cost and human interventions unavailable\n", lane.TaskStatistics.Completed, lane.TaskStatistics.Failed, lane.TaskStatistics.Cancelled, lane.TaskStatistics.RefusedBeforeDispatch, lane.TaskStatistics.Unresolved)
 			if lane.EvidenceTruncated || len(lane.EvidenceErrors) > 0 {
 				fmt.Fprintf(cmd.OutOrStdout(), "Task evidence: history truncated=%t; unverifiable references=%d (see JSON details)\n", lane.EvidenceTruncated, len(lane.EvidenceErrors))
 			}
@@ -661,6 +664,8 @@ func summarizeProviderTasks(operations []providerAssignmentStatus) providerTaskS
 	for _, operation := range operations {
 		measurable := false
 		switch {
+		case operation.SetupRefusalVerified && operation.State == "refused_before_dispatch" && operation.OutcomeSHA256 == "":
+			out.RefusedBeforeDispatch++
 		case providerTaskRequirementPassed(operation, providerAssignmentStatus{}, "completion", ""):
 			out.Completed++
 			measurable = true

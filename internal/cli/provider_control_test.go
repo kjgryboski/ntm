@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,109 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/robot"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 )
+
+func TestProviderSetupRefusalReviewCannotBecomeRuntimeWork(t *testing.T) {
+	id, err := provider.NewIdentity("xai", "fixture", "grok-4.6", "https://api.x.ai/v1", "grok", strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := &providerNativeLedgerFake{}
+	ctx, finish, err := beginProviderControl(t.Context(), ledger, id, providerAssignmentRequest{OperationID: "setup-only", CWD: t.TempDir(), Prompt: "private-canary"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = recordProviderSetupFailure(ctx, errors.New("bind provider broker to disposable worktree: private-canary")); err != nil {
+		t.Fatal(err)
+	}
+	observation, err := ledger.GetSendOperation("setup-only", "provider:setup-failure-observation")
+	if err != nil || observation == nil || observation.Status != state.SendOperationCompleted || strings.Contains(observation.OutcomeJSON, "private-canary") {
+		t.Fatalf("unsafe or missing observation: %v", err)
+	}
+	control, _ := ledger.GetSendOperation("setup-only", providerControlScope)
+	if control.Status != state.SendOperationInProgress {
+		t.Fatal("observation must precede finalization")
+	}
+	if err = finish(); err != nil {
+		t.Fatal(err)
+	}
+	control, _ = ledger.GetSendOperation("setup-only", providerControlScope)
+	if len(ledger.ops) != 2 {
+		t.Fatal("setup failure created runtime or campaign operations")
+	}
+	command := filepath.Join(t.TempDir(), "runtime")
+	if err = os.WriteFile(command, []byte("offline executable fixture"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	p := config.ProviderProfileConfig{Command: command, RuntimeVersion: "1.0.13"}
+	r := providerSetupRefusalReview{Schema: providerSetupReviewPolicy, Profile: "original", IdentitySHA256: id.Hash(), OperationIDSHA256: sha256StringCLI(control.OperationID), ControllerSHA256: digestSafeJSON(control), LedgerSHA256: strings.Repeat("b", 64), ErrorSHA256: strings.Repeat("c", 64), SourceSHA256: strings.Repeat("d", 64), Disposition: "reviewed_refused_before_dispatch", ReviewedAt: time.Now().UTC()}
+	sign := newProviderNativeTestSigner()
+	r.Envelope, err = signProviderLocalReview(t.Context(), p, id, providerSetupReviewPolicy, providerSetupReviewDigest(r), r.ReviewedAt, sign)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trusted := r.Envelope.Attestation.KeyMetadata
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded providerSetupRefusalReview
+	if err = decodeProviderLocalReview(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if err = validateProviderSetupReview(decoded, "original", r.LedgerSHA256, id, control, nil, trusted, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutation := range []string{"unsigned", "source", "controller", "ledger", "profile", "runtime"} {
+		t.Run(mutation, func(t *testing.T) {
+			bad := decoded
+			row := *control
+			var runtime *state.SendOperation
+			switch mutation {
+			case "unsigned":
+				bad.Envelope = nil
+			case "source":
+				bad.SourceSHA256 = strings.Repeat("e", 64)
+			case "controller":
+				row.BindingHash = "changed"
+			case "ledger":
+				bad.LedgerSHA256 = strings.Repeat("e", 64)
+			case "profile":
+				bad.Profile = "renamed"
+			case "runtime":
+				runtime = &state.SendOperation{}
+			}
+			if validateProviderSetupReview(bad, "original", r.LedgerSHA256, id, &row, runtime, trusted, time.Now().UTC()) == nil {
+				t.Fatal("mutation accepted")
+			}
+		})
+	}
+	if _, _, err = ledger.ClaimSendOperation(&state.SendOperation{OperationID: control.OperationID, SessionName: providerSetupReviewScope, BindingHash: r.ControllerSHA256, PayloadSHA256: id.Hash(), CreatedAt: r.ReviewedAt}); err != nil {
+		t.Fatal(err)
+	}
+	if err = ledger.CompleteSendOperation(control.OperationID, providerSetupReviewScope, string(data), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	status, err := inspectProviderSetupRefusal("original", control.OperationID, r.LedgerSHA256, id, ledger, trusted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := summarizeProviderTasks([]providerAssignmentStatus{status})
+	if status.OutcomeSHA256 != "" || stats.Completed != 0 || stats.RefusedBeforeDispatch != 1 || stats.Unresolved != 0 || r.Envelope.Passed {
+		t.Fatal("refusal promoted into provider work")
+	}
+	if _, _, err = beginProviderControl(t.Context(), ledger, id, providerAssignmentRequest{OperationID: "setup-only", CWD: t.TempDir(), Prompt: "private-canary"}); err == nil {
+		t.Fatal("review allowed replay")
+	}
+}
+
+func TestProviderLocalReviewRejectsAmbiguousNestedJSON(t *testing.T) {
+	for _, input := range []string{`{"checks":[{"name":"a","name":"b"}]}`, `{"checks":[{"Name":"a"}]}`, `{"x":1} {"x":2}`, `[]`} {
+		var target map[string]any
+		if decodeProviderLocalReview([]byte(input), &target) == nil {
+			t.Fatalf("accepted %s", input)
+		}
+	}
+}
 
 func TestGrokSessionSuccessorSurvivesControllerRestartAndRejectsFork(t *testing.T) {
 	for _, terminal := range []string{"completed", "cancelled", "unacknowledged"} {

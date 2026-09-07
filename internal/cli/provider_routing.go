@@ -44,7 +44,11 @@ type providerAssignmentRequest struct {
 // identity, completion, and capacity reconciliation. There is no fallback.
 var dispatchProviderAssignment = runProviderAssignment
 
+var prepareProviderGrokAssignment = prepareGrokACPDispatch
+
 type providerAssignmentStatus struct {
+	SetupRefusalVerified       bool                                 `json:"setup_refusal_verified,omitempty"`
+	SetupReviewSHA256          string                               `json:"setup_review_sha256,omitempty"`
 	SessionResumed             bool                                 `json:"session_resumed,omitempty"`
 	SessionClosed              bool                                 `json:"session_closed,omitempty"`
 	ParentOperationSHA256      string                               `json:"parent_operation_sha256,omitempty"`
@@ -132,7 +136,23 @@ func withProviderAssignmentStatus(cmd *cobra.Command, profileName, operationID s
 		return err
 	}
 	if row == nil {
-		return errors.New("provider assignment was not found")
+		sign, err := providerProfilePinnedSigner(profile)
+		if err != nil {
+			return err
+		}
+		trusted, err := preflightProviderReceiptSignerMetadataFor(providerCommandContext(cmd), sign, identity.Provider() == "xai")
+		if err != nil {
+			return err
+		}
+		path, err := filepath.Abs(state.DefaultPath())
+		if err != nil {
+			return err
+		}
+		refusal, err := inspectProviderSetupRefusal(profileName, operationID, sha256StringCLI(path), identity, ledger, trusted.KeyMetadata)
+		if err != nil {
+			return err
+		}
+		return visit(refusal)
 	}
 	out := providerAssignmentStatus{Schema: "ntm.provider-assignment-status.v1", Profile: profileName, Provider: identity.Provider(), Runtime: identity.Runtime(), AccountSHA256: sha256StringCLI(identity.AccountAlias()), IdentitySHA256: identity.Hash(), BillingClass: identity.BillingClass(), RequestedModel: identity.Model(), State: "outcome_unknown", RemoteTermination: "unverified"}
 	out.StartedAt = row.CreatedAt
@@ -314,29 +334,31 @@ func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest
 	case identity.Provider() == "xai" && identity.Runtime() == "grok":
 		resolved, err := resolveGrokACPProviderProfile(loaded, request.Profile, "", "")
 		if err != nil {
-			return err
+			return errors.Join(err, recordProviderSetupFailure(ctx, err))
 		}
 		ctx, cancel := context.WithTimeout(providerCommandContext(cmd), request.Timeout)
 		defer cancel()
-		opts, authorizer, err := prepareGrokACPDispatch(ctx, request.CWD, resolved, providerOperationWorkspaceWrite)
+		opts, authorizer, err := prepareProviderGrokAssignment(ctx, request.CWD, resolved, providerOperationWorkspaceWrite)
 		if err != nil {
-			return err
+			return errors.Join(err, recordProviderSetupFailure(ctx, err))
 		}
 		opts.Prompt, opts.OperationID = request.Prompt, request.OperationID
 		if request.ParentSession != "" {
 			parent, err := claimGrokSessionSuccessor(ctx, ledger, profile, identity, request, opts.TrustedSigner)
 			if err != nil {
-				return err
+				return errors.Join(err, recordProviderSetupFailure(ctx, err))
 			}
 			opts.ResumeSession, opts.ParentOperation, opts.CloseSession = parent.ProviderSessionID, request.ParentSession, request.CloseSession
 		} else if request.CloseSession {
-			return errors.New("closing a session requires its last completed operation")
+			err := errors.New("closing a session requires its last completed operation")
+			return errors.Join(err, recordProviderSetupFailure(ctx, err))
 		}
 		if err := checkProviderDispatchClock(clockStarted); err != nil {
-			return err
+			return errors.Join(err, recordProviderSetupFailure(ctx, err))
 		}
 		if err := ctx.Err(); err != nil {
-			return &providerEnvironmentError{reason: "prerequisite_deadline_expired"}
+			failure := &providerEnvironmentError{reason: "prerequisite_deadline_expired"}
+			return errors.Join(failure, recordProviderSetupFailure(ctx, failure))
 		}
 		if !request.CloseSession {
 			purpose := "workspace"

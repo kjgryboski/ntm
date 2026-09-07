@@ -695,13 +695,55 @@ settlement review digest makes repeated delivery idempotent across restart.
 The September 4 live hold remains unresolved until authenticated evidence and
 the original-runtime association are available; no fixture authorizes settlement.
 
-Historical identities from before bridge binding need additional reconciliation.
-The same archived Z.ai configuration can produce an older identity without bridge
-fields and a different current identity with them. This subcommand validates the
-current constructor's exact identity; it does not import an old identity schema
-or authorize that mapping. Preserve both preimages and request-time bridge evidence
-for a separate reviewed identity-migration contract before settling such a row.
-Renaming a profile or replacing the historical digest is not that contract.
+Historical identities from before bridge binding use the separate
+`provider codex settle-reviewed-usage identity-map` review. Supply the exact
+`--profile`, `--binding-sha256`, `--original-profile-file`,
+`--request-evidence-file` and `--request-bridge-file`. Inspection cannot settle
+usage. `--confirm-reviewed-identity-mapping --output ABSOLUTE_NEW_FILE` signs an
+explicit owner review bound to both identity projections, the unchanged original
+configuration, evidence bytes, request-time bridge, ledger, nonce and row digest.
+An optional `--reviewer-profile` selects a current protected signer belonging to
+the same provider, account and subscription scope; it does not replace the
+historical target or make it launchable. Renamed profiles, changed accounts,
+configuration drift, unsigned reviews and mismatched reservations are rejected.
+
+The orphan preview/apply surface consumes this file with `--identity-map-file`
+and the same three original evidence files. The v3 accounting review must bind
+the mapping file's exact digest in `historical_identity_mapping_sha256`. Usage
+evidence retains the historical identity; capacity validation uses the unchanged
+subscription scope. Authenticated provider request association, explicit units
+and settlement coverage remain independently required. A signed mapping proves
+the owner's reviewed association, not provider billing or served-model identity.
+
+After reviewing an actual authenticated provider response, prepare the exact
+unsigned v3 source-review document and use
+`provider codex settle-reviewed-usage sign-source-review --profile ORIGINAL
+--reviewer-profile CURRENT --review-file ABSOLUTE_DRAFT --output ABSOLUTE_NEW_FILE
+--confirm-authenticated-source-review`. This records the owner's assertion in
+the existing protected signing envelope with a separate policy and no passing
+qualification. It creates no operation and changes no accounting. The settlement
+command still independently validates source bytes, request evidence, mapping
+and current reservation state. Existing raw signed reviews remain readable;
+records containing both signing formats are rejected. Never create the assertion
+from a pending support request, a local reserve estimate or fabricated evidence.
+
+### Reviewed setup refusals
+
+`provider evidence setup-refusal` signs or imports a disposition for an exact
+finalized Grok controller without a runtime row. Signing requires `--profile`,
+`--operation`, absolute `--error-file` and `--source-file`, and explicit
+`--confirm-reviewed-predispatch --output ABSOLUTE_NEW_FILE`. The saved error must
+be the supported linked-worktree setup refusal. The review binds those file
+bytes, the full controller record, its identity, ledger and operation. Preview
+uses `--review-file`; `--apply` repeats validation and stores a separate review
+record. Unknown or changed evidence remains unresolved.
+
+Status and readiness count authenticated `refused_before_dispatch` separately.
+No runtime receipt, completion, cleanup, capacity release, qualification or
+remote termination is inferred. An old operation cannot be replayed. New Grok
+preparation failures persist allowlisted reasons in a separate observation before
+controller finalization; observations retain no raw error or assignment payload.
+They do not count as successful work or consume an experiment attempt.
 
 If request association is unavailable, complete-window evidence needs a distinct
 reviewed contract covering every request, settled usage with explicit units,

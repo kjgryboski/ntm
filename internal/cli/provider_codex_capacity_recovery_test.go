@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/BurntSushi/toml"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +22,211 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/Dicklesworthstone/ntm/internal/zai"
 )
+
+func TestProviderHistoricalIdentityMappingRequiresExactSignedEvidence(t *testing.T) {
+	root := t.TempDir()
+	p := providerCodexProfile(root)
+	id, err := p.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, request, bridge := filepath.Join(root, "original.toml"), filepath.Join(root, "request.json"), filepath.Join(root, "bridge")
+	var encoded bytes.Buffer
+	if err = toml.NewEncoder(&encoded).Encode(struct {
+		Profiles map[string]config.ProviderProfileConfig `toml:"provider_profiles"`
+	}{map[string]config.ProviderProfileConfig{"original": p}}); err != nil {
+		t.Fatal(err)
+	}
+	for path, data := range map[string][]byte{original: encoded.Bytes(), request: []byte(`{"request":"offline preserved request evidence"}`), bridge: []byte("retained bridge"), p.Command: []byte("runtime fixture")} {
+		if err = os.WriteFile(path, data, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old, originalSHA, requestSHA, bridgeSHA, err := providerHistoricalIdentityFromFiles("original", id, original, request, bridge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	row := ratelimit.BoundUsageReservation{Binding: strings.Repeat("b", 64), Nonce: strings.Repeat("c", 64), SHA256: strings.Repeat("d", 64), ObservedAt: now.Add(-time.Hour)}
+	ledgerSHA := strings.Repeat("e", 64)
+	r := providerHistoricalIdentityMap{Schema: providerHistoricalMapPolicy, Profile: "original", HistoricalIdentitySHA256: old.Hash(), CurrentIdentitySHA256: id.Hash(), ConfigSHA256: id.ConfigSHA256(), OriginalProfileSHA256: originalSHA, RequestEvidenceSHA256: requestSHA, RequestBridgeSHA256: bridgeSHA, Binding: row.Binding, Nonce: row.Nonce, ReservationSHA256: row.SHA256, LedgerSHA256: ledgerSHA, ScopeSHA256: sha256StringCLI(string(id.SubscriptionCapacityScope())), Association: "reviewed_original_configuration_and_request_time_bridge_for_exact_reservation", ReviewedAt: now}
+	r.Envelope, err = signProviderLocalReview(t.Context(), p, id, providerHistoricalMapPolicy, providerHistoricalMapDigest(r), now, newProviderNativeTestSigner())
+	if err != nil {
+		t.Fatal(err)
+	}
+	trusted := r.Envelope.Attestation.KeyMetadata
+	data, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded providerHistoricalIdentityMap
+	if err = decodeProviderLocalReview(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range []string{"valid", "unsigned", "renamed", "account", "configuration", "nonce", "binding", "row", "bridge", "request", "ledger", "future"} {
+		t.Run(scenario, func(t *testing.T) {
+			bad := decoded
+			targetID := id
+			name := "original"
+			targetRow := row
+			switch scenario {
+			case "unsigned":
+				bad.Envelope = nil
+			case "renamed":
+				name = "renamed"
+			case "account":
+				changed := p
+				changed.AccountAlias = "another"
+				targetID, err = changed.Identity()
+			case "configuration":
+				bad.ConfigSHA256 = strings.Repeat("f", 64)
+			case "nonce":
+				targetRow.Nonce = strings.Repeat("f", 64)
+			case "binding":
+				targetRow.Binding = strings.Repeat("f", 64)
+			case "row":
+				targetRow.SHA256 = strings.Repeat("f", 64)
+			case "bridge":
+				bad.RequestBridgeSHA256 = strings.Repeat("f", 64)
+			case "request":
+				bad.RequestEvidenceSHA256 = strings.Repeat("f", 64)
+			case "ledger":
+				bad.LedgerSHA256 = strings.Repeat("f", 64)
+			case "future":
+				bad.ReviewedAt = now.Add(time.Hour)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, validationErr := validateProviderHistoricalIdentityMap(bad, name, targetID, targetRow, ledgerSHA, original, request, bridge, trusted, now.Add(time.Second))
+			if (validationErr == nil) != (scenario == "valid") {
+				t.Fatalf("validation: %v", validationErr)
+			}
+			if scenario == "valid" && (got.Hash() != old.Hash() || r.Envelope.Passed) {
+				t.Fatal("mapping granted qualification or lost historical identity")
+			}
+		})
+	}
+}
+
+func TestHistoricalReviewerCannotChangeCommercialOwner(t *testing.T) {
+	target := providerCodexProfile(t.TempDir())
+	originalConfig := cfg
+	t.Cleanup(func() { cfg = originalConfig })
+	for _, scenario := range []string{"same-owner", "changed-account", "changed-provider", "changed-entitlement", "renamed-reviewer"} {
+		t.Run(scenario, func(t *testing.T) {
+			reviewer := target
+			reviewer.Model = "new-model"
+			switch scenario {
+			case "changed-account":
+				reviewer.AccountAlias = "other"
+			case "changed-provider":
+				reviewer.Provider = "openai"
+			case "changed-entitlement":
+				reviewer.Entitlement = provider.EntitlementNativeAPI
+			}
+			cfg = &config.Config{ProviderProfiles: map[string]config.ProviderProfileConfig{"current": reviewer}}
+			cmd := &cobra.Command{}
+			cmd.Flags().String("reviewer-profile", "current", "")
+			if scenario == "renamed-reviewer" {
+				if err := cmd.Flags().Set("reviewer-profile", "CURRENT"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got, err := providerHistoricalReviewSignerProfile(cmd, target)
+			if (err == nil) != (scenario == "same-owner") {
+				t.Fatalf("reviewer validation: %v", err)
+			}
+			if scenario == "same-owner" && (got.Model != "new-model" || target.Model == got.Model) {
+				t.Fatal("historical target changed")
+			}
+		})
+	}
+}
+
+func TestProviderUsageSourceReviewUsesProtectedEnvelope(t *testing.T) {
+	_, row, e, source, now := providerUsageFixture(t)
+	root := t.TempDir()
+	p := providerCodexProfile(root)
+	id, err := p.Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.IdentitySHA256 = id.Hash()
+	data, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := providerUsageSourceReview{Schema: "ntm.provider-usage-source-review.v3", EvidenceSHA256: sha256TextCLI(data), SourceSHA256: sha256TextCLI(source), IdentitySHA256: id.Hash(), OperationBinding: row.BindingHash, NonceSHA256: strings.Repeat("d", 64), OrphanReservationSHA256: strings.Repeat("e", 64), SubscriptionScopeSHA256: sha256StringCLI(string(id.SubscriptionCapacityScope())), LedgerPathSHA256: strings.Repeat("f", 64), OrphanAssociation: "original_runtime_identity_binding_nonce_and_exact_row_associated_with_authenticated_request", ProviderAccount: e.ProviderAccount, ProviderRequest: e.ProviderRequest, SourceAuthentication: "authenticated_support_reply_reviewed", RequestAssociation: "original_request_confirmed_by_provider_source", ReviewedAt: now}
+	input, output := filepath.Join(root, "unsigned.json"), filepath.Join(root, "signed.json")
+	unsigned, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(input, unsigned, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(p.Command, []byte("runtime fixture"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	baseSign := newProviderNativeTestSigner()
+	metadata, err := baseSign(t.Context(), []byte("offline metadata"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	target := func(_ *cobra.Command, name string, visit func(config.ProviderProfileConfig, provider.Identity, providerNativeOperationLedger, func(context.Context, []byte) (providerattestation.SignatureMetadata, error), providerattestation.KeyMetadata) error) error {
+		if name != "original" {
+			t.Fatal("changed target")
+		}
+		return visit(p, id, &providerNativeLedgerFake{}, func(ctx context.Context, payload []byte) (providerattestation.SignatureMetadata, error) {
+			calls++
+			if err := providerattestation.ValidateBridgePayload(payload); err != nil {
+				return providerattestation.SignatureMetadata{}, err
+			}
+			return baseSign(ctx, payload)
+		}, metadata.KeyMetadata)
+	}
+	run := func(confirm bool) error {
+		cmd := providerUsageSourceSigningCommand(target)
+		args := []string{"--profile", "original", "--review-file", input, "--output", output}
+		if confirm {
+			args = append(args, "--confirm-authenticated-source-review")
+		}
+		cmd.SetArgs(args)
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		return cmd.Execute()
+	}
+	if run(false) == nil || calls != 0 {
+		t.Fatal("unsigned assertion signed without explicit source review")
+	}
+	if err = run(true); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var signed providerUsageSourceReview
+	if err = decodeProviderLocalReview(stored, &signed); err != nil {
+		t.Fatal(err)
+	}
+	imported := providerUsageImportResult{ValidationPassed: true, EvidenceSHA256: sha256TextCLI(data), SourceSHA256: sha256TextCLI(source), Evidence: &e}
+	if err = verifyProviderUsageSourceReview(signed, imported, metadata.KeyMetadata, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if signed.Envelope == nil || signed.Envelope.Passed || signed.Attestation != nil {
+		t.Fatal("review promoted or ambiguously signed")
+	}
+	if run(true) == nil {
+		t.Fatal("signed output overwritten")
+	}
+	signed.ProviderRequest = strings.Repeat("0", 64)
+	if verifyProviderUsageSourceReview(signed, imported, metadata.KeyMetadata, time.Now().UTC()) == nil {
+		t.Fatal("changed request accepted")
+	}
+}
 
 func TestProviderOrphanLedgerGuard(t *testing.T) {
 	for _, scenario := range []string{"absent", "binding-match", "outcome-match", "missing-ledger", "corrupt-ledger"} {
@@ -88,7 +294,7 @@ func TestProviderOrphanLedgerGuard(t *testing.T) {
 }
 
 func TestProviderOrphanSettlementSurface(t *testing.T) {
-	for _, scenario := range []string{"ready", "active", "ledger-match", "ledger-unavailable", "wrong-row", "wrong-nonce", "wrong-scope", "wrong-ledger", "wrong-identity", "wrong-source", "unsigned", "wrong-association", "missing-request-window", "wrong-units", "changed-after-preview"} {
+	for _, scenario := range []string{"ready", "historical-mapped", "historical-envelope", "historical-missing", "active", "ledger-match", "ledger-unavailable", "wrong-row", "wrong-nonce", "wrong-scope", "wrong-ledger", "wrong-identity", "wrong-source", "unsigned", "wrong-association", "missing-request-window", "wrong-units", "changed-after-preview"} {
 		t.Run(scenario, func(t *testing.T) {
 			id, row, e, source, now := providerUsageFixture(t)
 			path := filepath.Join(t.TempDir(), "capacity.json")
@@ -119,6 +325,49 @@ func TestProviderOrphanSettlementSurface(t *testing.T) {
 				t.Fatal(err)
 			}
 			ledgerSHA := strings.Repeat("a", 64)
+			sign := newProviderNativeTestSigner()
+			var mappingData []byte
+			var mappingArgs []string
+			var historicalSigningProfile config.ProviderProfileConfig
+			var historicalSigningIdentity provider.Identity
+			if strings.HasPrefix(scenario, "historical-") {
+				dir := t.TempDir()
+				p := providerCodexProfile(dir)
+				var archived bytes.Buffer
+				if err := toml.NewEncoder(&archived).Encode(struct {
+					Profiles map[string]config.ProviderProfileConfig `toml:"provider_profiles"`
+				}{map[string]config.ProviderProfileConfig{"original": p}}); err != nil {
+					t.Fatal(err)
+				}
+				original, request, bridge, mappingFile := filepath.Join(dir, "original.toml"), filepath.Join(dir, "request.txt"), filepath.Join(dir, "bridge"), filepath.Join(dir, "mapping.json")
+				for path, body := range map[string][]byte{original: archived.Bytes(), request: []byte("preserved request association"), bridge: []byte("historical bridge"), p.Command: []byte("fixture runtime")} {
+					if err := os.WriteFile(path, body, 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				old, a, b, c, err := providerHistoricalIdentityFromFiles("original", id, original, request, bridge)
+				if err != nil {
+					t.Fatal(err)
+				}
+				mapping := providerHistoricalIdentityMap{Schema: providerHistoricalMapPolicy, Profile: "original", HistoricalIdentitySHA256: old.Hash(), CurrentIdentitySHA256: id.Hash(), ConfigSHA256: id.ConfigSHA256(), OriginalProfileSHA256: a, RequestEvidenceSHA256: b, RequestBridgeSHA256: c, Binding: reservation.Binding, Nonce: reservation.Nonce, ReservationSHA256: reservation.SHA256, LedgerSHA256: ledgerSHA, ScopeSHA256: sha256StringCLI(string(id.SubscriptionCapacityScope())), Association: "reviewed_original_configuration_and_request_time_bridge_for_exact_reservation", ReviewedAt: now}
+				mapping.Envelope, err = signProviderLocalReview(t.Context(), p, id, providerHistoricalMapPolicy, providerHistoricalMapDigest(mapping), now, sign)
+				if err != nil {
+					t.Fatal(err)
+				}
+				mappingData, err = json.Marshal(mapping)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = os.WriteFile(mappingFile, mappingData, 0600); err != nil {
+					t.Fatal(err)
+				}
+				e.IdentitySHA256 = old.Hash()
+				historicalSigningProfile = p
+				historicalSigningIdentity = old
+				if scenario == "historical-mapped" || scenario == "historical-envelope" {
+					mappingArgs = []string{"--identity-map-file", mappingFile, "--original-profile-file", original, "--request-evidence-file", request, "--request-bridge-file", bridge}
+				}
+			}
 			e.SchemaVersion, e.OperationIDSHA256 = "ntm.provider-usage-evidence.v2", ""
 			started := row.CreatedAt
 			e.RequestStartedAt = &started
@@ -136,6 +385,10 @@ func TestProviderOrphanSettlementSurface(t *testing.T) {
 				t.Fatal(err)
 			}
 			review := providerUsageSourceReview{Schema: "ntm.provider-usage-source-review.v3", EvidenceSHA256: sha256TextCLI(data), SourceSHA256: sha256TextCLI(source), IdentitySHA256: id.Hash(), OperationBinding: row.BindingHash, NonceSHA256: nonce, OrphanReservationSHA256: reservation.SHA256, SubscriptionScopeSHA256: sha256StringCLI(string(id.SubscriptionCapacityScope())), LedgerPathSHA256: ledgerSHA, OrphanAssociation: "original_runtime_identity_binding_nonce_and_exact_row_associated_with_authenticated_request", ProviderAccount: e.ProviderAccount, ProviderRequest: e.ProviderRequest, SourceAuthentication: "authenticated_support_reply_reviewed", RequestAssociation: "original_request_confirmed_by_provider_source", ReviewedAt: now}
+			if mappingData != nil {
+				review.HistoricalIdentityMappingSHA256 = sha256TextCLI(mappingData)
+				review.IdentitySHA256 = e.IdentitySHA256
+			}
 			switch scenario {
 			case "wrong-row":
 				review.OrphanReservationSHA256 = strings.Repeat("e", 64)
@@ -154,12 +407,24 @@ func TestProviderOrphanSettlementSurface(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			sig, err := newProviderNativeTestSigner()(t.Context(), payload)
+			sig, err := sign(t.Context(), payload)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if scenario != "unsigned" {
 				review.Attestation = &sig
+			}
+			if scenario == "historical-envelope" {
+				review.Attestation = nil
+				review.Envelope, err = signProviderLocalReview(t.Context(), historicalSigningProfile, historicalSigningIdentity, providerUsageReviewPolicy, providerUsageReviewDigest(review), review.ReviewedAt, func(ctx context.Context, payload []byte) (providerattestation.SignatureMetadata, error) {
+					if err := providerattestation.ValidateBridgePayload(payload); err != nil {
+						return providerattestation.SignatureMetadata{}, err
+					}
+					return sign(ctx, payload)
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 			reviewData, err := json.Marshal(review)
 			if err != nil {
@@ -191,6 +456,7 @@ func TestProviderOrphanSettlementSurface(t *testing.T) {
 					return open()
 				}, func(*cobra.Command, string) (providerattestation.KeyMetadata, error) { return sig.KeyMetadata, nil })
 				args := []string{"--profile", "original", "--binding-sha256", row.BindingHash, "--evidence-file", filepath.Join(dir, "evidence.json"), "--source-file", filepath.Join(dir, "source.txt"), "--review-file", filepath.Join(dir, "review.json")}
+				args = append(args, mappingArgs...)
 				if apply {
 					args = append(args, "--apply")
 				}
@@ -201,7 +467,7 @@ func TestProviderOrphanSettlementSurface(t *testing.T) {
 			}
 			before := open().Snapshot(id)
 			err = run(false)
-			valid := scenario == "ready" || scenario == "changed-after-preview"
+			valid := scenario == "ready" || scenario == "historical-mapped" || scenario == "historical-envelope" || scenario == "changed-after-preview"
 			if (err == nil) != valid {
 				t.Fatalf("preview: %v", err)
 			}
