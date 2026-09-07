@@ -7,6 +7,11 @@ requires the exact runtime terminal event, independent workspace verification,
 cleanup and the appropriate local capacity release. Local cancellation does not
 establish remote generation termination or resume support.
 
+Readiness discovers task evidence in the ledger beside the selected configuration.
+When comparing profiles from different configurations, query each owning ledger
+and retain each report's provenance. An empty candidate ledger does not erase a
+verified task in the normal ledger; combine only matching exact identity hashes.
+
 ## Dispatch audit
 
 | Entry point | Owning boundary |
@@ -466,7 +471,33 @@ erase that failure or demonstrate that host-clock stability has been repaired.
 The noisy-pane test now waits for the static marker and for actual window activity
 to advance beyond its first observation instead of assuming a fixed sleep suffices.
 
+## Clock correction evidence
+
+Each newly produced command receipt also carries a one-based sequence and start/end
+elapsed nanoseconds measured from one process-local monotonic origin. UTC remains
+unchanged. The optional timing object survives JSON serialization, while its absence
+preserves historical receipt bytes. Deterministic tests step the wall clock forward
+and backward without altering monotonic ordering. These fields are diagnostic only:
+the existing UTC bounds, signed identity, manifest, command, isolation, process wait
+and cleanup checks still apply.
+
+A September 7 recurrence recorded go-vet taking 2.258825362 seconds by monotonic
+time while UTC moved backward 330.271693 milliseconds. That failed qualification
+evidence remains rejected. Neither successful commands nor a later green rerun
+authorize relabeling it. The observed host had Windows Time stopped and Linux NTP
+reporting an approximately -2.56 second offset; competing clock correction is an
+investigation hypothesis, not an established attribution to a particular service.
+
+Replacing UTC ordering as an admission boundary requires a new explicitly versioned
+receipt contract: one controller-issued attempt nonce, consecutive event sequence,
+one process-local origin for all tool and command events, no overlapping command
+intervals, a controller-owned monotonic deadline, and exact process/manifest binding.
+Wall time remains an audit observation and freshness still needs a trusted authority.
+Do not compare unrelated process offsets, retrofit offsets into old receipts, or
+accept a self-reported duration as proof of completion or remote usage settlement.
+
 ## Historical Z.ai reservations without nonces
+
 
 The existing reconciliation plan now spells out the missing historical evidence.
 Exact nonce settlement cannot accept the original nonce-less reservation. Do not

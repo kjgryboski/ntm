@@ -110,17 +110,27 @@ type VerificationManifest struct {
 // CommandVerification is redacted evidence for one command.  It never retains
 // stdout, stderr, command arguments, credentials, or repository paths.
 type CommandVerification struct {
-	ID              string    `json:"id"`
-	CommandSHA256   string    `json:"command_sha256"`
-	OutputSHA256    string    `json:"output_sha256"`
-	OutputBytes     int64     `json:"output_bytes"`
-	ExitCode        int       `json:"exit_code"`
-	TimedOut        bool      `json:"timed_out"`
-	ProcessWaited   bool      `json:"process_waited"`
-	CleanupVerified bool      `json:"cleanup_verified"`
-	StartedAt       time.Time `json:"started_at"`
-	CompletedAt     time.Time `json:"completed_at"`
-	ErrorSHA256     string    `json:"error_sha256,omitempty"`
+	ID              string              `json:"id"`
+	CommandSHA256   string              `json:"command_sha256"`
+	OutputSHA256    string              `json:"output_sha256"`
+	OutputBytes     int64               `json:"output_bytes"`
+	ExitCode        int                 `json:"exit_code"`
+	TimedOut        bool                `json:"timed_out"`
+	ProcessWaited   bool                `json:"process_waited"`
+	CleanupVerified bool                `json:"cleanup_verified"`
+	StartedAt       time.Time           `json:"started_at"`
+	CompletedAt     time.Time           `json:"completed_at"`
+	ErrorSHA256     string              `json:"error_sha256,omitempty"`
+	Timing          *VerificationTiming `json:"timing,omitempty"`
+}
+
+// VerificationTiming records process-local ordering independently of wall time.
+// These offsets are diagnostic evidence, not a replacement for admission's UTC
+// bounds. They cannot be compared across processes or used to validate old receipts.
+type VerificationTiming struct {
+	Sequence           int   `json:"sequence"`
+	StartedElapsedNS   int64 `json:"started_elapsed_ns"`
+	CompletedElapsedNS int64 `json:"completed_elapsed_ns"`
 }
 
 // VerificationReceipt binds results to the resolved disposable worktree and
@@ -235,20 +245,24 @@ func (v *IsolatedVerifier) Verify(ctx context.Context, manifest VerificationMani
 		commands = append(commands, command)
 	}
 
+	monotonicOrigin := time.Now()
 	started := v.now().UTC()
 	receipt := VerificationReceipt{SchemaVersion: verifierSchemaVersion, ManifestSHA256: manifestDigest(resolved, manifest.Revision, manifest.CommandIDs), WorktreeSHA256: verifierHash(resolved), RevisionSHA256: verifierHash(manifest.Revision), NetworkIsolated: true, CredentialsCleared: true, PIDNamespaceIsolated: true, CleanupVerified: true, DisposableWorktree: true, StartedAt: started}
-	for _, command := range commands {
+	for index, command := range commands {
+		elapsedStarted := time.Since(monotonicOrigin).Nanoseconds()
 		commandStarted := v.now().UTC()
 		commandCtx, cancel := context.WithTimeout(ctx, command.Timeout)
 		outcome, runErr := v.runner.Run(commandCtx, bwrapPlan(resolved, command, v.goRoot))
 		timedOut := errors.Is(commandCtx.Err(), context.DeadlineExceeded)
 		cancel()
 		completed := v.now().UTC()
+		elapsedCompleted := time.Since(monotonicOrigin).Nanoseconds()
 		outputHash := outcome.OutputSHA256
 		if outputHash == "" {
 			outputHash = verifierHash(string(outcome.Output))
 		}
 		entry := CommandVerification{ID: command.ID, CommandSHA256: commandDigest(command), OutputSHA256: outputHash, OutputBytes: outcome.OutputBytes, ExitCode: outcome.ExitCode, TimedOut: timedOut, ProcessWaited: outcome.ProcessWaited, CleanupVerified: outcome.CleanupVerified, StartedAt: commandStarted, CompletedAt: completed}
+		entry.Timing = &VerificationTiming{Sequence: index + 1, StartedElapsedNS: elapsedStarted, CompletedElapsedNS: elapsedCompleted}
 		if !outcome.CleanupVerified {
 			receipt.CleanupVerified = false
 		}

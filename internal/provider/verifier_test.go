@@ -82,6 +82,44 @@ func TestVerifierGoRootSurvivesTrimpathWithoutMountingAnUnboundRoot(t *testing.T
 	}
 }
 
+func TestVerifierPreservesMonotonicDiagnosticsAcrossWallClockJumps(t *testing.T) {
+	for _, jump := range []time.Duration{-time.Hour, time.Hour} {
+		t.Run(jump.String(), func(t *testing.T) {
+			runner := &fakeVerifierRunner{outcome: verificationOutcome{ProcessWaited: true, CleanupVerified: true}}
+			verifier := testVerifier(t, runner, fakeVerifierInspector{path: "/worktrees/disposable", revision: verifierTestRevision, disposable: true})
+			base := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+			calls := 0
+			verifier.now = func() time.Time {
+				calls++
+				if calls >= 3 {
+					return base.Add(jump)
+				}
+				return base
+			}
+			receipt, err := verifier.Verify(t.Context(), VerificationManifest{Worktree: "/input/path", Revision: verifierTestRevision, CommandIDs: []string{"go-test", "go-vet"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Serialize to prove the ordering evidence survives the process boundary.
+			var decoded VerificationReceipt
+			if err := json.Unmarshal(mustJSON(t, receipt), &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if got := decoded.Commands[0].CompletedAt.Sub(decoded.Commands[0].StartedAt); got != jump {
+				t.Fatalf("UTC jump lost: %v", got)
+			}
+			var previous int64
+			for i, command := range decoded.Commands {
+				timing := command.Timing
+				if timing == nil || timing.Sequence != i+1 || timing.StartedElapsedNS < previous || timing.CompletedElapsedNS < timing.StartedElapsedNS {
+					t.Fatalf("invalid monotonic evidence: %+v", timing)
+				}
+				previous = timing.CompletedElapsedNS
+			}
+		})
+	}
+}
+
 func TestIsolatedVerifierBindsManifestAndBuildsCredentialFreeNetworkSandbox(t *testing.T) {
 	runner := &fakeVerifierRunner{outcome: verificationOutcome{Output: []byte("secret provider output"), OutputBytes: int64(len("secret provider output")), ExitCode: 0, ProcessWaited: true, CleanupVerified: true}}
 	verifier := testVerifier(t, runner, fakeVerifierInspector{path: "/worktrees/disposable", revision: verifierTestRevision, disposable: true})
