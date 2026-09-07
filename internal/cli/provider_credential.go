@@ -25,6 +25,138 @@ import (
 
 const providerCredentialOutputSchema = "ntm.provider-credential.v1"
 
+type primaryCodexQuota struct {
+	ObservedAt    time.Time `json:"observed_at"`
+	AccountSHA256 string    `json:"account_sha256"`
+	State         string    `json:"state"`
+	Allowed       bool      `json:"allowed"`
+	ResetAt       int64     `json:"reset_at,omitempty"`
+}
+
+func newProviderCodexQuotaCmd() *cobra.Command {
+	var name string
+	cmd := &cobra.Command{Use: "quota", Short: "Read exact Codex account quota without generation or spending an attempt", Args: cobra.NoArgs}
+	cmd.Flags().StringVar(&name, "profile", "", "Exact primary Codex profile")
+	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		cfg := loadSelectedConfigOrDefault()
+		if cfg == nil {
+			return errors.New("configuration unavailable")
+		}
+		p, err := cfg.ProviderProfile(name)
+		if err != nil {
+			return err
+		}
+		id, _, err := validatePrimaryComparisonProfile(p)
+		if err != nil {
+			return err
+		}
+		if id.Provider() != "openai" || id.Runtime() != "codex" {
+			return errors.New("quota lookup requires primary Codex identity")
+		}
+		out, err := readPrimaryCodexQuota(providerCommandContext(cmd), p.RuntimeHome)
+		if encodeErr := encodeIndentedJSON(cmd.OutOrStdout(), out); encodeErr != nil {
+			return encodeErr
+		}
+		return err
+	}
+	return cmd
+}
+
+func readPrimaryCodexQuota(ctx context.Context, home string) (primaryCodexQuota, error) {
+	client := &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	return fetchPrimaryCodexQuota(ctx, home, client)
+}
+
+// The fixed endpoint and account header mirror the pinned Codex backend client.
+// Tokens and response bodies remain memory-only, including all error paths.
+func fetchPrimaryCodexQuota(ctx context.Context, home string, client interface {
+	Do(*http.Request) (*http.Response, error)
+}) (primaryCodexQuota, error) {
+	out := primaryCodexQuota{ObservedAt: time.Now().UTC(), State: "unknown"}
+	fail := func(state string) (primaryCodexQuota, error) {
+		out.State = state
+		return out, fmt.Errorf("Codex quota preflight blocked: %s; no generation attempt spent", state)
+	}
+	b, err := readPrimaryCredentialSnapshot(filepath.Join(home, "auth.json"))
+	if err != nil {
+		return fail("credential_unavailable")
+	}
+	var auth struct {
+		Tokens struct {
+			Access  string `json:"access_token"`
+			Account string `json:"account_id"`
+		} `json:"tokens"`
+	}
+	if !primaryComparisonCredentialValid(b, "codex") || json.Unmarshal(b, &auth) != nil || auth.Tokens.Account == "" {
+		return fail("account_unbound")
+	}
+	out.AccountSHA256 = sha256StringCLI(auth.Tokens.Account)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://chatgpt.com/backend-api/wham/usage", nil)
+	if err != nil {
+		return fail("request_setup_failed")
+	}
+	req.Header.Set("Authorization", "Bearer "+auth.Tokens.Access)
+	req.Header.Set("ChatGPT-Account-Id", auth.Tokens.Account)
+	req.Header.Set("User-Agent", "OpenAI File Downloader, XaiImageApiFetch/1.0")
+	response, err := client.Do(req)
+	if err != nil {
+		return fail("transport_error")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fail("http_rejected")
+	}
+	b, err = io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
+	if err != nil || len(b) > 1<<20 {
+		return fail("response_incomplete")
+	}
+	var usage struct {
+		Account string `json:"account_id"`
+		Rate    *struct {
+			Allowed *bool `json:"allowed"`
+			Reached *bool `json:"limit_reached"`
+			Primary *struct {
+				Used  *float64 `json:"used_percent"`
+				Reset int64    `json:"reset_at"`
+			} `json:"primary_window"`
+			Secondary *struct {
+				Used  *float64 `json:"used_percent"`
+				Reset int64    `json:"reset_at"`
+			} `json:"secondary_window"`
+		} `json:"rate_limit"`
+		Additional []json.RawMessage `json:"additional_rate_limits"`
+	}
+	if json.Unmarshal(b, &usage) != nil || usage.Account != auth.Tokens.Account {
+		return fail("server_account_unverified")
+	}
+	if usage.Rate == nil || usage.Rate.Allowed == nil || usage.Rate.Reached == nil || usage.Rate.Primary == nil || usage.Rate.Primary.Used == nil {
+		return fail("quota_evidence_incomplete")
+	}
+	window := usage.Rate.Primary
+	if *window.Used < 0 || *window.Used > 100 {
+		return fail("quota_evidence_invalid")
+	}
+	if *window.Used >= 100 {
+		out.ResetAt = window.Reset
+	}
+	if secondary := usage.Rate.Secondary; secondary != nil {
+		if secondary.Used == nil || *secondary.Used < 0 || *secondary.Used > 100 {
+			return fail("quota_evidence_invalid")
+		}
+		if *secondary.Used >= 100 {
+			out.ResetAt = max(out.ResetAt, secondary.Reset)
+		}
+	}
+	if !*usage.Rate.Allowed || *usage.Rate.Reached || *window.Used >= 100 || (usage.Rate.Secondary != nil && *usage.Rate.Secondary.Used >= 100) {
+		return fail("quota_exhausted")
+	}
+	if len(usage.Additional) != 0 {
+		return fail("model_bucket_requires_review")
+	}
+	out.State, out.Allowed = "available_at_observation", true
+	return out, nil
+}
+
 type providerCredentialStore interface {
 	Get(context.Context, string) ([]byte, error)
 	Put(context.Context, string, []byte) error
@@ -63,7 +195,7 @@ type providerCredentialOutput struct {
 
 func newProviderCredentialCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "credential", Short: "Manage exact provider credentials in native OS secure storage"}
-	cmd.AddCommand(newProviderCredentialStatusCmd(), newProviderCredentialSetCmd(), newProviderCredentialRemoveCmd(), newProviderCredentialRefreshSnapshotCmd())
+	cmd.AddCommand(newProviderCredentialStatusCmd(), newProviderCredentialSetCmd(), newProviderCredentialRemoveCmd(), newProviderCredentialRefreshSnapshotCmd(), newProviderCodexQuotaCmd())
 	return cmd
 }
 

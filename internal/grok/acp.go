@@ -670,6 +670,10 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	events := readRPCEvents(proc.Stdout())
 	promptMayHaveBeenAccepted := false
 	var updates updateAccumulator
+	var executionLog *os.File
+	var executionOffset int64
+	var executionSession string
+	var terminalResponse bool
 
 	// Closing stdin and reaping the child is mandatory even after a confirmed
 	// reply: this is a one-shot adapter, not a daemon owner. This local cleanup
@@ -689,6 +693,13 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 		observation.AssistantTextBytes = updates.bytes
 		observation.ReplyBoundaries = updates.replyBoundaries
 		observation.AcknowledgementVerified = updates.nonce.verified
+		observation.Execution = provider.GrokExecutionObservation{PromptWritten: promptMayHaveBeenAccepted, TerminalResponse: terminalResponse, LogEvidence: "unavailable"}
+		if executionLog != nil {
+			stages := observeExecutionLog(io.NewSectionReader(executionLog, executionOffset, 4<<20), executionSession)
+			stages.PromptWritten, stages.TerminalResponse = promptMayHaveBeenAccepted, terminalResponse
+			observation.Execution = stages
+			_ = executionLog.Close()
+		}
 		result.ProtocolObservation = observation.Redacted()
 		// Preserve counters on every exit, including a protocol failure before
 		// the successful-result construction below.
@@ -881,6 +892,20 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 	promptID := nextID
 	nextID++
 	failureStage = "prompt_write"
+	// Snapshot the already-open log inode immediately before this prompt. Old
+	// session history and a replacement file cannot enter this turn's evidence.
+	if req.RuntimeVersion == "1.0.13" && filepath.IsAbs(req.RuntimeHome) {
+		path := filepath.Join(req.RuntimeHome, "logs", "unified.jsonl")
+		if info, e := os.Lstat(path); e == nil && info.Mode().IsRegular() {
+			if f, e := os.Open(path); e == nil {
+				if current, e := f.Stat(); e == nil && os.SameFile(info, current) {
+					executionLog, executionOffset, executionSession = f, current.Size(), session.SessionID
+				} else {
+					_ = f.Close()
+				}
+			}
+		}
+	}
 	promptMayHaveBeenAccepted, err = writeRequestWithEvidence(ctx, proc.Stdin(), promptID, "session/prompt", sessionPromptParams{
 		SessionID: session.SessionID,
 		Prompt:    []promptPart{{Type: "text", Text: req.Prompt}},
@@ -909,6 +934,7 @@ func Run(ctx context.Context, runner Runner, req Request) (result Result, return
 		return contextAwareFailure(result, promptMayHaveBeenAccepted, err)
 	}
 	var prompt sessionPromptResult
+	terminalResponse = true
 	if err := json.Unmarshal(promptRaw, &prompt); err != nil {
 		return finishFailure(result, ErrProtocol, protocolError(provider.ProtocolInvalidResult))
 	}
@@ -2007,6 +2033,63 @@ func persistBeforeCleanup(callback func(provider.ProtocolObservation) error, obs
 		}
 	}()
 	return callback(observation)
+}
+
+// Labels are pinned to grok-build bb7f39d's acp_agent.rs, prompt_queue.rs and
+// turn.rs. inference_start precedes sampler submission: it does not prove an
+// HTTP request reached xAI. Raw context, prompt IDs and session IDs never escape.
+func observeExecutionLog(reader io.Reader, session string) provider.GrokExecutionObservation {
+	out := provider.GrokExecutionObservation{LogEvidence: "unobserved"}
+	if session == "" {
+		out.LogEvidence = "unavailable"
+		return out
+	}
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 4096), 1<<20)
+	pid := 0
+	bytesRead := 0
+	for scanner.Scan() {
+		bytesRead += len(scanner.Bytes()) + 1
+		if bytesRead >= 4<<20 {
+			out.LogEvidence = "incomplete"
+			break
+		}
+		var entry struct {
+			SID     string `json:"sid"`
+			PID     int    `json:"pid"`
+			Message string `json:"msg"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &entry) != nil {
+			out.LogEvidence = "incomplete"
+			continue
+		}
+		if entry.SID != session || entry.PID <= 0 {
+			continue
+		}
+		if entry.Message == "prompt received" && pid == 0 {
+			pid = entry.PID
+		}
+		if entry.PID != pid {
+			continue
+		}
+		switch entry.Message {
+		case "prompt received":
+			out.PromptReceived++
+		case "shell.prompt.queued":
+			out.Queued++
+		case "shell.handle_prompt.start":
+			out.Dispatched++
+		case "shell.turn.inference_start":
+			out.InferenceSubmissions++
+		}
+	}
+	if scanner.Err() != nil {
+		out.LogEvidence = "incomplete"
+	}
+	if out.LogEvidence != "incomplete" && out.PromptReceived > 0 {
+		out.LogEvidence = "observed"
+	}
+	return out
 }
 
 func (a *updateAccumulator) observeProtocol(event rpcEvent) {

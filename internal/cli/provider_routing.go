@@ -339,7 +339,11 @@ func runProviderAssignment(cmd *cobra.Command, request providerAssignmentRequest
 			return &providerEnvironmentError{reason: "prerequisite_deadline_expired"}
 		}
 		if !request.CloseSession {
-			if err := reserveProviderExperiment(request.OperationID, identity.Hash(), sha256StringCLI(request.Prompt)); err != nil {
+			purpose := "workspace"
+			if request.ParentSession != "" {
+				purpose = "resume"
+			}
+			if err := reserveProviderPurpose(request.OperationID, identity.Hash(), sha256StringCLI(request.Prompt), purpose); err != nil {
 				return err
 			}
 		}

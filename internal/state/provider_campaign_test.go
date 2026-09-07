@@ -9,6 +9,51 @@ import (
 	"testing"
 )
 
+func TestCampaignConditionalWorkspaceSlotCannotBecomeRetry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "campaign.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := strings.Repeat("a", 64)
+	if err = s.ConfigureProviderCampaign("conditional", 2, 0, d); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.ReserveProviderCampaignPurpose("conditional", "qualification-failed", d, d, "qualification"); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.BindProviderCampaignCondition("conditional", 2, "workspace", d, d); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if s.ReserveProviderCampaignPurpose("conditional", "retry", d, d, "qualification") == nil {
+		t.Fatal("conditional slot spent as qualification retry")
+	}
+	if s.ReserveProviderCampaignAttempt("conditional", "bypass", d, d) == nil {
+		t.Fatal("generic route bypassed condition")
+	}
+	if s.ReserveProviderCampaignPurpose("conditional", "other-account", strings.Repeat("b", 64), d, "workspace") == nil {
+		t.Fatal("different identity admitted")
+	}
+	status, err := s.ProviderCampaign("conditional")
+	if err != nil || status.Used != 1 {
+		t.Fatalf("denials spent slot: %+v %v", status, err)
+	}
+	if s.BindProviderCampaignCondition("conditional", 2, "qualification", d, d) == nil {
+		t.Fatal("condition overwritten")
+	}
+	if err = s.ReserveProviderCampaignPurpose("conditional", "qualified-task", d, d, "workspace"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestProviderCampaignCeilingSurvivesConcurrentReservationsAndReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "budget.db")
 	s, err := Open(path)

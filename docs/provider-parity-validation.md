@@ -381,8 +381,14 @@ credential expiry, lifecycle evidence and current admission remain separate.
 `attempt_ceiling_remaining` is the campaign's unused ceiling. `authorized_attempts`
 is zero for a missing or exhausted campaign and null when positive unused slots
 have conditions the controller cannot evaluate. Inspect the bound authorization
-before dispatch: a slot reserved for an ordinary task after successful
-qualification is never a retry allowance after qualification fails.
+before dispatch. Bind a conditional slot with `provider campaign --id ID
+--slot N --slot-purpose workspace --slot-identity-sha256 IDENTITY_SHA
+--authorization-sha256 AUTHORIZATION_SHA`. The immutable condition is checked in
+the same transaction as attempt reservation, survives restart and cannot be
+overwritten. `qualification` and `resume` are also supported purposes. Only the
+qualified managed workspace routes emit `workspace`; generic experiments and
+qualification retries cannot spend that slot. Existing ceilings without bound
+conditions still require review of their original authorization.
 
 The September 6 resolution inspection authenticated the owner's newer Codex o08
 snapshot against the fixed usage endpoint and verified the original account.
@@ -391,6 +397,35 @@ existing refresh command preserved a private backup and the same runtime identit
 One newly scoped qualification then returned `usageLimitExceeded`, not retrying,
 before tools. The same account's authenticated usage response confirmed the weekly
 window at 100%, `allowed=false`. The conditional ordinary task remains unspent.
+
+`provider credential quota --profile EXACT_CODEX_PROFILE` performs a fixed,
+authenticated usage GET using that profile's token and account header, verifies
+the returned account, and emits only a hashed account, observation time, decision
+and reset time. No generation, token refresh, credit reset or attempt reservation
+occurs. Redirects, missing authority, invalid windows and unreviewed additional
+model buckets fail closed. Primary Codex qualification performs this check before
+claiming its experiment or spending the campaign slot. Ordinary Codex work checks
+before claiming a new operation; completed receipt replay does not require quota.
+An available observation is not a guarantee of capacity at a later instant.
+
+## Grok execution-stage observations
+
+For pinned Grok 1.0.13, the controller snapshots the existing unified log inode
+and offset immediately before writing the prompt. Before cleanup and signing it
+extracts only `prompt received`, `shell.prompt.queued`,
+`shell.handle_prompt.start`, and `shell.turn.inference_start` counts for the
+selected session and the receiving process. Other messages and all context stay
+private. Logs absent, malformed or over the four MiB budget remain explicitly
+unavailable or incomplete. The matching terminal ACP response is separate.
+
+The producer contracts are in grok-build revision
+`bb7f39d5858cbf5e00de639367f59debbdcb0138`, `acp_agent.rs`,
+`acp_session_impl/prompt_queue.rs` and `acp_session_impl/turn.rs`.
+Inference start precedes sampler submission: it does not prove a network request
+reached xAI. These diagnostics neither establish remote cancellation nor grant
+qualification. Missing execution fields retain the canonical form of historical
+signed receipts. Tests distinguish receipt, queue, dispatch and inference, reject
+other processes and unbound history, and check historical serialization.
 
 ## Historical Z.ai reservations without nonces
 
@@ -412,11 +447,15 @@ not satisfy that requirement. This plan makes no ledger mutation or admission gr
 and matches every current finding to a reviewed disposition on exact source bytes.
 Both CSV files use the existing seven-column schema:
 `severity,rule,file,line,source_sha256,disposition,reason`.
-Use the complete current scanner inventory; its disposition/reason columns may
-be empty because only the pinned review grants a disposition. Preserve raw output
-and the inventory extraction alongside it. The checker does not itself extract
-or prove completeness of a scanner report; the extraction must be independently
-reviewed. It rejects an empty inventory, changed source, new/changed locations or
+The raw report must now be a complete ast-grep JSON array. The checker derives
+every normalized finding directly from that pinned report and current source.
+The current CSV is optional; if provided, it must equal the raw report's complete
+multiset, including duplicates. `--normalize` emits that complete CSV for review
+without granting a verdict. Summary JSON and capped text reports are rejected
+because they cannot establish extraction completeness. This closes the supplied
+CSV omission gap, but covers only that ast-grep report: UBS's separate heuristics
+and summary totals still require their own raw review. The output identifies this
+scope explicitly. It rejects an empty inventory, changed source, new/changed locations or
 rules, extra duplicates, invalid dispositions, changed artifact hashes and paths
 outside the source root. It never edits reports, changes severity or grants
 provider readiness. Success means the reviewed inventory matches, not that the

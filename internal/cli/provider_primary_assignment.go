@@ -385,6 +385,17 @@ func runPrimaryAssignment(cmd *cobra.Command, request providerAssignmentRequest,
 		return err
 	}
 	binding := sha256StringCLI(id.Hash() + "\x00" + request.OperationID + "\x00" + sha256StringCLI(request.Prompt) + "\x00" + cwd + "\x00" + request.RestartOf)
+	if id.Runtime() == "codex" {
+		existing, err := ledger.GetSendOperation(request.OperationID, primaryAssignmentScope)
+		if err != nil {
+			return err
+		}
+		if existing == nil {
+			if _, err := readPrimaryCodexQuota(ctx, profile.RuntimeHome); err != nil {
+				return err
+			}
+		}
+	}
 	row, won, err := ledger.ClaimSendOperation(&state.SendOperation{OperationID: request.OperationID, SessionName: primaryAssignmentScope, BindingHash: binding, PayloadSHA256: id.Hash(), CreatedAt: time.Now().UTC()})
 	if err != nil {
 		return err
@@ -459,7 +470,7 @@ func runPrimaryAssignment(cmd *cobra.Command, request providerAssignmentRequest,
 	if err := ctx.Err(); err != nil {
 		return &providerEnvironmentError{reason: "prerequisite_deadline_expired"}
 	}
-	if err := reserveProviderExperiment(request.OperationID, id.Hash(), binding); err != nil {
+	if err := reserveProviderPurpose(request.OperationID, id.Hash(), binding, "workspace"); err != nil {
 		return err
 	}
 	decision, err := acquireProviderGrokQualificationTurn(ctx, admission, id)

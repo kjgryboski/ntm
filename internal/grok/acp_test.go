@@ -1117,6 +1117,47 @@ func TestACPForeignStandardSessionUpdateCannotContributeEvidence(t *testing.T) {
 	}
 }
 
+func TestExecutionLogSeparatesQueueDispatchAndInference(t *testing.T) {
+	// Adding diagnostics must not change canonical bytes of old signed receipts.
+	var historical provider.ProtocolObservation
+	if err := json.Unmarshal([]byte(`{"method":"absent"}`), &historical); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(mustJSON(t, historical)), `"execution"`) {
+		t.Fatal("new field invalidates historical signature payload")
+	}
+	prefix := `{"sid":"session","pid":5,"msg":"prompt received","ctx":{"secret":"credential"}}` + "\n"
+	queue := `{"sid":"session","pid":5,"msg":"shell.prompt.queued"}` + "\n"
+	dispatch := `{"sid":"session","pid":5,"msg":"shell.handle_prompt.start"}` + "\n"
+	inference := `{"sid":"session","pid":5,"msg":"shell.turn.inference_start"}` + "\n"
+	for _, tc := range []struct {
+		data                          string
+		queued, dispatched, inference int
+	}{
+		{prefix, 0, 0, 0}, {prefix + queue, 1, 0, 0}, {prefix + queue + dispatch, 1, 1, 0}, {prefix + queue + dispatch + inference, 1, 1, 1},
+	} {
+		o := observeExecutionLog(strings.NewReader(tc.data), "session")
+		if o.PromptReceived != 1 || o.Queued != tc.queued || o.Dispatched != tc.dispatched || o.InferenceSubmissions != tc.inference || o.TerminalResponse {
+			t.Fatalf("stages=%+v", o)
+		}
+		b := mustJSON(t, o)
+		if strings.Contains(string(b), "credential") || strings.Contains(string(b), "session") {
+			t.Fatal("raw log escaped")
+		}
+	}
+	o := observeExecutionLog(strings.NewReader(queue+inference), "session")
+	if o.InferenceSubmissions != 0 {
+		t.Fatal("old or unbound prompt entered evidence")
+	}
+	o = observeExecutionLog(strings.NewReader(prefix+strings.ReplaceAll(inference, `"pid":5`, `"pid":7`)), "session")
+	if o.InferenceSubmissions != 0 {
+		t.Fatal("other process entered evidence")
+	}
+	if observeExecutionLog(strings.NewReader("malformed\n"), "session").LogEvidence != "incomplete" {
+		t.Fatal("malformed log hidden")
+	}
+}
+
 func TestProtocolObservationIsSavedBeforeCleanupEvenWhenSinkFails(t *testing.T) {
 	for _, sinkFailure := range []string{"", "error", "panic"} {
 		t.Run(sinkFailure, func(t *testing.T) {

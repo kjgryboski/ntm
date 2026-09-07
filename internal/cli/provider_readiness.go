@@ -703,7 +703,7 @@ func providerReadinessCampaign() (*state.ProviderCampaign, error) {
 }
 
 func providerCampaignObservation(c state.ProviderCampaign) map[string]any {
-	return map[string]any{"id": c.ID, "limit": c.Limit, "used": c.Used, "remaining": max(0, c.Limit-c.Used), "authorization_sha256": c.AuthorizationSHA256, "unit": "dispatch_attempt", "runtime_transports": "one attempt per runtime dispatch; may contain multiple provider requests", "native_api": "one attempt per HTTP generation round", "billing_usage": false, "refunded_on_failure": false}
+	return map[string]any{"id": c.ID, "limit": c.Limit, "used": c.Used, "remaining": max(0, c.Limit-c.Used), "conditions": c.Conditions, "authorization_sha256": c.AuthorizationSHA256, "unit": "dispatch_attempt", "runtime_transports": "one attempt per runtime dispatch; may contain multiple provider requests", "native_api": "one attempt per HTTP generation round", "billing_usage": false, "refunded_on_failure": false}
 }
 
 func providerReadinessCapacity(capacity providerDoctorCapacity, campaign *state.ProviderCampaign) map[string]any {

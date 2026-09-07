@@ -78,11 +78,16 @@ func runBudgetedGrokSession(ctx context.Context, runner grok.LifecycleRunner, re
 func newProviderCampaignCmd() *cobra.Command {
 	var id, evidence string
 	var limit, previous int
+	var ordinal int
+	var purpose, identity string
 	cmd := &cobra.Command{Use: "campaign", Short: "Inspect or explicitly authorize a total provider experiment budget", Args: cobra.NoArgs}
 	cmd.Flags().StringVar(&id, "id", "", "Campaign identifier")
 	cmd.Flags().IntVar(&limit, "limit", 0, "Authorize this total attempt ceiling (1-100); omitted reads status")
 	cmd.Flags().IntVar(&previous, "previous-limit", 0, "Required current ceiling when explicitly authorizing an increase")
 	cmd.Flags().StringVar(&evidence, "authorization-sha256", "", "Digest of the authorization for creating or increasing this campaign")
+	cmd.Flags().IntVar(&ordinal, "slot", 0, "Permanently narrow this unspent attempt number")
+	cmd.Flags().StringVar(&purpose, "slot-purpose", "", "Required controller operation: qualification, workspace, or resume")
+	cmd.Flags().StringVar(&identity, "slot-identity-sha256", "", "Exact identity required for this slot")
 	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
 		if !validProviderNativeOperationID(id) {
 			return errors.New("valid campaign ID required")
@@ -92,6 +97,16 @@ func newProviderCampaignCmd() *cobra.Command {
 			return err
 		}
 		defer store.Close()
+		if ordinal != 0 {
+			if limit != 0 || !validProviderNativeDigest(identity) || !validProviderNativeDigest(evidence) {
+				return errors.New("bind an existing slot separately with exact identity and authorization digests")
+			}
+			if err = store.BindProviderCampaignCondition(id, ordinal, purpose, identity, evidence); err != nil {
+				return err
+			}
+		} else if purpose != "" || identity != "" {
+			return errors.New("slot condition requires --slot")
+		}
 		if limit != 0 {
 			if !validProviderNativeDigest(evidence) {
 				return errors.New("campaign authorization digest required")
@@ -110,6 +125,10 @@ func newProviderCampaignCmd() *cobra.Command {
 }
 
 func reserveProviderExperiment(attempt, identity, evidence string) error {
+	return reserveProviderPurpose(attempt, identity, evidence, "experiment")
+}
+
+func reserveProviderPurpose(attempt, identity, evidence, purpose string) error {
 	if !validProviderNativeOperationID(providerCampaignID) || !validProviderNativeOperationID(attempt) || !validProviderNativeDigest(identity) || !validProviderNativeDigest(evidence) {
 		return errors.New("managed provider dispatch requires --campaign-id and a bound attempt")
 	}
@@ -118,7 +137,7 @@ func reserveProviderExperiment(attempt, identity, evidence string) error {
 		return err
 	}
 	defer store.Close()
-	return store.ReserveProviderCampaignAttempt(providerCampaignID, attempt, identity, evidence)
+	return store.ReserveProviderCampaignPurpose(providerCampaignID, attempt, identity, evidence, purpose)
 }
 
 func runBudgetedCodexStructured(ctx context.Context, spec zai.CodexRunSpec) (zai.CodexRunReceipt, error) {

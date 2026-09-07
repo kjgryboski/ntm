@@ -20,6 +20,48 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/providercredential"
 )
 
+type quotaHTTPFixture func(*http.Request) (*http.Response, error)
+
+func (f quotaHTTPFixture) Do(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestCodexQuotaPreflightBindsAccountAndFailsClosed(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "auth.json"), []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"secret-token","account_id":"bound-account"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, body string
+		status     int
+		allowed    bool
+	}{
+		{"available", `{"account_id":"bound-account","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":25}}}`, 200, true},
+		{"exhausted", `{"account_id":"bound-account","rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"used_percent":100,"reset_at":1789165458}}}`, 200, false},
+		{"wrong-account", `{"account_id":"other","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":0}}}`, 200, false},
+		{"missing-authority", `{"account_id":"bound-account","rate_limit":{"primary_window":{"used_percent":0}}}`, 200, false},
+		{"redirect", `secret-body`, 302, false},
+		{"unauthorized", `secret-body`, 401, false},
+		{"oversized", strings.Repeat("x", (1<<20)+1), 200, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			out, err := fetchPrimaryCodexQuota(t.Context(), home, quotaHTTPFixture(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if req.Method != "GET" || req.URL.String() != "https://chatgpt.com/backend-api/wham/usage" || req.Header.Get("ChatGPT-Account-Id") != "bound-account" || req.Header.Get("Authorization") != "Bearer secret-token" {
+					t.Fatal("request not bound to exact account")
+				}
+				return &http.Response{StatusCode: tc.status, Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+			}))
+			if calls != 1 || out.Allowed != tc.allowed || (err == nil) != tc.allowed {
+				t.Fatalf("quota=%+v err=%v", out, err)
+			}
+			b, _ := json.Marshal(out)
+			if strings.Contains(string(b), "secret") || strings.Contains(string(b), "bound-account") {
+				t.Fatal("private evidence escaped")
+			}
+		})
+	}
+}
+
 func TestClaudeRotatedSnapshotRequiresAuthenticatedOriginalAccount(t *testing.T) {
 	now := time.Now().UTC()
 	snapshot := func(token, refresh string, expiry time.Time) []byte {

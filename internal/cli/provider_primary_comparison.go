@@ -525,10 +525,15 @@ func runProviderPrimaryComparison(cmd *cobra.Command, profileName string, profil
 	if err := runCtx.Err(); err != nil {
 		return &providerEnvironmentError{reason: "prerequisite_deadline_expired"}
 	}
+	if id.Runtime() == "codex" {
+		if _, err := readPrimaryCodexQuota(runCtx, workspace.RuntimeHome); err != nil {
+			return err
+		}
+	}
 	if err := claimPrimaryComparisonExperiment(ledger, experimentID, id.Hash(), changeEvidence); err != nil {
 		return err
 	}
-	if err := reserveProviderExperiment(experimentID, id.Hash(), changeEvidence); err != nil {
+	if err := reserveProviderPurpose(experimentID, id.Hash(), changeEvidence, "qualification"); err != nil {
 		return err
 	}
 	decision, err := acquireProviderGrokQualificationTurn(runCtx, admission, id)

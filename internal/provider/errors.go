@@ -4,23 +4,44 @@ package provider
 // Redacted must be applied at persistence boundaries, including for test runners.
 // No request IDs, session IDs, parameters, or provider error text are retained.
 type ProtocolObservation struct {
-	Method                  string                `json:"method"`
-	RequestIDKind           string                `json:"request_id_kind"`
-	SessionMatch            string                `json:"session_match"`
-	Stage                   string                `json:"stage"`
-	Reason                  ProtocolFailureReason `json:"reason,omitempty"`
-	ToolEvents              int                   `json:"tool_events"`
-	ToolRequests            int                   `json:"tool_requests"`
-	ToolCompletions         int                   `json:"tool_completions"`
-	PermissionDenials       int                   `json:"permission_denials"`
-	BrokerRejectedCalls     int                   `json:"broker_rejected_calls,omitempty"`
-	AssistantTextChunks     int                   `json:"assistant_text_chunks,omitempty"`
-	AssistantTextBytes      int64                 `json:"assistant_text_bytes,omitempty"`
-	ReplyBoundaries         int                   `json:"reply_boundaries,omitempty"`
-	AcknowledgementVerified bool                  `json:"acknowledgement_verified,omitempty"`
+	Method                  string                   `json:"method"`
+	RequestIDKind           string                   `json:"request_id_kind"`
+	SessionMatch            string                   `json:"session_match"`
+	Stage                   string                   `json:"stage"`
+	Reason                  ProtocolFailureReason    `json:"reason,omitempty"`
+	ToolEvents              int                      `json:"tool_events"`
+	ToolRequests            int                      `json:"tool_requests"`
+	ToolCompletions         int                      `json:"tool_completions"`
+	PermissionDenials       int                      `json:"permission_denials"`
+	BrokerRejectedCalls     int                      `json:"broker_rejected_calls,omitempty"`
+	AssistantTextChunks     int                      `json:"assistant_text_chunks,omitempty"`
+	AssistantTextBytes      int64                    `json:"assistant_text_bytes,omitempty"`
+	ReplyBoundaries         int                      `json:"reply_boundaries,omitempty"`
+	AcknowledgementVerified bool                     `json:"acknowledgement_verified,omitempty"`
+	Execution               GrokExecutionObservation `json:"execution,omitzero"`
+}
+
+// Producer logs describe local execution, never remote termination or billing.
+type GrokExecutionObservation struct {
+	PromptWritten        bool   `json:"prompt_written"`
+	PromptReceived       int    `json:"prompt_received"`
+	Queued               int    `json:"queued"`
+	Dispatched           int    `json:"dispatched"`
+	InferenceSubmissions int    `json:"inference_submissions"`
+	TerminalResponse     bool   `json:"terminal_response"`
+	LogEvidence          string `json:"log_evidence"`
 }
 
 func (o ProtocolObservation) Redacted() ProtocolObservation {
+	switch o.Execution.LogEvidence {
+	case "observed", "unobserved", "incomplete", "unavailable":
+	default:
+		o.Execution.LogEvidence = "unavailable"
+	}
+	o.Execution.PromptReceived = max(0, o.Execution.PromptReceived)
+	o.Execution.Queued = max(0, o.Execution.Queued)
+	o.Execution.Dispatched = max(0, o.Execution.Dispatched)
+	o.Execution.InferenceSubmissions = max(0, o.Execution.InferenceSubmissions)
 	// Reviewed ACP client methods and Grok 1.0.13 notifications. Recognition
 	// for diagnostics never implies permission to execute a reverse request.
 	switch o.Method {

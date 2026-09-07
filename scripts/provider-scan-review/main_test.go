@@ -58,7 +58,7 @@ func TestCommandPinsRawReportAndReview(t *testing.T) {
 	if err := os.WriteFile(csvPath, data.Bytes(), 0600); err != nil {
 		t.Fatal(err)
 	}
-	raw := []byte("raw finding, warning\n")
+	raw := []byte(`[{"ruleId":"test.rule","severity":"warning","file":"fixture.go","range":{"start":{"line":0}}}]`)
 	if err := os.WriteFile(rawPath, raw, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -67,10 +67,29 @@ func TestCommandPinsRawReportAndReview(t *testing.T) {
 	if err := run(args, &out); err != nil {
 		t.Fatal(err)
 	}
+	omitted := []byte(`[{"ruleId":"test.rule","severity":"warning","file":"fixture.go","range":{"start":{"line":0}}},{"ruleId":"new.rule","severity":"warning","file":"fixture.go","range":{"start":{"line":0}}}]`)
+	if err := os.WriteFile(rawPath, omitted, 0600); err != nil {
+		t.Fatal(err)
+	}
+	args[len(args)-1] = digest(omitted)
+	if run(args, &out) == nil {
+		t.Fatal("omitted raw finding passed review")
+	}
 	if err := os.WriteFile(rawPath, []byte("changed report"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := run(args, &out); err == nil {
 		t.Fatal("changed raw report accepted")
+	}
+}
+
+func TestRawNormalizationRejectsSummariesAndIncompleteEntries(t *testing.T) {
+	for _, raw := range []string{`{"critical":2}`, `sampled text`, `[{"ruleId":"x"}]`, `[{"ruleId":"x","severity":"warning","file":"x.go","range":{"start":{"line":-1}}}]`} {
+		if _, err := normalizeRaw(t.TempDir(), []byte(raw)); err == nil {
+			t.Fatal("incomplete raw inventory accepted")
+		}
+	}
+	if sameInventory([]finding{{Rule: "x"}}, []finding{{Rule: "x"}, {Rule: "x"}}) {
+		t.Fatal("duplicate hidden")
 	}
 }
