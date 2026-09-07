@@ -17,6 +17,66 @@ import (
 
 const admissionConfigHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
+func TestOrphanReviewedSettlementStateRejections(t *testing.T) {
+	for _, scenario := range []string{"duplicate", "changed-row", "unavailable", "active-other-lease", "already-reconciled"} {
+		t.Run(scenario, func(t *testing.T) {
+			now := time.Now().UTC()
+			path := filepath.Join(t.TempDir(), "capacity.json")
+			c, err := NewSubscriptionAdmissionController(DefaultSubscriptionAdmissionConfig(), path, func() time.Time { return now }, func() float64 { return .5 })
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := subscriptionIdentity(t, "orphan", "glm-5.3", "https://api.z.ai/api/v1")
+			binding, nonce, review := strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64)
+			d := c.Acquire(id)
+			if !d.Allowed {
+				t.Fatal(d)
+			}
+			if err := c.BindReservation(id, d, binding, nonce); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.RecordUnknownUsage(id, d); err != nil {
+				t.Fatal(err)
+			}
+			c.Release(id, d)
+			r, err := c.InspectBoundUsage(id, binding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !c.plan.withAuthoritativeState(id.SubscriptionCapacityScope(), now, func(s *admissionState) {
+				switch scenario {
+				case "duplicate":
+					s.subscriptionUsage = append(s.subscriptionUsage, s.subscriptionUsage[0])
+				case "changed-row":
+					s.subscriptionUsage[0].Credits++
+				case "already-reconciled":
+					s.subscriptionUsage[0].Unknown = false
+				case "active-other-lease":
+					s.leases["another-owner"] = admissionLease{OwnerPID: int32(os.Getpid()), OwnerID: c.plan.ownerID, ExpiresAt: now.Add(time.Hour)}
+				}
+			}) {
+				t.Fatal("fixture mutation failed")
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "unavailable" {
+				c.plan.fallbackReason = "injected storage failure"
+			}
+			for _, apply := range []bool{false, true} {
+				if c.ReviewOrphanUsage(id, binding, nonce, r.SHA256, 2.5, now, review, apply) == nil {
+					t.Fatal("unsafe settlement accepted")
+				}
+			}
+			after, err := os.ReadFile(path)
+			if err != nil || string(before) != string(after) {
+				t.Fatal("rejection mutated reservation")
+			}
+		})
+	}
+}
+
 func TestLegacyReviewedSettlementAtomicReplayAndRejection(t *testing.T) {
 	for _, scenario := range []string{"replay", "active", "ambiguous", "stale", "wrong-binding", "unavailable"} {
 		t.Run(scenario, func(t *testing.T) {

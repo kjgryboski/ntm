@@ -118,12 +118,14 @@ type subscriptionUsageEvent struct {
 	// RecoveryAuthorizationSHA256 binds an explicit, signed owner
 	// authorization to a legacy unbound accounting repair. It is never model
 	// identity or automatic operation-to-usage evidence.
-	RecoveryAuthorizationSHA256 string `json:"recovery_authorization_sha256,omitempty"`
-	SettlementReviewSHA256      string `json:"settlement_review_sha256,omitempty"`
-	LegacyReservationSHA256     string `json:"legacy_reservation_sha256,omitempty"`
-	SettlementBindingSHA256     string `json:"settlement_binding_sha256,omitempty"`
-	OperationBindingSHA256      string `json:"operation_binding_sha256,omitempty"`
-	NonceSHA256                 string `json:"nonce_sha256,omitempty"`
+	RecoveryAuthorizationSHA256 string     `json:"recovery_authorization_sha256,omitempty"`
+	SettlementReviewSHA256      string     `json:"settlement_review_sha256,omitempty"`
+	LegacyReservationSHA256     string     `json:"legacy_reservation_sha256,omitempty"`
+	SettlementBindingSHA256     string     `json:"settlement_binding_sha256,omitempty"`
+	OperationBindingSHA256      string     `json:"operation_binding_sha256,omitempty"`
+	NonceSHA256                 string     `json:"nonce_sha256,omitempty"`
+	OrphanReservationSHA256     string     `json:"orphan_reservation_sha256,omitempty"`
+	OriginalObservedAt          *time.Time `json:"original_observed_at,omitempty"`
 	// Unknown records that a dispatched request could not be reconciled to
 	// provider-resolved model and token evidence. Its conservative reservation
 	// deliberately prevents additional spend in the same subscription scope.
@@ -510,7 +512,73 @@ func (c *SubscriptionAdmissionController) RecordUnknownUsage(identity provider.I
 // Replays are idempotent; conflicting reviews, unbound legacy rows and active
 // leases cannot be settled. A committed receipt survives controller crashes.
 func (c *SubscriptionAdmissionController) SettleReviewedUsage(identity provider.Identity, binding, nonce string, credits float64, completedAt time.Time, review string) error {
-	return c.settleReviewedUsage(identity, binding, nonce, "", credits, completedAt, review, true)
+	return c.ReviewBoundUsage(identity, binding, nonce, credits, completedAt, review, true)
+}
+
+// ReviewBoundUsage validates the current reservation through the same atomic
+// transaction for preview and apply. A successful preview never releases usage.
+func (c *SubscriptionAdmissionController) ReviewBoundUsage(identity provider.Identity, binding, nonce string, credits float64, completedAt time.Time, review string, apply bool) error {
+	return c.settleReviewedUsage(identity, binding, nonce, "", "", credits, completedAt, review, apply)
+}
+
+// BoundUsageReservation identifies one exact local row; it does not attest to
+// its original runtime identity or association with a provider request.
+type BoundUsageReservation struct {
+	SHA256     string    `json:"reservation_sha256"`
+	Binding    string    `json:"operation_binding_sha256"`
+	Nonce      string    `json:"nonce_sha256"`
+	ObservedAt time.Time `json:"observed_at"`
+}
+
+func (c *SubscriptionAdmissionController) InspectBoundUsage(identity provider.Identity, binding string) (BoundUsageReservation, error) {
+	var out BoundUsageReservation
+	if c == nil || c.plan == nil || !validIdentity(identity) || !validSubscriptionEvidenceDigest(binding) {
+		return out, errors.New("invalid bound reservation inspection")
+	}
+	count := 0
+	if !c.plan.withAuthoritativeState(identity.SubscriptionCapacityScope(), c.plan.now(), func(s *admissionState) {
+		for _, e := range s.subscriptionUsage {
+			if e.OperationBindingSHA256 != binding {
+				continue
+			}
+			count++
+			out = BoundUsageReservation{SHA256: boundUsageFingerprint(identity, e), Binding: binding, Nonce: e.NonceSHA256, ObservedAt: e.ObservedAt}
+			if e.OrphanReservationSHA256 != "" {
+				out.SHA256 = e.OrphanReservationSHA256
+				if e.OriginalObservedAt != nil {
+					out.ObservedAt = *e.OriginalObservedAt
+				}
+			}
+		}
+	}) {
+		return out, errors.New("shared reservation inspection unavailable")
+	}
+	if count != 1 || !validSubscriptionEvidenceDigest(out.Nonce) {
+		return BoundUsageReservation{}, errors.New("bound reservation missing, duplicated or nonce-less")
+	}
+	return out, nil
+}
+
+func boundUsageFingerprint(identity provider.Identity, e subscriptionUsageEvent) string {
+	payload, err := json.Marshal(struct {
+		Schema string
+		Scope  string
+		Row    subscriptionUsageEvent
+	}{"ntm.bound-reservation.v1", string(identity.SubscriptionCapacityScope()), e})
+	if err != nil {
+		return ""
+	}
+	hash := sha256.Sum256(payload)
+	return hex.EncodeToString(hash[:])
+}
+
+// ReviewOrphanUsage shares the normal settlement transaction. The caller must
+// hold the ledger absence guard and verify the pinned source review first.
+func (c *SubscriptionAdmissionController) ReviewOrphanUsage(identity provider.Identity, binding, nonce, reservation string, credits float64, completedAt time.Time, review string, apply bool) error {
+	if !validSubscriptionEvidenceDigest(reservation) {
+		return errors.New("exact orphan reservation required")
+	}
+	return c.settleReviewedUsage(identity, binding, nonce, "", reservation, credits, completedAt, review, apply)
 }
 
 // LegacyUsageReservations exposes exact local row fingerprints for owner review.
@@ -552,10 +620,10 @@ func (c *SubscriptionAdmissionController) ReviewLegacyUsage(identity provider.Id
 	if !validSubscriptionEvidenceDigest(reservation) {
 		return errors.New("exact reviewed legacy reservation required")
 	}
-	return c.settleReviewedUsage(identity, binding, "", reservation, credits, completedAt, review, apply)
+	return c.settleReviewedUsage(identity, binding, "", reservation, "", credits, completedAt, review, apply)
 }
 
-func (c *SubscriptionAdmissionController) settleReviewedUsage(identity provider.Identity, binding, nonce, legacy string, credits float64, completedAt time.Time, review string, apply bool) error {
+func (c *SubscriptionAdmissionController) settleReviewedUsage(identity provider.Identity, binding, nonce, legacy, orphan string, credits float64, completedAt time.Time, review string, apply bool) error {
 	if c == nil || c.plan == nil || !validIdentity(identity) || !validSubscriptionEvidenceDigest(binding) || (legacy == "" && !validSubscriptionEvidenceDigest(nonce)) || !validSubscriptionEvidenceDigest(review) || math.IsNaN(credits) || math.IsInf(credits, 0) || credits < 0 || completedAt.IsZero() || completedAt.After(c.plan.now()) {
 		return errors.New("invalid reviewed usage settlement")
 	}
@@ -582,6 +650,9 @@ func (c *SubscriptionAdmissionController) settleReviewedUsage(identity provider.
 			return
 		}
 		e := &s.subscriptionUsage[candidate]
+		if orphan != "" && (len(s.leases) != 0 || (e.OrphanReservationSHA256 != orphan && boundUsageFingerprint(identity, *e) != orphan)) {
+			return
+		}
 		if legacy != "" && (len(s.leases) != 0 || (e.OperationBindingSHA256 != "" && e.OperationBindingSHA256 != binding)) {
 			return
 		}
@@ -596,6 +667,10 @@ func (c *SubscriptionAdmissionController) settleReviewedUsage(identity provider.
 			return
 		}
 		if apply {
+			if orphan != "" {
+				observed := e.ObservedAt
+				e.OriginalObservedAt, e.OrphanReservationSHA256 = &observed, orphan
+			}
 			e.Credits, e.ObservedAt, e.Unknown, e.Conservative, e.SettlementReviewSHA256 = credits, completedAt.UTC(), false, false, review
 			e.LegacyReservationSHA256 = legacy
 			e.SettlementBindingSHA256 = binding

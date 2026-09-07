@@ -161,6 +161,66 @@ func TestReadinessConfigRoutesRejectAmbiguousFallbackBeforeInspection(t *testing
 	}
 }
 
+func TestOperationalHoldsRestrictPreviewWithoutErasingHistoricalEvidence(t *testing.T) {
+	now := time.Now().UTC()
+	identity := strings.Repeat("a", 64)
+	other := strings.Repeat("b", 64)
+	path := filepath.Join(t.TempDir(), "provider-operational-holds.json")
+	valid := fmt.Sprintf(`{"schema_version":"ntm.provider-operational-holds.v1","holds":{"%s":{"quota":{"observed_at":%q,"evidence_sha256":%q,"recheck_after":%q,"clear_condition":"exact_account_capacity_verified"}},"%s":{"clock":{"observed_at":%q,"evidence_sha256":%q,"clear_condition":"stable_clock_observation_verified"}}}}`, identity, now.Add(-2*time.Hour).Format(time.RFC3339Nano), strings.Repeat("c", 64), now.Add(-time.Hour).Format(time.RFC3339Nano), other, now.Add(-time.Hour).Format(time.RFC3339Nano), strings.Repeat("d", 64))
+	for _, scenario := range []string{"valid", "missing", "different-identity", "duplicate", "unknown-field", "unknown-kind", "bad-evidence", "future", "null", "directory"} {
+		t.Run(scenario, func(t *testing.T) {
+			lane := providerReadinessLane{Identity: providerDoctorIdentity{SHA256: identity}, WorkspaceEvidence: "qualified", AdmissionState: "ready_for_dispatch_checks", DurationFits: true, CapabilitySummary: []providerReadinessCapability{{Operation: "workspace_edit", State: "passed"}}}
+			data, current := valid, path
+			switch scenario {
+			case "missing":
+				current = filepath.Join(t.TempDir(), "absent.json")
+			case "different-identity":
+				lane.Identity.SHA256 = strings.Repeat("f", 64)
+			case "duplicate":
+				data = strings.Replace(data, `"quota":{`, `"quota":{},"quota":{`, 1)
+			case "unknown-field":
+				data = strings.Replace(data, `"clear_condition":`, `"cleared":true,"clear_condition":`, 1)
+			case "unknown-kind":
+				data = strings.Replace(data, `"quota":`, `"payload":`, 1)
+			case "bad-evidence":
+				data = strings.Replace(data, strings.Repeat("c", 64), "unverified", 1)
+			case "future":
+				data = strings.Replace(data, now.Add(-2*time.Hour).Format(time.RFC3339Nano), now.Add(time.Hour).Format(time.RFC3339Nano), 1)
+			case "null":
+				data = `{"schema_version":"ntm.provider-operational-holds.v1","holds":null}`
+			case "directory":
+				current = t.TempDir()
+			}
+			if scenario != "missing" && scenario != "directory" {
+				if err := os.WriteFile(current, []byte(data), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			applyProviderOperationalHolds(&lane, current, now)
+			preview := previewProviderAssignment(lane, []string{"workspace_edit"})
+			if scenario == "missing" || scenario == "different-identity" {
+				if len(lane.Blockers) != 0 || !preview.Eligible {
+					t.Fatalf("unrelated hold applied: %+v", lane)
+				}
+				return
+			}
+			if preview.Eligible || lane.AdmissionState != "blocked" || lane.WorkspaceEvidence != "qualified" || lane.CapabilitySummary[0].State != "passed" || lane.DispatchAuthorized {
+				t.Fatalf("hold changed evidence or granted admission: %+v", lane)
+			}
+			if scenario == "valid" {
+				if lane.OperationalHoldsState != "recorded" || lane.OperationalHoldsSHA256 != sha256StringCLI(valid) || len(lane.OperationalHolds) != 1 || len(lane.Blockers) != 1 || lane.Blockers[0] != "operational_hold:quota" {
+					t.Fatalf("wrong hold: %+v", lane)
+				}
+				if !strings.Contains(strings.Join(providerOperatorView(lane).NextActions, " "), "recheck time does not release") {
+					t.Fatal("reset semantics hidden")
+				}
+			} else if lane.OperationalHoldsState != "invalid" || !strings.Contains(strings.Join(lane.Blockers, " "), "operational_hold_record_invalid") {
+				t.Fatal("invalid record did not fail closed")
+			}
+		})
+	}
+}
+
 func TestOperatorViewNeverPromotesConditionalAttemptCeiling(t *testing.T) {
 	for _, remaining := range []int{-1, 0, 1, 2} {
 		lane := providerReadinessLane{WorkspaceEvidence: "qualified", Capacity: map[string]any{"experiment_attempts": map[string]any{"remaining": remaining}}, AssignmentPreview: providerAssignmentPreview{Eligible: true}}

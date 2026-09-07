@@ -34,23 +34,24 @@ const providerCodexCapacityRecoverySchema = "ntm.provider-codex-capacity-recover
 // This is a source-bound review record, not provider attestation. Matching a
 // caller's claims to local ledger fields cannot establish remote authenticity.
 type providerUsageEvidence struct {
-	SchemaVersion      string    `json:"schema_version"`
-	IdentitySHA256     string    `json:"identity_sha256"`
-	AccountAliasSHA256 string    `json:"account_alias_sha256"`
-	OperationIDSHA256  string    `json:"operation_id_sha256"`
-	OperationBinding   string    `json:"operation_binding_sha256"`
-	ProviderAccount    string    `json:"provider_account_sha256"`
-	ProviderRequest    string    `json:"provider_request_sha256"`
-	SourceKind         string    `json:"source_kind"`
-	SourceSHA256       string    `json:"source_sha256"`
-	TerminalStatus     string    `json:"terminal_status"`
-	BillingUnits       string    `json:"billing_units"`
-	FinalUsage         *float64  `json:"final_usage"`
-	SettlementScope    string    `json:"settlement_scope"`
-	OutstandingUsage   *float64  `json:"outstanding_usage"`
-	RequestCompletedAt time.Time `json:"request_completed_at"`
-	SettledThrough     time.Time `json:"settled_through"`
-	ObservedAt         time.Time `json:"observed_at"`
+	SchemaVersion      string     `json:"schema_version"`
+	IdentitySHA256     string     `json:"identity_sha256"`
+	AccountAliasSHA256 string     `json:"account_alias_sha256"`
+	OperationIDSHA256  string     `json:"operation_id_sha256"`
+	OperationBinding   string     `json:"operation_binding_sha256"`
+	ProviderAccount    string     `json:"provider_account_sha256"`
+	ProviderRequest    string     `json:"provider_request_sha256"`
+	SourceKind         string     `json:"source_kind"`
+	SourceSHA256       string     `json:"source_sha256"`
+	TerminalStatus     string     `json:"terminal_status"`
+	BillingUnits       string     `json:"billing_units"`
+	FinalUsage         *float64   `json:"final_usage"`
+	SettlementScope    string     `json:"settlement_scope"`
+	OutstandingUsage   *float64   `json:"outstanding_usage"`
+	RequestCompletedAt time.Time  `json:"request_completed_at"`
+	RequestStartedAt   *time.Time `json:"request_started_at,omitempty"`
+	SettledThrough     time.Time  `json:"settled_through"`
+	ObservedAt         time.Time  `json:"observed_at"`
 }
 
 type providerUsageImportResult struct {
@@ -82,6 +83,10 @@ type providerUsageSourceReview struct {
 	NonceSHA256             string                                 `json:"nonce_sha256"`
 	LegacyReservationSHA256 string                                 `json:"legacy_reservation_sha256,omitempty"`
 	LegacyAssociation       string                                 `json:"legacy_association,omitempty"`
+	OrphanReservationSHA256 string                                 `json:"orphan_reservation_sha256,omitempty"`
+	SubscriptionScopeSHA256 string                                 `json:"subscription_scope_sha256,omitempty"`
+	LedgerPathSHA256        string                                 `json:"ledger_path_sha256,omitempty"`
+	OrphanAssociation       string                                 `json:"orphan_association,omitempty"`
 	ProviderAccount         string                                 `json:"provider_account_sha256"`
 	ProviderRequest         string                                 `json:"provider_request_sha256"`
 	SourceAuthentication    string                                 `json:"source_authentication"`
@@ -94,7 +99,11 @@ func verifyProviderUsageSourceReview(review providerUsageSourceReview, imported 
 	e := imported.Evidence
 	bound := review.Schema == "ntm.provider-usage-source-review.v1" && validProviderNativeDigest(review.NonceSHA256) && review.LegacyReservationSHA256 == "" && review.LegacyAssociation == ""
 	legacy := review.Schema == "ntm.provider-usage-source-review.v2" && review.NonceSHA256 == "" && validProviderNativeDigest(review.LegacyReservationSHA256) && review.LegacyAssociation == "exact_local_reservation_associated_with_authenticated_original_request"
-	if !imported.ValidationPassed || e == nil || (!bound && !legacy) || review.Attestation == nil || review.Attestation.KeyMetadata != trusted || review.EvidenceSHA256 != imported.EvidenceSHA256 || review.SourceSHA256 != imported.SourceSHA256 || review.IdentitySHA256 != e.IdentitySHA256 || review.OperationBinding != e.OperationBinding || review.ProviderAccount != e.ProviderAccount || review.ProviderRequest != e.ProviderRequest || review.RequestAssociation != "original_request_confirmed_by_provider_source" || (review.SourceAuthentication != "authenticated_account_export_reviewed" && review.SourceAuthentication != "authenticated_support_reply_reviewed") || review.ReviewedAt.Before(e.ObservedAt) || review.ReviewedAt.After(now) {
+	orphan := review.Schema == "ntm.provider-usage-source-review.v3" && validProviderNativeDigest(review.NonceSHA256) && validProviderNativeDigest(review.OrphanReservationSHA256) && validProviderNativeDigest(review.SubscriptionScopeSHA256) && validProviderNativeDigest(review.LedgerPathSHA256) && review.LegacyReservationSHA256 == "" && review.LegacyAssociation == "" && review.OrphanAssociation == "original_runtime_identity_binding_nonce_and_exact_row_associated_with_authenticated_request"
+	if (bound || legacy) && (review.OrphanReservationSHA256 != "" || review.SubscriptionScopeSHA256 != "" || review.LedgerPathSHA256 != "" || review.OrphanAssociation != "") {
+		return errors.New("orphan fields require the separate orphan settlement contract")
+	}
+	if !imported.ValidationPassed || e == nil || (!bound && !legacy && !orphan) || review.Attestation == nil || review.Attestation.KeyMetadata != trusted || review.EvidenceSHA256 != imported.EvidenceSHA256 || review.SourceSHA256 != imported.SourceSHA256 || review.IdentitySHA256 != e.IdentitySHA256 || review.OperationBinding != e.OperationBinding || review.ProviderAccount != e.ProviderAccount || review.ProviderRequest != e.ProviderRequest || review.RequestAssociation != "original_request_confirmed_by_provider_source" || (review.SourceAuthentication != "authenticated_account_export_reviewed" && review.SourceAuthentication != "authenticated_support_reply_reviewed") || review.ReviewedAt.Before(e.ObservedAt) || review.ReviewedAt.After(now) {
 		return errors.New("authenticated source review and exact request association are required")
 	}
 	signature := *review.Attestation
@@ -107,7 +116,7 @@ func verifyProviderUsageSourceReview(review providerUsageSourceReview, imported 
 }
 
 func newProviderUsageSettlementCmd() *cobra.Command {
-	return providerUsageSettlementCommand(resolveProviderUsageTarget, defaultProviderCodexSubscriptionAdmission, func(cmd *cobra.Command, profile string) (providerattestation.KeyMetadata, error) {
+	trust := func(cmd *cobra.Command, profile string) (providerattestation.KeyMetadata, error) {
 		cfg := loadSelectedConfigOrDefault()
 		if cfg == nil {
 			return providerattestation.KeyMetadata{}, errors.New("configuration unavailable")
@@ -122,7 +131,10 @@ func newProviderUsageSettlementCmd() *cobra.Command {
 		}
 		trusted, err := preflightProviderReceiptSignerMetadataFor(providerCommandContext(cmd), sign, false)
 		return trusted.KeyMetadata, err
-	})
+	}
+	cmd := providerUsageSettlementCommand(resolveProviderUsageTarget, defaultProviderCodexSubscriptionAdmission, trust)
+	cmd.AddCommand(providerOrphanUsageSettlementCommand(withProviderOrphanLedgerGuard, defaultProviderCodexSubscriptionAdmission, trust))
+	return cmd
 }
 
 func providerUsageSettlementCommand(resolve func(string, string) (provider.Identity, *state.SendOperation, error), admission func() *ratelimit.SubscriptionAdmissionController, trust func(*cobra.Command, string) (providerattestation.KeyMetadata, error)) *cobra.Command {
@@ -177,6 +189,9 @@ func providerUsageSettlementCommand(resolve func(string, string) (provider.Ident
 			return err
 		}
 		imported := validateProviderUsageEvidence(data, source, id, operation, row, time.Now().UTC())
+		if review.Schema == "ntm.provider-usage-source-review.v3" {
+			return errors.New("orphan review requires the orphan subcommand")
+		}
 		if err := verifyProviderUsageSourceReview(review, imported, trusted, time.Now().UTC()); err != nil {
 			return err
 		}
@@ -184,12 +199,144 @@ func providerUsageSettlementCommand(resolve func(string, string) (provider.Ident
 			if err := admission().ReviewLegacyUsage(id, row.BindingHash, review.LegacyReservationSHA256, *imported.Evidence.FinalUsage, imported.Evidence.RequestCompletedAt, sha256TextCLI(reviewData), apply); err != nil {
 				return err
 			}
-		} else if apply {
-			if err := admission().SettleReviewedUsage(id, row.BindingHash, review.NonceSHA256, *imported.Evidence.FinalUsage, imported.Evidence.RequestCompletedAt, sha256TextCLI(reviewData)); err != nil {
+		} else {
+			controller := admission()
+			var err error
+			if apply {
+				err = controller.SettleReviewedUsage(id, row.BindingHash, review.NonceSHA256, *imported.Evidence.FinalUsage, imported.Evidence.RequestCompletedAt, sha256TextCLI(reviewData))
+			} else {
+				err = controller.ReviewBoundUsage(id, row.BindingHash, review.NonceSHA256, *imported.Evidence.FinalUsage, imported.Evidence.RequestCompletedAt, sha256TextCLI(reviewData), false)
+			}
+			if err != nil {
 				return err
 			}
 		}
 		return encodeIndentedJSON(cmd.OutOrStdout(), map[string]any{"schema_version": "ntm.provider-usage-settlement.v1", "review_verified": true, "settlement_applied_or_already_present": apply, "admission_granted": false, "generation_calls": 0, "review_sha256": sha256TextCLI(reviewData), "authority": "pinned_owner_authenticated_source_review"})
+	}
+	return cmd
+}
+
+// Keep the selected ledger locked across absence validation and the capacity
+// transaction. This creates no operation and prevents a concurrent claim from
+// racing the absence check. Errors, missing ledgers and matching outcome bodies
+// all fail closed; no timestamp-based association is inferred.
+func withProviderOrphanLedgerGuard(cmd *cobra.Command, profile, binding string, visit func(provider.Identity, string) error) error {
+	cfg := loadSelectedConfigOrDefault()
+	if cfg == nil {
+		return errors.New("configuration unavailable")
+	}
+	p, err := cfg.ProviderProfile(profile)
+	if err != nil {
+		return err
+	}
+	id, err := p.Identity()
+	if err != nil {
+		return err
+	}
+	if id.Provider() != "zai" || id.Runtime() != "codex" || id.Entitlement() != provider.EntitlementCodexResponses || !validProviderNativeDigest(binding) {
+		return errors.New("exact original Z.ai Codex identity and binding required")
+	}
+	path, err := filepath.Abs(state.DefaultPath())
+	if err != nil {
+		return err
+	}
+	return withProviderOrphanLedgerPathGuard(providerCommandContext(cmd), path, binding, func(ledgerSHA string) error { return visit(id, ledgerSHA) })
+}
+
+func withProviderOrphanLedgerPathGuard(parent context.Context, path, binding string, visit func(string) error) error {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return errors.New("existing regular selected ledger required")
+	}
+	store, err := state.Open(path)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	ctx, cancel := context.WithTimeout(parent, 20*time.Second)
+	defer cancel()
+	conn, err := store.DB().Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return errors.New("exclusive ledger absence guard unavailable")
+	}
+	defer conn.ExecContext(context.Background(), "ROLLBACK")
+	var matches int
+	if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM send_operations WHERE binding_hash = ? OR instr(COALESCE(outcome_json, ''), ?) > 0", binding, binding).Scan(&matches); err != nil {
+		return errors.New("ledger absence could not be established")
+	}
+	if matches != 0 {
+		return errors.New("binding is present in selected ledger; use its original operation settlement")
+	}
+	return visit(sha256StringCLI(path))
+}
+
+func providerOrphanUsageSettlementCommand(guard func(*cobra.Command, string, string, func(provider.Identity, string) error) error, admission func() *ratelimit.SubscriptionAdmissionController, trust func(*cobra.Command, string) (providerattestation.KeyMetadata, error)) *cobra.Command {
+	var profile, binding, evidenceFile, sourceFile, reviewFile string
+	var inspect, apply bool
+	cmd := &cobra.Command{Use: "orphan", Short: "Inspect or settle an exact nonce-bound reservation absent from the selected ledger", Args: cobra.NoArgs}
+	cmd.Flags().StringVar(&profile, "profile", "", "Exact original runtime identity profile; a successor is not a substitute")
+	cmd.Flags().StringVar(&binding, "binding-sha256", "", "Original reservation operation binding")
+	cmd.Flags().BoolVar(&inspect, "inspect", false, "Read local row fingerprint and ledger absence; does not authenticate provider association")
+	cmd.Flags().StringVar(&evidenceFile, "evidence-file", "", "Absolute v2 original-request usage evidence")
+	cmd.Flags().StringVar(&sourceFile, "source-file", "", "Absolute authenticated provider source")
+	cmd.Flags().StringVar(&reviewFile, "review-file", "", "Absolute pinned signed v3 source and original runtime association review")
+	cmd.Flags().BoolVar(&apply, "apply", false, "Apply the exact verified settlement; preview is the default")
+	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
+		if profile == "" || !validProviderNativeDigest(binding) || (inspect && (apply || evidenceFile != "" || sourceFile != "" || reviewFile != "")) || (!inspect && (!filepath.IsAbs(evidenceFile) || !filepath.IsAbs(sourceFile) || !filepath.IsAbs(reviewFile))) {
+			return errors.New("exact profile, binding and either inspection or absolute evidence/source/review required")
+		}
+		return guard(cmd, profile, binding, func(id provider.Identity, ledgerSHA string) error {
+			controller := admission()
+			reservation, err := controller.InspectBoundUsage(id, binding)
+			if err != nil {
+				return err
+			}
+			scopeSHA := sha256StringCLI(string(id.SubscriptionCapacityScope()))
+			if inspect {
+				return encodeIndentedJSON(cmd.OutOrStdout(), map[string]any{"schema_version": "ntm.orphan-reservation-inspection.v1", "identity_sha256": id.Hash(), "subscription_scope_sha256": scopeSHA, "ledger_path_sha256": ledgerSHA, "reservation": reservation, "provider_association": "unverified", "original_runtime_identity": "requires_authenticated_review", "accounting_mutated": false, "admission_granted": false, "generation_calls": 0})
+			}
+			data, err := readProviderUsageFile(evidenceFile)
+			if err != nil {
+				return err
+			}
+			source, err := readProviderUsageFile(sourceFile)
+			if err != nil {
+				return err
+			}
+			reviewData, err := readProviderUsageFile(reviewFile)
+			if err != nil {
+				return err
+			}
+			var review providerUsageSourceReview
+			if validateProviderUsageObject(json.NewDecoder(bytes.NewReader(reviewData)), 0) != nil {
+				return errors.New("ambiguous orphan source review")
+			}
+			decoder := json.NewDecoder(bytes.NewReader(reviewData))
+			decoder.DisallowUnknownFields()
+			if decoder.Decode(&review) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+				return errors.New("invalid orphan source review")
+			}
+			if review.Schema != "ntm.provider-usage-source-review.v3" || review.OrphanReservationSHA256 != reservation.SHA256 || review.NonceSHA256 != reservation.Nonce || review.SubscriptionScopeSHA256 != scopeSHA || review.LedgerPathSHA256 != ledgerSHA {
+				return errors.New("orphan review differs from current exact reservation, scope or ledger")
+			}
+			trusted, err := trust(cmd, profile)
+			if err != nil {
+				return err
+			}
+			now := time.Now().UTC()
+			imported := validateProviderUsageTargetEvidence(data, source, id, "", binding, reservation.ObservedAt, now, true)
+			if err := verifyProviderUsageSourceReview(review, imported, trusted, now); err != nil {
+				return err
+			}
+			if err := controller.ReviewOrphanUsage(id, binding, reservation.Nonce, reservation.SHA256, *imported.Evidence.FinalUsage, imported.Evidence.RequestCompletedAt, sha256TextCLI(reviewData), apply); err != nil {
+				return err
+			}
+			return encodeIndentedJSON(cmd.OutOrStdout(), map[string]any{"schema_version": "ntm.orphan-usage-settlement.v1", "review_verified": true, "settlement_applied_or_already_present": apply, "reservation_sha256": reservation.SHA256, "review_sha256": sha256TextCLI(reviewData), "authority": "pinned_owner_authenticated_source_review", "operation_created": false, "admission_granted": false, "generation_calls": 0})
+		})
 	}
 	return cmd
 }
@@ -377,16 +524,27 @@ func decodeProviderUsageEvidence(data []byte) (providerUsageEvidence, error) {
 }
 
 func validateProviderUsageEvidence(data, source []byte, id provider.Identity, operation string, row *state.SendOperation, now time.Time) providerUsageImportResult {
+	if row == nil || row.OperationID != operation {
+		return providerUsageImportResult{SchemaVersion: "ntm.provider-usage-import.v1", Reasons: []string{"local_identity_or_operation_mismatch"}, EvidenceSHA256: sha256TextCLI(data), SourceSHA256: sha256TextCLI(source), Authority: "external_source_review_required", ProviderAssociation: "unverified_source_claim"}
+	}
+	return validateProviderUsageTargetEvidence(data, source, id, sha256StringCLI(operation), row.BindingHash, row.CreatedAt, now, false)
+}
+
+func validateProviderUsageTargetEvidence(data, source []byte, id provider.Identity, operationSHA, binding string, createdAt, now time.Time, orphan bool) providerUsageImportResult {
 	out := providerUsageImportResult{SchemaVersion: "ntm.provider-usage-import.v1", Reasons: []string{}, EvidenceSHA256: sha256TextCLI(data), SourceSHA256: sha256TextCLI(source), Authority: "external_source_review_required", ProviderAssociation: "unverified_source_claim"}
 	e, err := decodeProviderUsageEvidence(data)
 	if err != nil {
 		out.Reasons = append(out.Reasons, "malformed_or_ambiguous_record")
 		return out
 	}
-	if e.SchemaVersion != "ntm.provider-usage-evidence.v1" {
+	expectedSchema := "ntm.provider-usage-evidence.v1"
+	if orphan {
+		expectedSchema = "ntm.provider-usage-evidence.v2"
+	}
+	if e.SchemaVersion != expectedSchema {
 		out.Reasons = append(out.Reasons, "unsupported_schema")
 	}
-	if row == nil || row.OperationID != operation || e.IdentitySHA256 != id.Hash() || e.AccountAliasSHA256 != sha256StringCLI(id.AccountAlias()) || e.OperationIDSHA256 != sha256StringCLI(operation) || e.OperationBinding != row.BindingHash {
+	if e.IdentitySHA256 != id.Hash() || e.AccountAliasSHA256 != sha256StringCLI(id.AccountAlias()) || e.OperationIDSHA256 != operationSHA || e.OperationBinding != binding {
 		out.Reasons = append(out.Reasons, "local_identity_or_operation_mismatch")
 	}
 	if !validProviderNativeDigest(e.ProviderAccount) || !validProviderNativeDigest(e.ProviderRequest) || !validProviderNativeDigest(e.OperationBinding) {
@@ -404,7 +562,17 @@ func validateProviderUsageEvidence(data, source []byte, id provider.Identity, op
 	if e.SettlementScope != "original_request_only" || e.OutstandingUsage == nil || *e.OutstandingUsage != 0 {
 		out.Reasons = append(out.Reasons, "request_settlement_incomplete")
 	}
-	if row == nil || e.RequestCompletedAt.IsZero() || e.RequestCompletedAt.Before(row.CreatedAt) || e.SettledThrough.Before(e.RequestCompletedAt) || e.ObservedAt.Before(e.SettledThrough) || e.ObservedAt.After(now) {
+	start := createdAt
+	if orphan {
+		if e.RequestStartedAt == nil || e.RequestStartedAt.IsZero() || e.RequestStartedAt.After(createdAt) || createdAt.After(e.ObservedAt) {
+			out.Reasons = append(out.Reasons, "original_request_window_missing")
+		} else {
+			start = *e.RequestStartedAt
+		}
+	} else if e.RequestStartedAt != nil {
+		out.Reasons = append(out.Reasons, "unexpected_orphan_request_window")
+	}
+	if e.RequestCompletedAt.IsZero() || e.RequestCompletedAt.Before(start) || e.SettledThrough.Before(e.RequestCompletedAt) || e.ObservedAt.Before(e.SettledThrough) || e.ObservedAt.After(now) {
 		out.Reasons = append(out.Reasons, "settlement_window_invalid")
 	}
 	out.ValidationPassed = len(out.Reasons) == 0

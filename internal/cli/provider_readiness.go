@@ -30,32 +30,35 @@ type providerReadinessEvidence struct {
 }
 
 type providerReadinessLane struct {
-	Source                 *providerReadinessSource      `json:"source,omitempty"`
-	Profile                string                        `json:"profile"`
-	Identity               providerDoctorIdentity        `json:"identity"`
-	AccountSHA256          string                        `json:"account_sha256"`
-	Transport              string                        `json:"transport"`
-	WorkspaceEvidence      string                        `json:"workspace_evidence"`
-	AdmissionState         string                        `json:"admission_state"`
-	Blockers               []string                      `json:"blockers"`
-	DispatchAuthorized     bool                          `json:"dispatch_authorized"`
-	Credential             map[string]any                `json:"credential"`
-	Qualification          providerDoctorQualification   `json:"qualification"`
-	QualificationExpiresAt *time.Time                    `json:"qualification_expires_at,omitempty"`
-	UsableUntil            *time.Time                    `json:"usable_until,omitempty"`
-	RequestedDuration      time.Duration                 `json:"requested_duration_ns"`
-	DurationFits           bool                          `json:"duration_fits"`
-	CapabilitySummary      []providerReadinessCapability `json:"capability_summary"`
-	EvidenceDiscoveryLimit int                           `json:"evidence_discovery_limit"`
-	EvidenceTruncated      bool                          `json:"evidence_truncated"`
-	EvidenceErrors         []string                      `json:"evidence_errors,omitempty"`
-	Capacity               map[string]any                `json:"capacity"`
-	Checks                 []providerReadinessEvidence   `json:"checks"`
-	Operations             []providerAssignmentStatus    `json:"operations"`
-	RemoteTermination      string                        `json:"remote_generation_termination"`
-	AssignmentPreview      providerAssignmentPreview     `json:"assignment_preview"`
-	TaskStatistics         providerTaskStatistics        `json:"task_statistics"`
-	Operator               providerOperatorReadiness     `json:"operator"`
+	Source                 *providerReadinessSource           `json:"source,omitempty"`
+	Profile                string                             `json:"profile"`
+	Identity               providerDoctorIdentity             `json:"identity"`
+	AccountSHA256          string                             `json:"account_sha256"`
+	Transport              string                             `json:"transport"`
+	WorkspaceEvidence      string                             `json:"workspace_evidence"`
+	AdmissionState         string                             `json:"admission_state"`
+	Blockers               []string                           `json:"blockers"`
+	OperationalHoldsState  string                             `json:"operational_holds_state"`
+	OperationalHoldsSHA256 string                             `json:"operational_holds_sha256,omitempty"`
+	OperationalHolds       map[string]providerOperationalHold `json:"operational_holds,omitempty"`
+	DispatchAuthorized     bool                               `json:"dispatch_authorized"`
+	Credential             map[string]any                     `json:"credential"`
+	Qualification          providerDoctorQualification        `json:"qualification"`
+	QualificationExpiresAt *time.Time                         `json:"qualification_expires_at,omitempty"`
+	UsableUntil            *time.Time                         `json:"usable_until,omitempty"`
+	RequestedDuration      time.Duration                      `json:"requested_duration_ns"`
+	DurationFits           bool                               `json:"duration_fits"`
+	CapabilitySummary      []providerReadinessCapability      `json:"capability_summary"`
+	EvidenceDiscoveryLimit int                                `json:"evidence_discovery_limit"`
+	EvidenceTruncated      bool                               `json:"evidence_truncated"`
+	EvidenceErrors         []string                           `json:"evidence_errors,omitempty"`
+	Capacity               map[string]any                     `json:"capacity"`
+	Checks                 []providerReadinessEvidence        `json:"checks"`
+	Operations             []providerAssignmentStatus         `json:"operations"`
+	RemoteTermination      string                             `json:"remote_generation_termination"`
+	AssignmentPreview      providerAssignmentPreview          `json:"assignment_preview"`
+	TaskStatistics         providerTaskStatistics             `json:"task_statistics"`
+	Operator               providerOperatorReadiness          `json:"operator"`
 }
 
 type providerReadinessSource struct {
@@ -63,6 +66,74 @@ type providerReadinessSource struct {
 	ConfigSHA256 string    `json:"config_sha256"`
 	LedgerPath   string    `json:"ledger_path"`
 	ObservedAt   time.Time `json:"observed_at"`
+}
+
+// These local observations only restrict the preview. They are neither provider
+// accounting nor a replacement for dispatch checks, signatures or campaign gates.
+// RecheckAfter is a reminder, never an expiry that silently releases a hold.
+type providerOperationalHold struct {
+	ObservedAt     time.Time  `json:"observed_at"`
+	EvidenceSHA256 string     `json:"evidence_sha256"`
+	RecheckAfter   *time.Time `json:"recheck_after,omitempty"`
+	ClearCondition string     `json:"clear_condition"`
+}
+
+func applyProviderOperationalHolds(lane *providerReadinessLane, path string, now time.Time) {
+	lane.OperationalHoldsState = "not_recorded"
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	invalid := func() {
+		lane.OperationalHoldsState = "invalid"
+		lane.Blockers = append(lane.Blockers, "operational_hold_record_invalid")
+		lane.AdmissionState = "blocked"
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 64<<10 {
+		invalid()
+		return
+	}
+	data, err := readProviderReadinessConfigFile(path)
+	if err != nil || len(data) > 64<<10 || validateProviderUsageObject(json.NewDecoder(bytes.NewReader(data)), 0) != nil {
+		invalid()
+		return
+	}
+	var record struct {
+		Schema string                                        `json:"schema_version"`
+		Holds  map[string]map[string]providerOperationalHold `json:"holds"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&record) != nil || decoder.Decode(&struct{}{}) != io.EOF || record.Schema != "ntm.provider-operational-holds.v1" || record.Holds == nil || len(record.Holds) > 64 {
+		invalid()
+		return
+	}
+	conditions := map[string]string{"clock": "stable_clock_observation_verified", "quota": "exact_account_capacity_verified", "accounting": "authenticated_usage_settled", "credential": "exact_account_credential_refreshed"}
+	for identity, holds := range record.Holds {
+		if !validProviderNativeDigest(identity) || len(holds) == 0 || len(holds) > len(conditions) {
+			invalid()
+			return
+		}
+		for kind, hold := range holds {
+			condition, known := conditions[kind]
+			if !known || hold.ClearCondition != condition || !validProviderNativeDigest(hold.EvidenceSHA256) || hold.ObservedAt.IsZero() || hold.ObservedAt.After(now.Add(time.Minute)) || (hold.RecheckAfter != nil && (hold.RecheckAfter.IsZero() || hold.RecheckAfter.Before(hold.ObservedAt))) {
+				invalid()
+				return
+			}
+		}
+	}
+	lane.OperationalHoldsState = "recorded"
+	lane.OperationalHoldsSHA256 = sha256TextCLI(data)
+	lane.OperationalHolds = record.Holds[lane.Identity.SHA256]
+	kinds := make([]string, 0, len(lane.OperationalHolds))
+	for kind := range lane.OperationalHolds {
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	for _, kind := range kinds {
+		lane.Blockers = append(lane.Blockers, "operational_hold:"+kind)
+		lane.AdmissionState = "blocked"
+	}
 }
 
 type providerOperatorReadiness struct {
@@ -303,6 +374,7 @@ func providerReadinessCommand(run func(context.Context, []string) ([]byte, error
 					lane.EvidenceErrors = append(lane.EvidenceErrors, "unverifiable_task_reference:"+sha256StringCLI(operation))
 				}
 			}
+			applyProviderOperationalHolds(&lane, filepath.Join(filepath.Dir(state.DefaultPath()), "provider-operational-holds.json"), time.Now().UTC())
 			lane.Checks = append(lane.Checks, providerTaskEvidence(lane.Operations)...)
 			lane.CapabilitySummary = summarizeProviderReadiness(lane.Checks)
 			applyProviderReadinessWindow(&lane, duration, time.Now().UTC())
@@ -325,6 +397,7 @@ func providerReadinessCommand(run func(context.Context, []string) ([]byte, error
 		for _, lane := range lanes {
 			fmt.Fprintf(cmd.OutOrStdout(), "%s (%s / %s): workspace evidence %s; admission %s\n", lane.Profile, lane.Identity.Provider, lane.Identity.Model, lane.WorkspaceEvidence, lane.AdmissionState)
 			fmt.Fprintf(cmd.OutOrStdout(), "Credential: %v; blockers: %s\n", lane.Credential["state"], strings.Join(lane.Blockers, ", "))
+			fmt.Fprintf(cmd.OutOrStdout(), "Operational hold record: %s; evidence digest: %s\n", lane.OperationalHoldsState, lane.OperationalHoldsSHA256)
 			fmt.Fprintf(cmd.OutOrStdout(), "Usable until: %v; task duration fits: %t\n", lane.UsableUntil, lane.DurationFits)
 			fmt.Fprintf(cmd.OutOrStdout(), "Assignment preview: eligible=%t; reasons: %s\n", lane.AssignmentPreview.Eligible, strings.Join(lane.AssignmentPreview.Reasons, ", "))
 			fmt.Fprintf(cmd.OutOrStdout(), "Attempt authorization: %s\n", lane.Operator.AttemptAuthorization)
@@ -468,6 +541,15 @@ func readProviderReadinessConfig(ctx context.Context, name, path string, args []
 // its conditions. Never turn an unused conditional slot into permission to retry.
 func providerOperatorView(lane providerReadinessLane) providerOperatorReadiness {
 	out := providerOperatorReadiness{AttemptAuthorization: "no_campaign_selected", NextActions: []string{}}
+	if lane.OperationalHoldsState == "invalid" {
+		out.NextActions = append(out.NextActions, "Repair the invalid local hold record before relying on this preview; missing data cannot clear a known hold.")
+	}
+	for _, kind := range []string{"clock", "quota", "accounting", "credential"} {
+		if _, found := lane.OperationalHolds[kind]; found {
+			action := map[string]string{"clock": "Verify stable host and guest clocks", "quota": "Verify available capacity for the exact account", "accounting": "Verify authenticated final usage and settlement", "credential": "Refresh and verify the exact account credential"}[kind]
+			out.NextActions = append(out.NextActions, action+" before clearing the recorded hold; its recheck time does not release it.")
+		}
+	}
 	zero := 0
 	out.AuthorizedAttempts = &zero
 	if attempts, ok := lane.Capacity["experiment_attempts"].(map[string]any); ok {

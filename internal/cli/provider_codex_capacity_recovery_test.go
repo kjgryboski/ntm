@@ -22,6 +22,231 @@ import (
 	"github.com/Dicklesworthstone/ntm/internal/zai"
 )
 
+func TestProviderOrphanLedgerGuard(t *testing.T) {
+	for _, scenario := range []string{"absent", "binding-match", "outcome-match", "missing-ledger", "corrupt-ledger"} {
+		t.Run(scenario, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.db")
+			binding := strings.Repeat("a", 64)
+			if scenario == "corrupt-ledger" {
+				if err := os.WriteFile(path, []byte("not sqlite"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario != "missing-ledger" && scenario != "corrupt-ledger" {
+				store, err := state.Open(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer store.Close()
+				if err := store.Migrate(); err != nil {
+					t.Fatal(err)
+				}
+				if scenario != "absent" {
+					b := binding
+					if scenario == "outcome-match" {
+						b = strings.Repeat("b", 64)
+					}
+					_, _, err := store.ClaimSendOperation(&state.SendOperation{OperationID: "original", SessionName: "arbitrary-scope", BindingHash: b, CreatedAt: time.Now().UTC()})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if scenario == "outcome-match" {
+						if err := store.CompleteSendOperation("original", "arbitrary-scope", `{"binding":"`+binding+`"}`, time.Now().UTC()); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			}
+			visited := false
+			err := withProviderOrphanLedgerPathGuard(t.Context(), path, binding, func(hash string) error {
+				visited = true
+				if hash != sha256StringCLI(path) {
+					t.Fatal("ledger identity mismatch")
+				}
+				other, err := state.Open(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer other.Close()
+				ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+				defer cancel()
+				if _, err := other.DB().ExecContext(ctx, "INSERT INTO send_operations (operation_id,session_name,binding_hash,status,created_at) VALUES ('racing','scope',?,'in_progress',CURRENT_TIMESTAMP)", binding); err == nil {
+					t.Fatal("ledger claim raced absence guard")
+				}
+				return nil
+			})
+			if (err == nil) != (scenario == "absent") || visited != (scenario == "absent") {
+				t.Fatalf("guard err=%v visited=%v", err, visited)
+			}
+			if scenario == "missing-ledger" {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatal("missing ledger created")
+				}
+			}
+		})
+	}
+}
+
+func TestProviderOrphanSettlementSurface(t *testing.T) {
+	for _, scenario := range []string{"ready", "active", "ledger-match", "ledger-unavailable", "wrong-row", "wrong-nonce", "wrong-scope", "wrong-ledger", "wrong-identity", "wrong-source", "unsigned", "wrong-association", "missing-request-window", "wrong-units", "changed-after-preview"} {
+		t.Run(scenario, func(t *testing.T) {
+			id, row, e, source, now := providerUsageFixture(t)
+			path := filepath.Join(t.TempDir(), "capacity.json")
+			open := func() *ratelimit.SubscriptionAdmissionController {
+				c, err := ratelimit.NewSubscriptionAdmissionController(ratelimit.DefaultSubscriptionAdmissionConfig(), path, func() time.Time { return now }, func() float64 { return .5 })
+				if err != nil {
+					t.Fatal(err)
+				}
+				return c
+			}
+			c := open()
+			d := c.Acquire(id)
+			if !d.Allowed {
+				t.Fatal(d)
+			}
+			nonce := strings.Repeat("d", 64)
+			if err := c.BindReservation(id, d, row.BindingHash, nonce); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.RecordUnknownUsage(id, d); err != nil {
+				t.Fatal(err)
+			}
+			if scenario != "active" {
+				c.Release(id, d)
+			}
+			reservation, err := c.InspectBoundUsage(id, row.BindingHash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ledgerSHA := strings.Repeat("a", 64)
+			e.SchemaVersion, e.OperationIDSHA256 = "ntm.provider-usage-evidence.v2", ""
+			started := row.CreatedAt
+			e.RequestStartedAt = &started
+			if scenario == "missing-request-window" {
+				e.RequestStartedAt = nil
+			}
+			if scenario == "wrong-units" {
+				e.BillingUnits = "tokens"
+			}
+			if scenario == "wrong-identity" {
+				e.IdentitySHA256 = strings.Repeat("f", 64)
+			}
+			data, err := json.Marshal(e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			review := providerUsageSourceReview{Schema: "ntm.provider-usage-source-review.v3", EvidenceSHA256: sha256TextCLI(data), SourceSHA256: sha256TextCLI(source), IdentitySHA256: id.Hash(), OperationBinding: row.BindingHash, NonceSHA256: nonce, OrphanReservationSHA256: reservation.SHA256, SubscriptionScopeSHA256: sha256StringCLI(string(id.SubscriptionCapacityScope())), LedgerPathSHA256: ledgerSHA, OrphanAssociation: "original_runtime_identity_binding_nonce_and_exact_row_associated_with_authenticated_request", ProviderAccount: e.ProviderAccount, ProviderRequest: e.ProviderRequest, SourceAuthentication: "authenticated_support_reply_reviewed", RequestAssociation: "original_request_confirmed_by_provider_source", ReviewedAt: now}
+			switch scenario {
+			case "wrong-row":
+				review.OrphanReservationSHA256 = strings.Repeat("e", 64)
+			case "wrong-nonce":
+				review.NonceSHA256 = strings.Repeat("e", 64)
+			case "wrong-scope":
+				review.SubscriptionScopeSHA256 = strings.Repeat("e", 64)
+			case "wrong-ledger":
+				review.LedgerPathSHA256 = strings.Repeat("e", 64)
+			case "wrong-association":
+				review.OrphanAssociation = "timestamp_correlation_only"
+			case "wrong-source":
+				source = []byte("different authenticated source")
+			}
+			payload, err := json.Marshal(review)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sig, err := newProviderNativeTestSigner()(t.Context(), payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario != "unsigned" {
+				review.Attestation = &sig
+			}
+			reviewData, err := json.Marshal(review)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			for name, body := range map[string][]byte{"evidence.json": data, "source.txt": source, "review.json": reviewData} {
+				if err := os.WriteFile(filepath.Join(dir, name), body, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			guarded := false
+			guard := func(_ *cobra.Command, profile, binding string, visit func(provider.Identity, string) error) error {
+				if profile != "original" || binding != row.BindingHash {
+					t.Fatal("target changed")
+				}
+				if scenario == "ledger-match" || scenario == "ledger-unavailable" {
+					return errors.New("ledger absence not established")
+				}
+				guarded = true
+				defer func() { guarded = false }()
+				return visit(id, ledgerSHA)
+			}
+			run := func(apply bool) error {
+				cmd := providerOrphanUsageSettlementCommand(guard, func() *ratelimit.SubscriptionAdmissionController {
+					if !guarded {
+						t.Fatal("outside ledger guard")
+					}
+					return open()
+				}, func(*cobra.Command, string) (providerattestation.KeyMetadata, error) { return sig.KeyMetadata, nil })
+				args := []string{"--profile", "original", "--binding-sha256", row.BindingHash, "--evidence-file", filepath.Join(dir, "evidence.json"), "--source-file", filepath.Join(dir, "source.txt"), "--review-file", filepath.Join(dir, "review.json")}
+				if apply {
+					args = append(args, "--apply")
+				}
+				cmd.SetArgs(args)
+				cmd.SetOut(&bytes.Buffer{})
+				cmd.SetErr(&bytes.Buffer{})
+				return cmd.Execute()
+			}
+			before := open().Snapshot(id)
+			err = run(false)
+			valid := scenario == "ready" || scenario == "changed-after-preview"
+			if (err == nil) != valid {
+				t.Fatalf("preview: %v", err)
+			}
+			after := open().Snapshot(id)
+			if before.WeeklyCreditsUsed != after.WeeklyCreditsUsed || before.UnknownUsageReserved != after.UnknownUsageReserved {
+				t.Fatal("preview mutated accounting")
+			}
+			if !valid {
+				if run(true) == nil {
+					t.Fatal("invalid apply accepted")
+				}
+				return
+			}
+			if scenario == "changed-after-preview" {
+				if err := c.SettleReviewedUsage(id, row.BindingHash, nonce, *e.FinalUsage, e.RequestCompletedAt, strings.Repeat("b", 64)); err != nil {
+					t.Fatal(err)
+				}
+				if run(true) == nil {
+					t.Fatal("changed reservation accepted")
+				}
+				return
+			}
+			for i := 0; i < 2; i++ {
+				if err := run(true); err != nil {
+					t.Fatal(err)
+				}
+				if err := run(false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			final := open().Snapshot(id)
+			if final.UnknownUsageReserved || final.WeeklyCreditsUsed != *e.FinalUsage {
+				t.Fatal(final)
+			}
+			original, err := open().InspectBoundUsage(id, row.BindingHash)
+			if err != nil || original != reservation {
+				t.Fatalf("original provenance changed: %+v %v", original, err)
+			}
+			if row.Status != state.SendOperationInProgress {
+				t.Fatal("manufactured task completion")
+			}
+		})
+	}
+}
+
 func TestProviderUsageReviewRejectsAmbiguousNestedSignature(t *testing.T) {
 	for _, data := range []string{`{"attestation":{"key_id":"a","key_id":"b"}}`, `{"attestation":{"Key_id":"a"}}`, `{"attestation":[]}`, `{} {}`, `null`} {
 		if validateProviderUsageObject(json.NewDecoder(strings.NewReader(data)), 0) == nil {
@@ -207,6 +432,119 @@ func TestProviderUsageSettlementRequiresSignedExactSourceReview(t *testing.T) {
 	cmd.SetArgs([]string{"--profile", "zai", "--operation-id", "original-request", "--apply"})
 	if cmd.Execute() == nil {
 		t.Fatal("surface settled without evidence")
+	}
+}
+
+func TestProviderBoundSettlementPreviewUsesCurrentStore(t *testing.T) {
+	for _, scenario := range []string{"ready", "missing", "active", "wrong-nonce", "settled-conflict", "unavailable"} {
+		t.Run(scenario, func(t *testing.T) {
+			id, row, evidence, source, now := providerUsageFixture(t)
+			path := filepath.Join(t.TempDir(), "capacity.json")
+			open := func() *ratelimit.SubscriptionAdmissionController {
+				c, err := ratelimit.NewSubscriptionAdmissionController(ratelimit.DefaultSubscriptionAdmissionConfig(), path, func() time.Time { return now }, func() float64 { return .5 })
+				if err != nil {
+					t.Fatal(err)
+				}
+				return c
+			}
+			c := open()
+			nonce := strings.Repeat("d", 64)
+			if scenario != "missing" {
+				d := c.Acquire(id)
+				if !d.Allowed {
+					t.Fatal(d)
+				}
+				if err := c.BindReservation(id, d, row.BindingHash, nonce); err != nil {
+					t.Fatal(err)
+				}
+				if err := c.RecordUnknownUsage(id, d); err != nil {
+					t.Fatal(err)
+				}
+				if scenario != "active" {
+					c.Release(id, d)
+				}
+			}
+			if scenario == "settled-conflict" {
+				if err := c.SettleReviewedUsage(id, row.BindingHash, nonce, *evidence.FinalUsage, evidence.RequestCompletedAt, strings.Repeat("f", 64)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := c.Snapshot(id)
+			data, err := json.Marshal(evidence)
+			if err != nil {
+				t.Fatal(err)
+			}
+			imported := validateProviderUsageEvidence(data, source, id, row.OperationID, row, now)
+			if scenario == "wrong-nonce" {
+				nonce = strings.Repeat("e", 64)
+			}
+			review := providerUsageSourceReview{Schema: "ntm.provider-usage-source-review.v1", EvidenceSHA256: imported.EvidenceSHA256, SourceSHA256: imported.SourceSHA256, IdentitySHA256: id.Hash(), OperationBinding: row.BindingHash, NonceSHA256: nonce, ProviderAccount: evidence.ProviderAccount, ProviderRequest: evidence.ProviderRequest, SourceAuthentication: "authenticated_support_reply_reviewed", RequestAssociation: "original_request_confirmed_by_provider_source", ReviewedAt: now}
+			payload, err := json.Marshal(review)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sig, err := newProviderNativeTestSigner()(t.Context(), payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			review.Attestation = &sig
+			reviewData, err := json.Marshal(review)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			for name, body := range map[string][]byte{"evidence.json": data, "source.txt": source, "review.json": reviewData} {
+				if err := os.WriteFile(filepath.Join(dir, name), body, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			run := func(apply bool) (string, error) {
+				cmd := providerUsageSettlementCommand(func(string, string) (provider.Identity, *state.SendOperation, error) { return id, row, nil }, func() *ratelimit.SubscriptionAdmissionController {
+					if scenario == "unavailable" {
+						return nil
+					}
+					return open()
+				}, func(*cobra.Command, string) (providerattestation.KeyMetadata, error) { return sig.KeyMetadata, nil })
+				args := []string{"--profile", "exact", "--operation-id", row.OperationID, "--evidence-file", filepath.Join(dir, "evidence.json"), "--source-file", filepath.Join(dir, "source.txt"), "--review-file", filepath.Join(dir, "review.json")}
+				if apply {
+					args = append(args, "--apply")
+				}
+				var output bytes.Buffer
+				cmd.SetOut(&output)
+				cmd.SetErr(&bytes.Buffer{})
+				cmd.SetArgs(args)
+				err := cmd.Execute()
+				return output.String(), err
+			}
+			out, err := run(false)
+			if (err == nil) != (scenario == "ready") {
+				t.Fatalf("preview err=%v output=%s", err, out)
+			}
+			after := open().Snapshot(id)
+			if before.WeeklyCreditsUsed != after.WeeklyCreditsUsed || before.UnknownUsageReserved != after.UnknownUsageReserved || before.PlanRunning != after.PlanRunning {
+				t.Fatal("preview changed accounting")
+			}
+			if scenario != "ready" {
+				if _, err := run(true); err == nil {
+					t.Fatal("apply accepted a refused preview")
+				}
+				return
+			}
+			for i := 0; i < 2; i++ {
+				if _, err := run(true); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := run(false); err != nil {
+					t.Fatal("idempotent preview after restart:", err)
+				}
+			}
+			if after := open().Snapshot(id); after.UnknownUsageReserved || after.WeeklyCreditsUsed != *evidence.FinalUsage {
+				t.Fatal(after)
+			}
+			if row.Status != state.SendOperationInProgress {
+				t.Fatal("settlement declared task completion")
+			}
+		})
 	}
 }
 

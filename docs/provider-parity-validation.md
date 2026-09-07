@@ -605,3 +605,106 @@ rules, extra duplicates, invalid dispositions, changed artifact hashes and paths
 outside the source root. It never edits reports, changes severity or grants
 provider readiness. Success means the reviewed inventory matches, not that the
 raw scanner passed. A raw report with no findings should use its own clean result.
+
+## Operational holds and exact settlement preview
+
+Readiness reads `provider-operational-holds.json` beside the selected ledger
+(`state.db`). Each configuration route reads its own record. The optional local
+record only adds restrictions to the assignment preview; it grants no capability,
+credential, provider-account authority or dispatch authorization. A missing record
+is reported as `not_recorded`; malformed, oversized, nonregular or ambiguous records
+block the preview. The record is limited to 64 KiB and 64 exact identities.
+
+```json
+{
+  "schema_version": "ntm.provider-operational-holds.v1",
+  "holds": {
+    "EXACT_64_CHARACTER_IDENTITY_SHA256": {
+      "clock": {
+        "observed_at": "2026-09-07T03:58:14Z",
+        "evidence_sha256": "EXACT_64_CHARACTER_EVIDENCE_SHA256",
+        "clear_condition": "stable_clock_observation_verified"
+      }
+    }
+  }
+}
+```
+
+Allowed kinds and clearing conditions are `clock` /
+`stable_clock_observation_verified`, `quota` / `exact_account_capacity_verified`,
+`accounting` / `authenticated_usage_settled`, and `credential` /
+`exact_account_credential_refreshed`. Optional `recheck_after` is a reminder and
+does not expire or clear the hold. Removing an entry requires separately reviewed
+clearing evidence; readiness does not mutate the record. Its digest and matching
+observations are exposed alongside qualification, credential and capacity status.
+Historical successful capabilities remain visible while admission is blocked.
+Direct dispatch retains its existing prerequisites; this record is an operator
+preview restriction, not a new dispatch authorization or enforcement service.
+
+Both nonce-bound and legacy `settle-reviewed-usage` previews now validate the
+actual reservation through the same atomic engine used by apply. Missing, active,
+duplicated, unavailable or conflicting state fails preview. A valid preview does
+not change usage, mark a task complete or authorize generation; apply rechecks
+the state and signed source review. Idempotent preview/apply remains valid after
+restart when the exact same settlement is already present.
+
+### Orphaned nonce-bound reservations
+
+An unknown row with a nonce but no matching operation is not eligible for the
+nonce-less legacy migration. The current ordinary settlement surface still
+requires an existing exact ledger operation. Do not create a synthetic operation,
+reuse a different binding, or clear the hold from timestamp correlation alone.
+
+`provider codex settle-reviewed-usage orphan --profile ORIGINAL_PROFILE
+--binding-sha256 ORIGINAL_BINDING --inspect` checks ledger absence and reports
+the complete local row fingerprint, nonce, original observation, subscription
+scope and selected ledger path digest. It does not prove provider association
+or that the selected profile is the original runtime identity.
+
+The recovery contract selects the complete original row fingerprint,
+subscription scope, exact original runtime identity, binding and nonce digest;
+prove the operation is absent from the selected ledger; and authenticate the
+provider request/account association and final settled usage. A separately pinned
+signed reviewer record must bind those exact inputs. Preview/apply must share one
+atomic transaction, reject active or duplicate matches and changed rows, preserve
+original nonce/binding/observation provenance, and be idempotent across restart.
+It never manufactures task completion or qualification. Preview is the default;
+`--apply` repeats all checks. An immediate SQLite transaction guards the entire
+ledger-absence check and capacity settlement against concurrent ledger claims.
+Any matching binding, including one retained inside an outcome, refuses this
+path. The capacity transaction rejects any active plan lease, duplicate match,
+changed row, unavailable storage or conflicting prior settlement.
+
+The orphan subcommand consumes absolute `--evidence-file`, `--source-file` and
+`--review-file` paths. Evidence schema `ntm.provider-usage-evidence.v2` uses the
+existing exact account/request/source and final Coding Plan credit fields, an
+empty `operation_id_sha256`, and `request_started_at` no later than the original
+reservation observation. Completion and settlement must cover that request;
+outstanding usage must be zero. A pinned owner review with schema
+`ntm.provider-usage-source-review.v3` binds `orphan_reservation_sha256`,
+`subscription_scope_sha256`, `ledger_path_sha256`, the original identity,
+binding, nonce, source and evidence hashes. Its `orphan_association` must be
+`original_runtime_identity_binding_nonce_and_exact_row_associated_with_authenticated_request`.
+This is a reviewed authenticated-source assertion, not a provider signature.
+The ordinary settlement surface rejects orphan reviews. A successor identity
+or timestamp correlation alone is insufficient to create the signed review.
+
+After apply, `original_observed_at` and `orphan_reservation_sha256` retain the
+original row provenance; the original nonce and binding are unchanged. The
+settlement review digest makes repeated delivery idempotent across restart.
+The September 4 live hold remains unresolved until authenticated evidence and
+the original-runtime association are available; no fixture authorizes settlement.
+
+Historical identities from before bridge binding need additional reconciliation.
+The same archived Z.ai configuration can produce an older identity without bridge
+fields and a different current identity with them. This subcommand validates the
+current constructor's exact identity; it does not import an old identity schema
+or authorize that mapping. Preserve both preimages and request-time bridge evidence
+for a separate reviewed identity-migration contract before settling such a row.
+Renaming a profile or replacing the historical digest is not that contract.
+
+If request association is unavailable, complete-window evidence needs a distinct
+reviewed contract covering every request, settled usage with explicit units,
+outstanding liability, cutoffs and exclusions for the actual affected interval.
+An aggregate balance or reset estimate is insufficient. No existing receipt is
+rewritten to turn a historical correlation into authoritative evidence.
