@@ -414,8 +414,11 @@ For pinned Grok 1.0.13, the controller snapshots the existing unified log inode
 and offset immediately before writing the prompt. Before cleanup and signing it
 extracts only `prompt received`, `shell.prompt.queued`,
 `shell.handle_prompt.start`, and `shell.turn.inference_start` counts for the
-selected session and the receiving process. Other messages and all context stay
-private. Logs absent, malformed or over the four MiB budget remain explicitly
+selected session and the receiving process. `shell.turn.inference_retry` adds
+sampler retry counts, HTTP retry counts, and the latest closed error category,
+attempt and configured retry limit. Other messages and context stay private,
+including retry reason text, endpoint URLs and sampler request identifiers.
+Logs absent, malformed or over the four MiB budget remain explicitly
 unavailable or incomplete. The matching terminal ACP response is separate.
 
 The producer contracts are in grok-build revision
@@ -426,6 +429,16 @@ reached xAI. These diagnostics neither establish remote cancellation nor grant
 qualification. Missing execution fields retain the canonical form of historical
 signed receipts. Tests distinguish receipt, queue, dispatch and inference, reject
 other processes and unbound history, and check historical serialization.
+
+Sampler-internal retries do not increment `inference_start`. The retained
+September 7 resumed turn reported seven `http` retries (attempts 1 through 7,
+configured limit 15) before cancellation, despite only one inference-start
+marker. This is transport-failure evidence, not proof of a silent deadlock or
+remote acceptance. The producer is `acp_session_impl/sampling_events.rs`;
+the closed category vocabulary is `xai-grok-sampler/src/events.rs` at the same
+pinned revision. Retrospective log analysis remains unsigned supporting evidence;
+existing receipts are never rewritten to add these fields. Zero retry fields
+are omitted to preserve both pre-execution and execution-era signed bytes.
 
 ## Historical Z.ai reservations without nonces
 

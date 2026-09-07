@@ -1158,6 +1158,43 @@ func TestExecutionLogSeparatesQueueDispatchAndInference(t *testing.T) {
 	}
 }
 
+func TestExecutionLogRetainsSamplerRetriesWithoutProviderText(t *testing.T) {
+	prefix := `{"sid":"session","pid":5,"msg":"prompt received"}` + "\n"
+	retry := `{"sid":"session","pid":5,"msg":"shell.turn.inference_retry","ctx":{"kind":"http","attempt":7,"max_retries":15,"reason":"PRIVATE error https://secret.invalid/key","sampler_request_id":"PRIVATE-ID"}}` + "\n"
+	o := observeExecutionLog(strings.NewReader(prefix+retry), "session")
+	if o.InferenceRetries != 1 || o.HTTPRetries != 1 || o.LastRetryKind != "http" || o.LastRetryAttempt != 7 || o.LastRetryLimit != 15 || o.InferenceSubmissions != 0 || o.TerminalResponse {
+		t.Fatalf("retry evidence lost or strengthened: %+v", o)
+	}
+	for _, forbidden := range []string{"PRIVATE", "secret.invalid", "sampler_request_id", "reason"} {
+		if strings.Contains(string(mustJSON(t, o)), forbidden) {
+			t.Fatalf("provider text retained: %s", forbidden)
+		}
+	}
+	for _, data := range []string{retry, prefix + strings.ReplaceAll(retry, `"pid":5`, `"pid":6`), prefix + strings.ReplaceAll(retry, `"sid":"session"`, `"sid":"foreign"`)} {
+		if got := observeExecutionLog(strings.NewReader(data), "session"); got.InferenceRetries != 0 {
+			t.Fatalf("unbound retry counted: %+v", got)
+		}
+	}
+	unknown := observeExecutionLog(strings.NewReader(prefix+strings.ReplaceAll(retry, `"kind":"http"`, `"kind":"PRIVATE"`)), "session")
+	if unknown.LastRetryKind != "unknown" || unknown.HTTPRetries != 0 {
+		t.Fatalf("unreviewed kind admitted: %+v", unknown)
+	}
+	malformed := observeExecutionLog(strings.NewReader(prefix+strings.ReplaceAll(retry, `"attempt":7`, `"attempt":"PRIVATE"`)), "session")
+	if malformed.LogEvidence != "incomplete" || malformed.InferenceRetries != 1 || malformed.LastRetryKind != "unknown" {
+		t.Fatalf("malformed retry hidden: %+v", malformed)
+	}
+	// Existing signed execution objects must re-marshal with identical bytes.
+	historical := `{"prompt_written":true,"prompt_received":1,"queued":1,"dispatched":1,"inference_submissions":1,"terminal_response":true,"log_evidence":"observed"}`
+	var old provider.GrokExecutionObservation
+	if err := json.Unmarshal([]byte(historical), &old); err != nil || string(mustJSON(t, old)) != historical {
+		t.Fatal("retry fields changed historical receipt bytes")
+	}
+	redacted := (provider.ProtocolObservation{Execution: provider.GrokExecutionObservation{InferenceRetries: -1, HTTPRetries: 3, LastRetryKind: "PRIVATE", LastRetryAttempt: -1, LastRetryLimit: -1}}).Redacted()
+	if redacted.Execution.InferenceRetries != 0 || redacted.Execution.HTTPRetries != 0 || redacted.Execution.LastRetryKind != "unknown" || redacted.Execution.LastRetryAttempt != 0 || redacted.Execution.LastRetryLimit != 0 {
+		t.Fatal("persistence boundary did not sanitize retry observations")
+	}
+}
+
 func TestProtocolObservationIsSavedBeforeCleanupEvenWhenSinkFails(t *testing.T) {
 	for _, sinkFailure := range []string{"", "error", "panic"} {
 		t.Run(sinkFailure, func(t *testing.T) {

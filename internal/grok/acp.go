@@ -2055,9 +2055,10 @@ func observeExecutionLog(reader io.Reader, session string) provider.GrokExecutio
 			break
 		}
 		var entry struct {
-			SID     string `json:"sid"`
-			PID     int    `json:"pid"`
-			Message string `json:"msg"`
+			SID     string          `json:"sid"`
+			PID     int             `json:"pid"`
+			Message string          `json:"msg"`
+			Context json.RawMessage `json:"ctx"`
 		}
 		if json.Unmarshal(scanner.Bytes(), &entry) != nil {
 			out.LogEvidence = "incomplete"
@@ -2081,6 +2082,26 @@ func observeExecutionLog(reader io.Reader, session string) provider.GrokExecutio
 			out.Dispatched++
 		case "shell.turn.inference_start":
 			out.InferenceSubmissions++
+		case "shell.turn.inference_retry":
+			// sampling_events.rs emits this for sampler-internal retries,
+			// which do not increment turn.rs's inference_start counter.
+			// It proves a retry was reported, never remote acceptance or spend.
+			out.InferenceRetries++
+			var retry struct {
+				Kind    string `json:"kind"`
+				Attempt int    `json:"attempt"`
+				Limit   int    `json:"max_retries"`
+			}
+			if json.Unmarshal(entry.Context, &retry) != nil || retry.Kind == "" || retry.Attempt <= 0 || retry.Limit < 0 {
+				out.LogEvidence = "incomplete"
+				out.LastRetryKind = "unknown"
+				out.LastRetryAttempt, out.LastRetryLimit = 0, 0
+				continue
+			}
+			out.LastRetryKind, out.LastRetryAttempt, out.LastRetryLimit = retry.Kind, retry.Attempt, retry.Limit
+			if retry.Kind == "http" {
+				out.HTTPRetries++
+			}
 		}
 	}
 	if scanner.Err() != nil {
@@ -2089,7 +2110,7 @@ func observeExecutionLog(reader io.Reader, session string) provider.GrokExecutio
 	if out.LogEvidence != "incomplete" && out.PromptReceived > 0 {
 		out.LogEvidence = "observed"
 	}
-	return out
+	return (provider.ProtocolObservation{Execution: out}).Redacted().Execution
 }
 
 func (a *updateAccumulator) observeProtocol(event rpcEvent) {

@@ -28,6 +28,11 @@ type GrokExecutionObservation struct {
 	Queued               int    `json:"queued"`
 	Dispatched           int    `json:"dispatched"`
 	InferenceSubmissions int    `json:"inference_submissions"`
+	InferenceRetries     int    `json:"inference_retries,omitempty"`
+	HTTPRetries          int    `json:"http_retries,omitempty"`
+	LastRetryKind        string `json:"last_retry_kind,omitempty"`
+	LastRetryAttempt     int    `json:"last_retry_attempt,omitempty"`
+	LastRetryLimit       int    `json:"last_retry_limit,omitempty"`
 	TerminalResponse     bool   `json:"terminal_response"`
 	LogEvidence          string `json:"log_evidence"`
 }
@@ -42,6 +47,17 @@ func (o ProtocolObservation) Redacted() ProtocolObservation {
 	o.Execution.Queued = max(0, o.Execution.Queued)
 	o.Execution.Dispatched = max(0, o.Execution.Dispatched)
 	o.Execution.InferenceSubmissions = max(0, o.Execution.InferenceSubmissions)
+	o.Execution.InferenceRetries = max(0, o.Execution.InferenceRetries)
+	o.Execution.HTTPRetries = min(max(0, o.Execution.HTTPRetries), o.Execution.InferenceRetries)
+	o.Execution.LastRetryAttempt = max(0, o.Execution.LastRetryAttempt)
+	o.Execution.LastRetryLimit = max(0, o.Execution.LastRetryLimit)
+	// SamplingErrorKind::as_str from the pinned Grok 1.0.13 producer.
+	// Provider prose, request identifiers and endpoint URLs never enter receipts.
+	switch o.Execution.LastRetryKind {
+	case "", "http", "api", "auth", "serialization", "rate_limited", "empty_response", "idle_timeout", "doom_loop_detected", "max_tokens_truncation", "unknown":
+	default:
+		o.Execution.LastRetryKind = "unknown"
+	}
 	// Reviewed ACP client methods and Grok 1.0.13 notifications. Recognition
 	// for diagnostics never implies permission to execute a reverse request.
 	switch o.Method {
