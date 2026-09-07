@@ -143,23 +143,28 @@ type providerBroker struct {
 }
 
 const providerBrokerAuditSchemaVersion = "ntm.provider-workspace-broker-audit.v1"
+const providerBrokerMonotonicAuditSchemaVersion = "ntm.provider-workspace-broker-audit.v2"
 
 // providerBrokerAudit stores receipt-safe evidence only. In particular it
 // never persists tool arguments, file content, verifier output, or raw paths.
 type providerBrokerAudit struct {
-	file     *os.File
-	sequence uint64
+	file        *os.File
+	sequence    uint64
+	clock       *provider.ExecutionClock
+	toolStarted int64
 }
 
 type providerBrokerAuditHeader struct {
-	SchemaVersion  string    `json:"schema_version"`
-	Kind           string    `json:"kind"`
-	WorktreeSHA256 string    `json:"worktree_sha256"`
-	RevisionSHA256 string    `json:"revision_sha256"`
-	CreatedAt      time.Time `json:"created_at"`
+	Execution      *provider.ExecutionSpan `json:"execution,omitempty"`
+	SchemaVersion  string                  `json:"schema_version"`
+	Kind           string                  `json:"kind"`
+	WorktreeSHA256 string                  `json:"worktree_sha256"`
+	RevisionSHA256 string                  `json:"revision_sha256"`
+	CreatedAt      time.Time               `json:"created_at"`
 }
 
 type providerBrokerAuditEvent struct {
+	Execution           *provider.ExecutionSpan             `json:"execution,omitempty"`
 	SchemaVersion       string                              `json:"schema_version"`
 	Kind                string                              `json:"kind"`
 	Sequence            uint64                              `json:"sequence"`
@@ -337,9 +342,15 @@ func openProviderBrokerAudit(worktree, revision, auditFile string) (*providerBro
 		_ = file.Close()
 		return nil, errors.New("provider broker audit file changed before broker admission")
 	}
-	audit := &providerBrokerAudit{file: file}
+	clock, err := provider.NewExecutionClock(5 * time.Minute)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	audit := &providerBrokerAudit{file: file, clock: clock}
 	header := providerBrokerAuditHeader{
-		SchemaVersion:  providerBrokerAuditSchemaVersion,
+		SchemaVersion:  providerBrokerMonotonicAuditSchemaVersion,
+		Execution:      clock.Span(0),
 		Kind:           "header",
 		WorktreeSHA256: providerBrokerHash(worktree),
 		RevisionSHA256: providerBrokerHash(revision),
@@ -394,6 +405,10 @@ func (b *providerBroker) recordToolEvent(tool, path string, success, rejected bo
 		WorkspaceReceipt:    workspaceReceipt,
 		VerificationReceipt: verificationReceipt,
 		OccurredAt:          time.Now().UTC(),
+	}
+	if b.audit.clock != nil {
+		event.SchemaVersion = providerBrokerMonotonicAuditSchemaVersion
+		event.Execution = b.audit.clock.Span(b.audit.toolStarted)
 	}
 	if path != "" {
 		event.PathSHA256 = providerBrokerHash(path)
@@ -501,6 +516,12 @@ func providerBrokerToolDefinitions() []map[string]any {
 }
 
 func (b *providerBroker) call(ctx context.Context, raw json.RawMessage) (any, error) {
+	if b.audit != nil && b.audit.clock != nil {
+		b.audit.toolStarted = b.audit.clock.ElapsedNS()
+		var cancel context.CancelFunc
+		ctx, cancel = b.audit.clock.Context(ctx)
+		defer cancel()
+	}
 	var request struct {
 		Name      string          `json:"name"`
 		Arguments json.RawMessage `json:"arguments"`

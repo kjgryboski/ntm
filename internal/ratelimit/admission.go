@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -119,6 +120,8 @@ type subscriptionUsageEvent struct {
 	// identity or automatic operation-to-usage evidence.
 	RecoveryAuthorizationSHA256 string `json:"recovery_authorization_sha256,omitempty"`
 	SettlementReviewSHA256      string `json:"settlement_review_sha256,omitempty"`
+	LegacyReservationSHA256     string `json:"legacy_reservation_sha256,omitempty"`
+	SettlementBindingSHA256     string `json:"settlement_binding_sha256,omitempty"`
 	OperationBindingSHA256      string `json:"operation_binding_sha256,omitempty"`
 	NonceSHA256                 string `json:"nonce_sha256,omitempty"`
 	// Unknown records that a dispatched request could not be reconciled to
@@ -507,14 +510,68 @@ func (c *SubscriptionAdmissionController) RecordUnknownUsage(identity provider.I
 // Replays are idempotent; conflicting reviews, unbound legacy rows and active
 // leases cannot be settled. A committed receipt survives controller crashes.
 func (c *SubscriptionAdmissionController) SettleReviewedUsage(identity provider.Identity, binding, nonce string, credits float64, completedAt time.Time, review string) error {
-	if c == nil || c.plan == nil || !validIdentity(identity) || !validSubscriptionEvidenceDigest(binding) || !validSubscriptionEvidenceDigest(nonce) || !validSubscriptionEvidenceDigest(review) || math.IsNaN(credits) || math.IsInf(credits, 0) || credits < 0 || completedAt.IsZero() || completedAt.After(c.plan.now()) {
+	return c.settleReviewedUsage(identity, binding, nonce, "", credits, completedAt, review, true)
+}
+
+// LegacyUsageReservations exposes exact local row fingerprints for owner review.
+// A fingerprint proves which row was reviewed, never its provider association.
+func (c *SubscriptionAdmissionController) LegacyUsageReservations(identity provider.Identity) ([]string, error) {
+	if c == nil || c.plan == nil || !validIdentity(identity) {
+		return nil, errors.New("invalid legacy reservation identity")
+	}
+	rows := []string{}
+	if !c.plan.withAuthoritativeState(identity.SubscriptionCapacityScope(), c.plan.now(), func(s *admissionState) {
+		for _, e := range s.subscriptionUsage {
+			if e.Unknown && e.Reconciled && e.NonceSHA256 == "" && e.SettlementReviewSHA256 == "" && e.RecoveryAuthorizationSHA256 == "" {
+				rows = append(rows, legacyUsageFingerprint(identity, e))
+			}
+		}
+	}) {
+		return nil, errors.New("shared legacy reservation inspection unavailable")
+	}
+	return rows, nil
+}
+
+func legacyUsageFingerprint(identity provider.Identity, e subscriptionUsageEvent) string {
+	payload, err := json.Marshal(struct {
+		Schema   string                 `json:"schema"`
+		Identity string                 `json:"identity_sha256"`
+		Row      subscriptionUsageEvent `json:"row"`
+	}{"ntm.legacy-reservation.v1", identity.Hash(), e})
+	if err != nil {
+		return ""
+	}
+	hash := sha256.Sum256(payload)
+	return hex.EncodeToString(hash[:])
+}
+
+// ReviewLegacyUsage uses the same atomic settlement engine. The caller must
+// verify a pinned signed review explicitly associating this exact local row
+// with the authenticated original provider request. No nonce is manufactured.
+func (c *SubscriptionAdmissionController) ReviewLegacyUsage(identity provider.Identity, binding, reservation string, credits float64, completedAt time.Time, review string, apply bool) error {
+	if !validSubscriptionEvidenceDigest(reservation) {
+		return errors.New("exact reviewed legacy reservation required")
+	}
+	return c.settleReviewedUsage(identity, binding, "", reservation, credits, completedAt, review, apply)
+}
+
+func (c *SubscriptionAdmissionController) settleReviewedUsage(identity provider.Identity, binding, nonce, legacy string, credits float64, completedAt time.Time, review string, apply bool) error {
+	if c == nil || c.plan == nil || !validIdentity(identity) || !validSubscriptionEvidenceDigest(binding) || (legacy == "" && !validSubscriptionEvidenceDigest(nonce)) || !validSubscriptionEvidenceDigest(review) || math.IsNaN(credits) || math.IsInf(credits, 0) || credits < 0 || completedAt.IsZero() || completedAt.After(c.plan.now()) {
 		return errors.New("invalid reviewed usage settlement")
 	}
 	accepted := false
 	if !c.plan.withAuthoritativeState(identity.SubscriptionCapacityScope(), c.plan.now(), func(s *admissionState) {
 		candidate := -1
+		unknown := 0
 		for i, e := range s.subscriptionUsage {
-			if e.OperationBindingSHA256 == binding && e.NonceSHA256 == nonce {
+			if e.Unknown {
+				unknown++
+			}
+			matches := e.OperationBindingSHA256 == binding && e.NonceSHA256 == nonce
+			if legacy != "" {
+				matches = e.NonceSHA256 == "" && (e.LegacyReservationSHA256 == legacy || legacyUsageFingerprint(identity, e) == legacy)
+			}
+			if matches {
 				if candidate >= 0 {
 					return
 				}
@@ -525,17 +582,24 @@ func (c *SubscriptionAdmissionController) SettleReviewedUsage(identity provider.
 			return
 		}
 		e := &s.subscriptionUsage[candidate]
+		if legacy != "" && (len(s.leases) != 0 || (e.OperationBindingSHA256 != "" && e.OperationBindingSHA256 != binding)) {
+			return
+		}
 		if _, active := s.leases[e.LeaseID]; active {
 			return
 		}
 		if e.SettlementReviewSHA256 != "" {
-			accepted = e.SettlementReviewSHA256 == review && e.Credits == credits && e.ObservedAt.Equal(completedAt) && !e.Unknown
+			accepted = e.SettlementReviewSHA256 == review && e.Credits == credits && e.ObservedAt.Equal(completedAt) && !e.Unknown && (legacy == "" || e.SettlementBindingSHA256 == binding)
 			return
 		}
-		if !e.Unknown || !e.Reconciled {
+		if !e.Unknown || !e.Reconciled || (legacy != "" && (unknown != 1 || e.RecoveryAuthorizationSHA256 != "" || e.LegacyReservationSHA256 != "")) {
 			return
 		}
-		e.Credits, e.ObservedAt, e.Unknown, e.Conservative, e.SettlementReviewSHA256 = credits, completedAt.UTC(), false, false, review
+		if apply {
+			e.Credits, e.ObservedAt, e.Unknown, e.Conservative, e.SettlementReviewSHA256 = credits, completedAt.UTC(), false, false, review
+			e.LegacyReservationSHA256 = legacy
+			e.SettlementBindingSHA256 = binding
+		}
 		accepted = true
 	}) {
 		return errors.New("shared reviewed usage transaction is unavailable")

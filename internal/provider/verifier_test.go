@@ -108,15 +108,40 @@ func TestVerifierPreservesMonotonicDiagnosticsAcrossWallClockJumps(t *testing.T)
 			if got := decoded.Commands[0].CompletedAt.Sub(decoded.Commands[0].StartedAt); got != jump {
 				t.Fatalf("UTC jump lost: %v", got)
 			}
+			if decoded.SchemaVersion != "ntm.disposable-verifier.v3" || !decoded.Execution.Valid() {
+				t.Fatal("missing bounded execution contract")
+			}
 			var previous int64
 			for i, command := range decoded.Commands {
 				timing := command.Timing
-				if timing == nil || timing.Sequence != i+1 || timing.StartedElapsedNS < previous || timing.CompletedElapsedNS < timing.StartedElapsedNS {
+				if timing == nil || timing.DomainSHA256 != decoded.Execution.DomainSHA256 || timing.TimeoutNS != int64(time.Second) || timing.Sequence != i+1 || timing.StartedElapsedNS < previous || timing.CompletedElapsedNS < timing.StartedElapsedNS || timing.CompletedElapsedNS > decoded.Execution.CompletedElapsedNS {
 					t.Fatalf("invalid monotonic evidence: %+v", timing)
 				}
 				previous = timing.CompletedElapsedNS
 			}
 		})
+	}
+}
+
+func TestVerifierSharedExecutionClockEnforcesDeadline(t *testing.T) {
+	clock, err := NewExecutionClock(20 * time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := clock.Context(t.Context())
+	defer cancel()
+	runner := &fakeVerifierRunner{wait: true}
+	v := testVerifier(t, runner, fakeVerifierInspector{path: "/worktrees/disposable", revision: verifierTestRevision, disposable: true})
+	r, err := v.Verify(ctx, VerificationManifest{Worktree: "/input", Revision: verifierTestRevision, CommandIDs: []string{"go-test", "go-vet"}})
+	if err == nil || len(r.Commands) != 1 || !r.Commands[0].TimedOut || r.Execution == nil || r.Execution.DomainSHA256 != clock.domain || r.Execution.DeadlineElapsedNS != int64(20*time.Millisecond) {
+		t.Fatal("controller deadline/domain lost or timed-out work continued")
+	}
+	other, err := NewExecutionClock(time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.domain == clock.domain {
+		t.Fatal("execution domains reused")
 	}
 }
 

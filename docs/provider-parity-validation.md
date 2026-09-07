@@ -473,7 +473,7 @@ to advance beyond its first observation instead of assuming a fixed sleep suffic
 
 ## Clock correction evidence
 
-Each newly produced command receipt also carries a one-based sequence and start/end
+The earlier v2 command receipts carried a one-based sequence and start/end
 elapsed nanoseconds measured from one process-local monotonic origin. UTC remains
 unchanged. The optional timing object survives JSON serialization, while its absence
 preserves historical receipt bytes. Deterministic tests step the wall clock forward
@@ -488,13 +488,30 @@ authorize relabeling it. The observed host had Windows Time stopped and Linux NT
 reporting an approximately -2.56 second offset; competing clock correction is an
 investigation hypothesis, not an established attribution to a particular service.
 
-Replacing UTC ordering as an admission boundary requires a new explicitly versioned
-receipt contract: one controller-issued attempt nonce, consecutive event sequence,
-one process-local origin for all tool and command events, no overlapping command
-intervals, a controller-owned monotonic deadline, and exact process/manifest binding.
-Wall time remains an audit observation and freshness still needs a trusted authority.
-Do not compare unrelated process offsets, retrofit offsets into old receipts, or
-accept a self-reported duration as proof of completion or remote usage settlement.
+New broker audit v2 and verifier receipt v3 now implement the execution-timing
+contract. The broker mints one random domain and retains a process-local monotonic
+origin with a five-minute maximum deadline. Its context carries that exact clock
+into verification. Ordered tool spans must share the header's domain and deadline;
+verification must fit inside its tool event, and consecutive command spans must
+fit inside verification and their controller-approved timeouts. The signed outer
+qualification continues to bind the exact profile, process, manifest and evidence.
+These fields are controller evidence, never provider-supplied duration claims.
+
+UTC observations must still lie inside the trusted qualification interval, and
+receipt freshness, signature expiry and identity admission retain their UTC checks.
+Historical audit v1/verifier v2 evidence continues to require ordered UTC. Adding
+new timing fields to an old schema, missing a domain, crossing domains, overlapping
+events or commands, exceeding a deadline, and moving outside UTC bounds all fail.
+No old receipt is rewritten or promoted. Deterministic serialized-audit fixtures
+cover forward/backward wall corrections and these rejection cases. See Go's
+[monotonic clock contract](https://pkg.go.dev/time#hdr-Monotonic_Clocks): serialization
+does not preserve a live Go clock; only one controller may interpret its domain.
+
+The September 7 host repair started Windows Time and produced three successful
+forced synchronization cycles, followed by 150 seconds with no backward samples
+on Windows. The simultaneous WSL observation still had five backward samples
+(largest observed reversal approximately 573 ms). The guest clock-source experiment
+is pending; host repair alone does not clear the live qualification clock gate.
 
 ## Historical Z.ai reservations without nonces
 
@@ -539,9 +556,33 @@ manufacture a nonce, rewrite its identity, or infer provider correlation from a
 nearby timestamp. Obtain either authenticated original request correlation and
 terminal charge/units/settlement coverage, or authoritative coverage of every
 request and outstanding liability in the affected account/window. Preserve the
-source and review its digest before designing a separate atomic migration.
+source and review its digest before applying an atomic migration.
 Current aggregate quota, local reset estimates and an unsigned support claim do
 not satisfy that requirement. This plan makes no ledger mutation or admission grant.
+
+`provider codex settle-reviewed-usage --profile NAME --operation-id ORIGINAL
+--inspect-legacy-reservations` exposes fingerprints of local nonce-less rows. A
+fingerprint includes the exact identity and persisted row; it supplies no provider
+association. The pinned owner reviewer must sign a source-review v2 record with
+that `legacy_reservation_sha256`, an empty `nonce_sha256`, and
+`legacy_association=exact_local_reservation_associated_with_authenticated_original_request`.
+The existing authenticated source, provider account/request, original operation,
+terminal charge and settlement-coverage checks remain mandatory.
+
+Supply `--evidence-file`, `--source-file` and `--review-file` to preview against the
+current authoritative store, then `--apply` to commit. Both use the same transaction
+engine as contemporary nonce settlement. Migration requires exactly one unknown
+row, the unchanged reviewed fingerprint, no active plan leases, and no conflicting
+prior recovery. It preserves the absent nonce and original binding, storing separate
+settlement provenance. A repeated identical review survives restart without charging
+twice; changed review, binding or charge fails. Storage failure does not fall back to
+local accounting. Offline tests exercise the CLI with signed synthetic evidence and
+independent controllers contending on the actual shared file transaction.
+
+This migration handles an authenticated original request only. Complete-window
+evidence without exact request association still needs a separately reviewed contract.
+Accounting settlement does not mark the old task complete, prove served-model
+identity, authorize a qualification or spend the reserved strict preflight.
 
 ## Repeatable scanner disposition checks
 

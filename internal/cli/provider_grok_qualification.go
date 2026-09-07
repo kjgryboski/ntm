@@ -502,7 +502,7 @@ func providerWorkspaceDiagnostic(audit providerGrokWorkspaceAudit, auditErr erro
 
 func evaluateProviderGrokWorkspaceAudit(audit providerGrokWorkspaceAudit, worktree, revision string, qualificationBounds ...time.Time) providerGrokWorkspaceAssertions {
 	result := providerGrokWorkspaceAssertions{EvidenceSHA256: digestSafeJSON(audit)}
-	if len(audit.Events) > 4 || audit.Header.WorktreeSHA256 != sha256StringCLI(filepath.Clean(worktree)) || audit.Header.RevisionSHA256 != sha256StringCLI(revision) {
+	if !validProviderAuditTiming(audit) || len(audit.Events) > 4 || audit.Header.WorktreeSHA256 != sha256StringCLI(filepath.Clean(worktree)) || audit.Header.RevisionSHA256 != sha256StringCLI(revision) {
 		return result
 	}
 	var qualificationStarted, qualificationCompleted time.Time
@@ -522,7 +522,7 @@ func evaluateProviderGrokWorkspaceAudit(audit providerGrokWorkspaceAudit, worktr
 		if audit.Events[index].Sequence != uint64(index+1) || audit.Events[index].Tool != expectedTool || !providerGrokTimeWithinBounds(audit.Events[index].OccurredAt, qualificationStarted, qualificationCompleted) {
 			return result
 		}
-		if index > 0 && audit.Events[index].OccurredAt.Before(audit.Events[index-1].OccurredAt) {
+		if audit.Header.Execution == nil && index > 0 && audit.Events[index].OccurredAt.Before(audit.Events[index-1].OccurredAt) {
 			return result
 		}
 	}
@@ -538,17 +538,60 @@ func evaluateProviderGrokWorkspaceAudit(audit providerGrokWorkspaceAudit, worktr
 	copy(events[:], audit.Events)
 	readEvent, writeEvent, secretEvent, verifyEvent := events[0], events[1], events[2], events[3]
 	validWorkspaceReceipt := func(event providerBrokerAuditEvent, action, pathSHA256 string) bool {
-		return event.Success && !event.Rejected && event.WorkspaceReceipt != nil && event.WorkspaceReceipt.SchemaVersion == providerGrokWorkspaceSchema && event.WorkspaceReceipt.Action == action && event.PathSHA256 == pathSHA256 && event.WorkspaceReceipt.PathSHA256 == pathSHA256 && event.WorkspaceReceipt.WorktreeSHA256 == worktreeSHA256 && event.WorkspaceReceipt.RevisionSHA256 == revisionSHA256 && event.WorkspaceReceipt.ErrorSHA256 == "" && providerGrokOrderedTimes(event.WorkspaceReceipt.StartedAt, event.WorkspaceReceipt.CompletedAt, event.OccurredAt) && providerGrokTimeWithinBounds(event.WorkspaceReceipt.StartedAt, qualificationStarted, qualificationCompleted)
+		return event.Success && !event.Rejected && event.WorkspaceReceipt != nil && event.WorkspaceReceipt.SchemaVersion == providerGrokWorkspaceSchema && event.WorkspaceReceipt.Action == action && event.PathSHA256 == pathSHA256 && event.WorkspaceReceipt.PathSHA256 == pathSHA256 && event.WorkspaceReceipt.WorktreeSHA256 == worktreeSHA256 && event.WorkspaceReceipt.RevisionSHA256 == revisionSHA256 && event.WorkspaceReceipt.ErrorSHA256 == "" && providerGrokEventTimes(event, event.WorkspaceReceipt.StartedAt, event.WorkspaceReceipt.CompletedAt, qualificationStarted, qualificationCompleted)
 	}
 	result.ReadObserved = readEvent.Sequence == 1 && readEvent.Tool == "read_file" && validWorkspaceReceipt(readEvent, "read", targetSHA256) && !readEvent.WorkspaceReceipt.Mutated && readEvent.WorkspaceReceipt.Bytes == int64(len(providerGrokWorkspaceBefore)) && readEvent.WorkspaceReceipt.ResultSHA256 == beforeSHA256
 	result.EditObserved = writeEvent.Sequence == 2 && writeEvent.Tool == "write_file" && validWorkspaceReceipt(writeEvent, "write", targetSHA256) && writeEvent.WorkspaceReceipt.Mutated && writeEvent.WorkspaceReceipt.Bytes == int64(len(providerGrokWorkspaceAfter)) && writeEvent.WorkspaceReceipt.BeforeSHA256 == beforeSHA256 && writeEvent.WorkspaceReceipt.AfterSHA256 == afterSHA256 && writeEvent.WorkspaceReceipt.ResultSHA256 == afterSHA256
-	result.SecretDenied = secretEvent.Sequence == 3 && secretEvent.Tool == "read_file" && !secretEvent.Success && secretEvent.Rejected && secretEvent.PathSHA256 == secretSHA256 && secretEvent.WorkspaceReceipt != nil && secretEvent.WorkspaceReceipt.SchemaVersion == providerGrokWorkspaceSchema && secretEvent.WorkspaceReceipt.Action == "read" && secretEvent.WorkspaceReceipt.PathSHA256 == secretSHA256 && secretEvent.WorkspaceReceipt.WorktreeSHA256 == worktreeSHA256 && secretEvent.WorkspaceReceipt.RevisionSHA256 == revisionSHA256 && validProviderNativeDigest(secretEvent.WorkspaceReceipt.ErrorSHA256) && secretEvent.ErrorSHA256 == secretEvent.WorkspaceReceipt.ErrorSHA256 && providerGrokOrderedTimes(secretEvent.WorkspaceReceipt.StartedAt, secretEvent.WorkspaceReceipt.CompletedAt, secretEvent.OccurredAt) && providerGrokTimeWithinBounds(secretEvent.WorkspaceReceipt.StartedAt, qualificationStarted, qualificationCompleted)
+	result.SecretDenied = secretEvent.Sequence == 3 && secretEvent.Tool == "read_file" && !secretEvent.Success && secretEvent.Rejected && secretEvent.PathSHA256 == secretSHA256 && secretEvent.WorkspaceReceipt != nil && secretEvent.WorkspaceReceipt.SchemaVersion == providerGrokWorkspaceSchema && secretEvent.WorkspaceReceipt.Action == "read" && secretEvent.WorkspaceReceipt.PathSHA256 == secretSHA256 && secretEvent.WorkspaceReceipt.WorktreeSHA256 == worktreeSHA256 && secretEvent.WorkspaceReceipt.RevisionSHA256 == revisionSHA256 && validProviderNativeDigest(secretEvent.WorkspaceReceipt.ErrorSHA256) && secretEvent.ErrorSHA256 == secretEvent.WorkspaceReceipt.ErrorSHA256 && providerGrokEventTimes(secretEvent, secretEvent.WorkspaceReceipt.StartedAt, secretEvent.WorkspaceReceipt.CompletedAt, qualificationStarted, qualificationCompleted)
 	expectedManifestSHA256 := sha256StringCLI(filepath.Clean(worktree) + "\x00" + revision + "\x00go-test\x00go-vet")
 	result.TestObserved = verifyEvent.Sequence == 4 && verifyEvent.Tool == "verify_worktree" && verifyEvent.Success && !verifyEvent.Rejected && validProviderGrokVerificationReceipt(verifyEvent.VerificationReceipt, worktreeSHA256, revisionSHA256, expectedManifestSHA256, verifyEvent.OccurredAt, qualificationStarted, qualificationCompleted)
 	if result.TestObserved {
-		result.TestObserved = result.EditObserved && !verifyEvent.VerificationReceipt.StartedAt.Before(writeEvent.WorkspaceReceipt.CompletedAt)
+		if audit.Header.Execution != nil {
+			result.TestObserved = result.EditObserved && verifyEvent.Execution.Contains(verifyEvent.VerificationReceipt.Execution)
+		} else {
+			result.TestObserved = result.EditObserved && verifyEvent.VerificationReceipt.Execution == nil && !verifyEvent.VerificationReceipt.StartedAt.Before(writeEvent.WorkspaceReceipt.CompletedAt)
+		}
 	}
 	return result
+}
+
+// The audit's schema chooses a complete timing contract. Never combine old UTC
+// ordering with selected new offsets or compare independently minted domains.
+func validProviderAuditTiming(audit providerGrokWorkspaceAudit) bool {
+	header := audit.Header
+	monotonic := header.SchemaVersion == providerBrokerMonotonicAuditSchemaVersion
+	if monotonic {
+		if !header.Execution.Valid() || header.Execution.StartedElapsedNS != 0 {
+			return false
+		}
+	} else if header.SchemaVersion != providerBrokerAuditSchemaVersion || header.Execution != nil {
+		return false
+	}
+	previous := int64(0)
+	if monotonic {
+		previous = header.Execution.CompletedElapsedNS
+	}
+	for index, event := range audit.Events {
+		if event.SchemaVersion != header.SchemaVersion || event.Sequence != uint64(index+1) {
+			return false
+		}
+		if monotonic {
+			if !event.Execution.Valid() || event.Execution.DomainSHA256 != header.Execution.DomainSHA256 || event.Execution.DeadlineElapsedNS != header.Execution.DeadlineElapsedNS || event.Execution.StartedElapsedNS < previous {
+				return false
+			}
+			previous = event.Execution.CompletedElapsedNS
+		} else if event.Execution != nil || event.OccurredAt.Before(header.CreatedAt) || index > 0 && event.OccurredAt.Before(audit.Events[index-1].OccurredAt) {
+			return false
+		}
+	}
+	return true
+}
+
+func providerGrokEventTimes(event providerBrokerAuditEvent, started, completed, boundStart, boundEnd time.Time) bool {
+	if started.IsZero() || completed.IsZero() || event.OccurredAt.IsZero() || !providerGrokTimeWithinBounds(started, boundStart, boundEnd) || !providerGrokTimeWithinBounds(completed, boundStart, boundEnd) || !providerGrokTimeWithinBounds(event.OccurredAt, boundStart, boundEnd) {
+		return false
+	}
+	return event.Execution.Valid() || event.Execution == nil && providerGrokOrderedTimes(started, completed, event.OccurredAt)
 }
 
 func providerGrokOrderedTimes(started, completed, recorded time.Time) bool {
@@ -563,7 +606,7 @@ func providerGrokTimeWithinBounds(value, started, completed time.Time) bool {
 }
 
 func validProviderGrokVerificationReceipt(receipt *provider.VerificationReceipt, worktreeSHA256, revisionSHA256, manifestSHA256 string, recordedAt, qualificationStarted, qualificationCompleted time.Time) bool {
-	if receipt == nil || receipt.SchemaVersion != providerGrokVerifierSchema || receipt.ManifestSHA256 != manifestSHA256 || receipt.WorktreeSHA256 != worktreeSHA256 || receipt.RevisionSHA256 != revisionSHA256 || !receipt.NetworkIsolated || !receipt.CredentialsCleared || !receipt.PIDNamespaceIsolated || !receipt.CleanupVerified || !receipt.DisposableWorktree || len(receipt.Commands) != 2 || !providerGrokOrderedTimes(receipt.StartedAt, receipt.CompletedAt, recordedAt) || !providerGrokTimeWithinBounds(receipt.StartedAt, qualificationStarted, qualificationCompleted) {
+	if receipt == nil || receipt.ManifestSHA256 != manifestSHA256 || receipt.WorktreeSHA256 != worktreeSHA256 || receipt.RevisionSHA256 != revisionSHA256 || !receipt.NetworkIsolated || !receipt.CredentialsCleared || !receipt.PIDNamespaceIsolated || !receipt.CleanupVerified || !receipt.DisposableWorktree || len(receipt.Commands) != 2 || !validProviderVerificationTiming(receipt, recordedAt, qualificationStarted, qualificationCompleted) {
 		return false
 	}
 	expectedCommandHashes := []string{
@@ -572,7 +615,42 @@ func validProviderGrokVerificationReceipt(receipt *provider.VerificationReceipt,
 	}
 	for index, expected := range []string{"go-test", "go-vet"} {
 		command := receipt.Commands[index]
-		if command.ID != expected || command.CommandSHA256 != expectedCommandHashes[index] || !validProviderNativeDigest(command.OutputSHA256) || command.OutputBytes < 0 || command.ExitCode != 0 || command.TimedOut || !command.ProcessWaited || !command.CleanupVerified || command.ErrorSHA256 != "" || !providerGrokOrderedTimes(command.StartedAt, command.CompletedAt, receipt.CompletedAt) || command.StartedAt.Before(receipt.StartedAt) {
+		if command.ID != expected || command.CommandSHA256 != expectedCommandHashes[index] || !validProviderNativeDigest(command.OutputSHA256) || command.OutputBytes < 0 || command.ExitCode != 0 || command.TimedOut || !command.ProcessWaited || !command.CleanupVerified || command.ErrorSHA256 != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func validProviderVerificationTiming(receipt *provider.VerificationReceipt, recordedAt, boundStart, boundEnd time.Time) bool {
+	monotonic := receipt.SchemaVersion == "ntm.disposable-verifier.v3"
+	if monotonic {
+		if !receipt.Execution.Valid() {
+			return false
+		}
+	} else if receipt.SchemaVersion != providerGrokVerifierSchema || receipt.Execution != nil || !providerGrokOrderedTimes(receipt.StartedAt, receipt.CompletedAt, recordedAt) {
+		return false
+	}
+	for _, wall := range []time.Time{receipt.StartedAt, receipt.CompletedAt, recordedAt} {
+		if wall.IsZero() || !providerGrokTimeWithinBounds(wall, boundStart, boundEnd) {
+			return false
+		}
+	}
+	previous := int64(0)
+	if monotonic {
+		previous = receipt.Execution.StartedElapsedNS
+	}
+	for index, command := range receipt.Commands {
+		if command.StartedAt.IsZero() || command.CompletedAt.IsZero() || !providerGrokTimeWithinBounds(command.StartedAt, boundStart, boundEnd) || !providerGrokTimeWithinBounds(command.CompletedAt, boundStart, boundEnd) {
+			return false
+		}
+		if monotonic {
+			timing := command.Timing
+			if timing == nil || timing.DomainSHA256 != receipt.Execution.DomainSHA256 || timing.Sequence != index+1 || timing.StartedElapsedNS < previous || timing.CompletedElapsedNS < timing.StartedElapsedNS || timing.CompletedElapsedNS > receipt.Execution.CompletedElapsedNS || timing.TimeoutNS <= 0 || timing.TimeoutNS > int64(5*time.Minute) || timing.CompletedElapsedNS-timing.StartedElapsedNS > timing.TimeoutNS {
+				return false
+			}
+			previous = timing.CompletedElapsedNS
+		} else if !providerGrokOrderedTimes(command.StartedAt, command.CompletedAt, receipt.CompletedAt) || command.StartedAt.Before(receipt.StartedAt) || command.Timing != nil && (command.Timing.DomainSHA256 != "" || command.Timing.TimeoutNS != 0) {
 			return false
 		}
 	}
@@ -658,16 +736,19 @@ func readProviderGrokWorkspaceAudit(file *os.File, auditFile, worktree, revision
 		}
 		raw := append([]byte(nil), scanner.Bytes()...)
 		if line == 1 {
-			if err := decodeProviderGrokAuditLine(raw, &audit.Header); err != nil || audit.Header.Kind != "header" || audit.Header.SchemaVersion != providerBrokerAuditSchemaVersion || audit.Header.WorktreeSHA256 != sha256StringCLI(filepath.Clean(worktree)) || audit.Header.RevisionSHA256 != sha256StringCLI(revision) || audit.Header.CreatedAt.IsZero() {
+			if err := decodeProviderGrokAuditLine(raw, &audit.Header); err != nil || audit.Header.Kind != "header" || !validProviderAuditTiming(audit) || audit.Header.WorktreeSHA256 != sha256StringCLI(filepath.Clean(worktree)) || audit.Header.RevisionSHA256 != sha256StringCLI(revision) || audit.Header.CreatedAt.IsZero() {
 				return providerGrokWorkspaceAudit{}, errors.New("Grok workspace audit header is invalid")
 			}
 			continue
 		}
 		var event providerBrokerAuditEvent
-		if err := decodeProviderGrokAuditLine(raw, &event); err != nil || event.Kind != "tool_call" || event.SchemaVersion != providerBrokerAuditSchemaVersion || event.Sequence != uint64(line-1) || event.Tool == "" || event.OccurredAt.IsZero() || event.OccurredAt.Before(audit.Header.CreatedAt) || len(audit.Events) > 0 && event.OccurredAt.Before(audit.Events[len(audit.Events)-1].OccurredAt) {
+		if err := decodeProviderGrokAuditLine(raw, &event); err != nil || event.Kind != "tool_call" || event.SchemaVersion != audit.Header.SchemaVersion || event.Sequence != uint64(line-1) || event.Tool == "" || event.OccurredAt.IsZero() {
 			return providerGrokWorkspaceAudit{}, errors.New("Grok workspace audit event is invalid")
 		}
 		audit.Events = append(audit.Events, event)
+		if !validProviderAuditTiming(audit) {
+			return providerGrokWorkspaceAudit{}, errors.New("Grok workspace audit timing contract is invalid")
+		}
 	}
 	if err := scanner.Err(); err != nil || line < 2 {
 		return providerGrokWorkspaceAudit{}, errors.New("Grok workspace audit is incomplete")

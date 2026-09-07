@@ -337,6 +337,106 @@ func providerGrokWorkspaceAuditForTest(worktree, revision string) providerGrokWo
 	}
 }
 
+func TestProviderGrokMonotonicAuditSurvivesWallCorrectionsAndRejectsUnboundTiming(t *testing.T) {
+	for _, jump := range []time.Duration{-time.Hour, time.Hour} {
+		t.Run(jump.String(), func(t *testing.T) {
+			worktree, revision := filepath.Join(t.TempDir(), "linked"), strings.Repeat("a", 40)
+			fixture := func() providerGrokWorkspaceAudit {
+				a := providerGrokWorkspaceAuditForTest(worktree, revision)
+				base := a.Header.CreatedAt
+				a.Header.SchemaVersion = providerBrokerMonotonicAuditSchemaVersion
+				domain := strings.Repeat("d", 64)
+				span := func(start, end int64) *provider.ExecutionSpan {
+					return &provider.ExecutionSpan{DomainSHA256: domain, StartedElapsedNS: start, CompletedElapsedNS: end, DeadlineElapsedNS: int64(time.Minute)}
+				}
+				a.Header.Execution = span(0, 1)
+				for i := range a.Events {
+					e := &a.Events[i]
+					e.SchemaVersion = providerBrokerMonotonicAuditSchemaVersion
+					e.Execution = span(int64(10+i*100), int64(100+i*100))
+					e.OccurredAt = base.Add(jump)
+					if e.WorkspaceReceipt != nil {
+						e.WorkspaceReceipt.CompletedAt = base.Add(jump)
+					}
+				}
+				v := a.Events[3].VerificationReceipt
+				v.SchemaVersion = "ntm.disposable-verifier.v3"
+				v.Execution = span(320, 390)
+				v.CompletedAt = base.Add(jump)
+				for i := range v.Commands {
+					c := &v.Commands[i]
+					c.CompletedAt = base.Add(jump)
+					c.Timing = &provider.VerificationTiming{DomainSHA256: domain, TimeoutNS: int64(time.Second), Sequence: i + 1, StartedElapsedNS: int64(330 + i*20), CompletedElapsedNS: int64(340 + i*20)}
+				}
+				return a
+			}
+			a := fixture()
+			start, end := a.Header.CreatedAt.Add(-2*time.Hour), a.Header.CreatedAt.Add(2*time.Hour)
+			// The original wall-only receipt rejects the observed backward jump.
+			if jump < 0 {
+				old := providerGrokWorkspaceAuditForTest(worktree, revision)
+				old.Events[3].VerificationReceipt.Commands[0].CompletedAt = old.Header.CreatedAt.Add(jump)
+				if evaluateProviderGrokWorkspaceAudit(old, worktree, revision, start, end).TestObserved {
+					t.Fatal("pre-fix reproducer did not reject reversed UTC")
+				}
+			}
+			file, err := os.OpenFile(filepath.Join(filepath.Dir(worktree), "audit.jsonl"), os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			encoder := json.NewEncoder(file)
+			if err := encoder.Encode(a.Header); err != nil {
+				t.Fatal(err)
+			}
+			for _, event := range a.Events {
+				if err := encoder.Encode(event); err != nil {
+					t.Fatal(err)
+				}
+			}
+			decoded, err := readProviderGrokWorkspaceAudit(file, file.Name(), worktree, revision)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := evaluateProviderGrokWorkspaceAudit(decoded, worktree, revision, start, end)
+			if !got.ReadObserved || !got.EditObserved || !got.SecretDenied || !got.TestObserved {
+				t.Fatalf("bounded monotonic evidence lost: %+v", got)
+			}
+			for _, change := range []string{"domain", "overlap", "negative", "deadline", "command-timeout", "command-overlap", "missing", "downgrade", "outside-event", "wall-expired"} {
+				t.Run(change, func(t *testing.T) {
+					a := fixture()
+					v := a.Events[3].VerificationReceipt
+					switch change {
+					case "domain":
+						v.Commands[0].Timing.DomainSHA256 = strings.Repeat("e", 64)
+					case "overlap":
+						a.Events[3].Execution.StartedElapsedNS = a.Events[2].Execution.CompletedElapsedNS - 1
+					case "negative":
+						v.Commands[0].Timing.StartedElapsedNS = -1
+					case "deadline":
+						v.Execution.DeadlineElapsedNS = 1
+					case "command-timeout":
+						v.Commands[0].Timing.TimeoutNS = 1
+					case "command-overlap":
+						v.Commands[1].Timing.StartedElapsedNS = v.Commands[0].Timing.CompletedElapsedNS - 1
+					case "missing":
+						v.Execution = nil
+					case "downgrade":
+						v.SchemaVersion = providerGrokVerifierSchema
+					case "outside-event":
+						v.Execution.StartedElapsedNS = 0
+					case "wall-expired":
+						v.Commands[0].StartedAt = start.Add(-time.Second)
+					}
+					if evaluateProviderGrokWorkspaceAudit(a, worktree, revision, start, end).TestObserved {
+						t.Fatal("invalid timing promoted test evidence")
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestProviderGrokWorkspaceAuditRejectsReorderedEvidence(t *testing.T) {
 	audit := providerGrokWorkspaceAuditForTest("/tmp/linked", strings.Repeat("a", 40))
 	audit.Events[0], audit.Events[1] = audit.Events[1], audit.Events[0]

@@ -8,6 +8,7 @@ package provider
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -25,7 +26,7 @@ import (
 )
 
 const (
-	verifierSchemaVersion  = "ntm.disposable-verifier.v2"
+	verifierSchemaVersion  = "ntm.disposable-verifier.v3"
 	defaultVerifyTimeout   = 5 * time.Minute
 	worktreeInspectTimeout = 10 * time.Second
 	maxVerifyCommands      = 8
@@ -124,18 +125,69 @@ type CommandVerification struct {
 	Timing          *VerificationTiming `json:"timing,omitempty"`
 }
 
-// VerificationTiming records process-local ordering independently of wall time.
-// These offsets are diagnostic evidence, not a replacement for admission's UTC
-// bounds. They cannot be compared across processes or used to validate old receipts.
+// VerificationTiming is diagnostic in v2 receipts. In v3 it is bound to the
+// receipt's controller-created execution domain and command timeout. UTC remains
+// separate freshness evidence; offsets cannot be compared across domains.
 type VerificationTiming struct {
-	Sequence           int   `json:"sequence"`
-	StartedElapsedNS   int64 `json:"started_elapsed_ns"`
-	CompletedElapsedNS int64 `json:"completed_elapsed_ns"`
+	DomainSHA256       string `json:"domain_sha256,omitempty"`
+	TimeoutNS          int64  `json:"timeout_ns,omitempty"`
+	Sequence           int    `json:"sequence"`
+	StartedElapsedNS   int64  `json:"started_elapsed_ns"`
+	CompletedElapsedNS int64  `json:"completed_elapsed_ns"`
+}
+
+// ExecutionClock is minted by a controller process, never decoded from provider
+// input. SAFETY: its immutable origin/deadline retain Go's monotonic readings.
+// Serialization exposes offsets and a random domain, never the clock itself.
+type ExecutionClock struct {
+	origin time.Time
+	domain string
+	budget time.Duration
+}
+type executionClockKey struct{}
+type ExecutionSpan struct {
+	DomainSHA256       string `json:"domain_sha256"`
+	StartedElapsedNS   int64  `json:"started_elapsed_ns"`
+	CompletedElapsedNS int64  `json:"completed_elapsed_ns"`
+	DeadlineElapsedNS  int64  `json:"deadline_elapsed_ns"`
+}
+
+func NewExecutionClock(budget time.Duration) (*ExecutionClock, error) {
+	if budget <= 0 || budget > defaultVerifyTimeout {
+		return nil, errors.New("execution clock requires a bounded controller budget")
+	}
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, err
+	}
+	return &ExecutionClock{origin: time.Now(), domain: hex.EncodeToString(nonce[:]), budget: budget}, nil
+}
+func (c *ExecutionClock) ElapsedNS() int64 { return time.Since(c.origin).Nanoseconds() }
+func (c *ExecutionClock) Span(start int64) *ExecutionSpan {
+	return &ExecutionSpan{DomainSHA256: c.domain, StartedElapsedNS: start, CompletedElapsedNS: c.ElapsedNS(), DeadlineElapsedNS: int64(c.budget)}
+}
+func (c *ExecutionClock) Context(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithDeadline(context.WithValue(ctx, executionClockKey{}, c), c.origin.Add(c.budget))
+}
+func (s *ExecutionSpan) Valid() bool {
+	if s == nil || len(s.DomainSHA256) != 64 || s.StartedElapsedNS < 0 || s.CompletedElapsedNS < s.StartedElapsedNS || s.DeadlineElapsedNS <= 0 || s.DeadlineElapsedNS > int64(defaultVerifyTimeout) || s.CompletedElapsedNS > s.DeadlineElapsedNS {
+		return false
+	}
+	for _, ch := range s.DomainSHA256 {
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+func (s *ExecutionSpan) Contains(child *ExecutionSpan) bool {
+	return s.Valid() && child.Valid() && s.DomainSHA256 == child.DomainSHA256 && s.DeadlineElapsedNS == child.DeadlineElapsedNS && child.StartedElapsedNS >= s.StartedElapsedNS && child.CompletedElapsedNS <= s.CompletedElapsedNS
 }
 
 // VerificationReceipt binds results to the resolved disposable worktree and
 // exact Git revision.  Hashing paths keeps machine layout out of durable logs.
 type VerificationReceipt struct {
+	Execution            *ExecutionSpan        `json:"execution,omitempty"`
 	SchemaVersion        string                `json:"schema_version"`
 	ManifestSHA256       string                `json:"manifest_sha256"`
 	WorktreeSHA256       string                `json:"worktree_sha256"`
@@ -245,24 +297,33 @@ func (v *IsolatedVerifier) Verify(ctx context.Context, manifest VerificationMani
 		commands = append(commands, command)
 	}
 
-	monotonicOrigin := time.Now()
+	clock, _ := ctx.Value(executionClockKey{}).(*ExecutionClock)
+	if clock == nil {
+		clock, err = NewExecutionClock(defaultVerifyTimeout)
+		if err != nil {
+			return VerificationReceipt{}, err
+		}
+	}
+	ctx, executionCancel := clock.Context(ctx)
+	defer executionCancel()
+	executionStarted := clock.ElapsedNS()
 	started := v.now().UTC()
 	receipt := VerificationReceipt{SchemaVersion: verifierSchemaVersion, ManifestSHA256: manifestDigest(resolved, manifest.Revision, manifest.CommandIDs), WorktreeSHA256: verifierHash(resolved), RevisionSHA256: verifierHash(manifest.Revision), NetworkIsolated: true, CredentialsCleared: true, PIDNamespaceIsolated: true, CleanupVerified: true, DisposableWorktree: true, StartedAt: started}
 	for index, command := range commands {
-		elapsedStarted := time.Since(monotonicOrigin).Nanoseconds()
+		elapsedStarted := clock.ElapsedNS()
 		commandStarted := v.now().UTC()
 		commandCtx, cancel := context.WithTimeout(ctx, command.Timeout)
 		outcome, runErr := v.runner.Run(commandCtx, bwrapPlan(resolved, command, v.goRoot))
 		timedOut := errors.Is(commandCtx.Err(), context.DeadlineExceeded)
 		cancel()
 		completed := v.now().UTC()
-		elapsedCompleted := time.Since(monotonicOrigin).Nanoseconds()
+		elapsedCompleted := clock.ElapsedNS()
 		outputHash := outcome.OutputSHA256
 		if outputHash == "" {
 			outputHash = verifierHash(string(outcome.Output))
 		}
 		entry := CommandVerification{ID: command.ID, CommandSHA256: commandDigest(command), OutputSHA256: outputHash, OutputBytes: outcome.OutputBytes, ExitCode: outcome.ExitCode, TimedOut: timedOut, ProcessWaited: outcome.ProcessWaited, CleanupVerified: outcome.CleanupVerified, StartedAt: commandStarted, CompletedAt: completed}
-		entry.Timing = &VerificationTiming{Sequence: index + 1, StartedElapsedNS: elapsedStarted, CompletedElapsedNS: elapsedCompleted}
+		entry.Timing = &VerificationTiming{DomainSHA256: clock.domain, TimeoutNS: int64(command.Timeout), Sequence: index + 1, StartedElapsedNS: elapsedStarted, CompletedElapsedNS: elapsedCompleted}
 		if !outcome.CleanupVerified {
 			receipt.CleanupVerified = false
 		}
@@ -272,10 +333,12 @@ func (v *IsolatedVerifier) Verify(ctx context.Context, manifest VerificationMani
 		receipt.Commands = append(receipt.Commands, entry)
 		if runErr != nil {
 			receipt.CompletedAt = completed
+			receipt.Execution = clock.Span(executionStarted)
 			return receipt, fmt.Errorf("isolated verification command %s failed: %w", command.ID, runErr)
 		}
 	}
 	receipt.CompletedAt = v.now().UTC()
+	receipt.Execution = clock.Span(executionStarted)
 	return receipt, nil
 }
 

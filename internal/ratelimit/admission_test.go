@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,127 @@ import (
 )
 
 const admissionConfigHash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+func TestLegacyReviewedSettlementAtomicReplayAndRejection(t *testing.T) {
+	for _, scenario := range []string{"replay", "active", "ambiguous", "stale", "wrong-binding", "unavailable"} {
+		t.Run(scenario, func(t *testing.T) {
+			now := time.Now().UTC()
+			path := filepath.Join(t.TempDir(), "capacity.json")
+			open := func() *SubscriptionAdmissionController {
+				c, err := NewSubscriptionAdmissionController(DefaultSubscriptionAdmissionConfig(), path, func() time.Time { return now }, func() float64 { return .5 })
+				if err != nil {
+					t.Fatal(err)
+				}
+				return c
+			}
+			c := open()
+			id := subscriptionIdentity(t, "legacy", "glm-5.3", "https://api.z.ai/api/v1")
+			d := c.Acquire(id)
+			if !d.Allowed {
+				t.Fatal(d)
+			}
+			if err := c.RecordUnknownUsage(id, d); err != nil {
+				t.Fatal(err)
+			}
+			rows, err := c.LegacyUsageReservations(id)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("rows=%v err=%v", rows, err)
+			}
+			reservation := rows[0]
+			binding, review := strings.Repeat("a", 64), strings.Repeat("b", 64)
+			if scenario != "active" {
+				c.Release(id, d)
+			}
+			if scenario == "ambiguous" || scenario == "stale" || scenario == "wrong-binding" {
+				if !c.plan.withAuthoritativeState(id.SubscriptionCapacityScope(), now, func(s *admissionState) {
+					switch scenario {
+					case "ambiguous":
+						s.subscriptionUsage = append(s.subscriptionUsage, s.subscriptionUsage[0])
+					case "stale":
+						s.subscriptionUsage[0].Credits++
+					case "wrong-binding":
+						s.subscriptionUsage[0].OperationBindingSHA256 = strings.Repeat("c", 64)
+					}
+				}) {
+					t.Fatal("fixture transaction")
+				}
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "unavailable" {
+				c.plan.fallbackReason = "injected storage failure"
+			}
+			if scenario != "replay" {
+				for _, apply := range []bool{false, true} {
+					if c.ReviewLegacyUsage(id, binding, reservation, 2.5, now, review, apply) == nil {
+						t.Fatal("unsafe review accepted")
+					}
+				}
+				after, err := os.ReadFile(path)
+				if err != nil || string(before) != string(after) {
+					t.Fatal("rejected review changed persisted state", err)
+				}
+				return
+			}
+			if err := c.ReviewLegacyUsage(id, binding, reservation, 2.5, now, review, false); err != nil {
+				t.Fatal(err)
+			}
+			if !open().Snapshot(id).UnknownUsageReserved {
+				t.Fatal("preview released usage")
+			}
+			// Independent controllers contend on the real file transaction; a
+			// crash/restart or duplicate delivery must apply only one charge.
+			var wg sync.WaitGroup
+			results := make(chan error, 8)
+			for i := 0; i < 8; i++ {
+				controller := open()
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					results <- controller.ReviewLegacyUsage(id, binding, reservation, 2.5, now, review, true)
+				}()
+			}
+			wg.Wait()
+			close(results)
+			for err := range results {
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			after := open()
+			if err := after.ReviewLegacyUsage(id, binding, reservation, 2.5, now, review, true); err != nil {
+				t.Fatal(err)
+			}
+			for _, change := range []string{"review", "binding", "amount"} {
+				b, r, amount := binding, review, 2.5
+				switch change {
+				case "review":
+					r = strings.Repeat("c", 64)
+				case "binding":
+					b = strings.Repeat("c", 64)
+				case "amount":
+					amount = 0
+				}
+				if after.ReviewLegacyUsage(id, b, reservation, amount, now, r, true) == nil {
+					t.Fatal("conflict accepted", change)
+				}
+			}
+			if snapshot := after.Snapshot(id); snapshot.UnknownUsageReserved || snapshot.WeeklyCreditsUsed != 2.5 {
+				t.Fatal(snapshot)
+			}
+			if !after.plan.withAuthoritativeState(id.SubscriptionCapacityScope(), now, func(s *admissionState) {
+				e := s.subscriptionUsage[0]
+				if e.NonceSHA256 != "" || e.OperationBindingSHA256 != "" || e.LegacyReservationSHA256 != reservation || e.SettlementBindingSHA256 != binding {
+					t.Fatal("original provenance changed", e)
+				}
+			}) {
+				t.Fatal("read settlement")
+			}
+		})
+	}
+}
 
 func TestSubscriptionCrashRetainsUncertainUsageAcrossControllerRestart(t *testing.T) {
 	for _, phase := range []string{"reservation", "dispatch"} {

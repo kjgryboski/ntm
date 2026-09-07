@@ -350,7 +350,7 @@ func TestProviderBrokerAuditIsPrivateRedactedAndEnforcesWriteThenVerify(t *testi
 	if err := json.Unmarshal([]byte(lines[0]), &header); err != nil {
 		t.Fatal(err)
 	}
-	if header.SchemaVersion != providerBrokerAuditSchemaVersion || header.Kind != "header" || header.WorktreeSHA256 == "" || header.RevisionSHA256 == "" {
+	if header.SchemaVersion != providerBrokerMonotonicAuditSchemaVersion || !header.Execution.Valid() || header.Kind != "header" || header.WorktreeSHA256 == "" || header.RevisionSHA256 == "" {
 		t.Fatalf("audit header = %+v", header)
 	}
 	for index, raw := range lines[1:] {
@@ -358,7 +358,7 @@ func TestProviderBrokerAuditIsPrivateRedactedAndEnforcesWriteThenVerify(t *testi
 		if err := json.Unmarshal([]byte(raw), &event); err != nil {
 			t.Fatal(err)
 		}
-		if event.Sequence != uint64(index+1) || event.SchemaVersion != providerBrokerAuditSchemaVersion || event.Kind != "tool_call" {
+		if event.Sequence != uint64(index+1) || event.SchemaVersion != providerBrokerMonotonicAuditSchemaVersion || !event.Execution.Valid() || event.Execution.DomainSHA256 != header.Execution.DomainSHA256 || event.Kind != "tool_call" {
 			t.Fatalf("audit event %d = %+v", index, event)
 		}
 	}

@@ -74,23 +74,27 @@ func newProviderUsageImportCmd() *cobra.Command {
 // This is an operator's signed review of an authenticated source, not a
 // provider signature. The importer deliberately cannot manufacture it.
 type providerUsageSourceReview struct {
-	Schema               string                                 `json:"schema_version"`
-	EvidenceSHA256       string                                 `json:"evidence_sha256"`
-	SourceSHA256         string                                 `json:"source_sha256"`
-	IdentitySHA256       string                                 `json:"identity_sha256"`
-	OperationBinding     string                                 `json:"operation_binding_sha256"`
-	NonceSHA256          string                                 `json:"nonce_sha256"`
-	ProviderAccount      string                                 `json:"provider_account_sha256"`
-	ProviderRequest      string                                 `json:"provider_request_sha256"`
-	SourceAuthentication string                                 `json:"source_authentication"`
-	RequestAssociation   string                                 `json:"request_association"`
-	ReviewedAt           time.Time                              `json:"reviewed_at"`
-	Attestation          *providerattestation.SignatureMetadata `json:"attestation,omitempty"`
+	Schema                  string                                 `json:"schema_version"`
+	EvidenceSHA256          string                                 `json:"evidence_sha256"`
+	SourceSHA256            string                                 `json:"source_sha256"`
+	IdentitySHA256          string                                 `json:"identity_sha256"`
+	OperationBinding        string                                 `json:"operation_binding_sha256"`
+	NonceSHA256             string                                 `json:"nonce_sha256"`
+	LegacyReservationSHA256 string                                 `json:"legacy_reservation_sha256,omitempty"`
+	LegacyAssociation       string                                 `json:"legacy_association,omitempty"`
+	ProviderAccount         string                                 `json:"provider_account_sha256"`
+	ProviderRequest         string                                 `json:"provider_request_sha256"`
+	SourceAuthentication    string                                 `json:"source_authentication"`
+	RequestAssociation      string                                 `json:"request_association"`
+	ReviewedAt              time.Time                              `json:"reviewed_at"`
+	Attestation             *providerattestation.SignatureMetadata `json:"attestation,omitempty"`
 }
 
 func verifyProviderUsageSourceReview(review providerUsageSourceReview, imported providerUsageImportResult, trusted providerattestation.KeyMetadata, now time.Time) error {
 	e := imported.Evidence
-	if !imported.ValidationPassed || e == nil || review.Schema != "ntm.provider-usage-source-review.v1" || review.Attestation == nil || review.Attestation.KeyMetadata != trusted || review.EvidenceSHA256 != imported.EvidenceSHA256 || review.SourceSHA256 != imported.SourceSHA256 || review.IdentitySHA256 != e.IdentitySHA256 || review.OperationBinding != e.OperationBinding || review.ProviderAccount != e.ProviderAccount || review.ProviderRequest != e.ProviderRequest || !validProviderNativeDigest(review.NonceSHA256) || review.RequestAssociation != "original_request_confirmed_by_provider_source" || (review.SourceAuthentication != "authenticated_account_export_reviewed" && review.SourceAuthentication != "authenticated_support_reply_reviewed") || review.ReviewedAt.Before(e.ObservedAt) || review.ReviewedAt.After(now) {
+	bound := review.Schema == "ntm.provider-usage-source-review.v1" && validProviderNativeDigest(review.NonceSHA256) && review.LegacyReservationSHA256 == "" && review.LegacyAssociation == ""
+	legacy := review.Schema == "ntm.provider-usage-source-review.v2" && review.NonceSHA256 == "" && validProviderNativeDigest(review.LegacyReservationSHA256) && review.LegacyAssociation == "exact_local_reservation_associated_with_authenticated_original_request"
+	if !imported.ValidationPassed || e == nil || (!bound && !legacy) || review.Attestation == nil || review.Attestation.KeyMetadata != trusted || review.EvidenceSHA256 != imported.EvidenceSHA256 || review.SourceSHA256 != imported.SourceSHA256 || review.IdentitySHA256 != e.IdentitySHA256 || review.OperationBinding != e.OperationBinding || review.ProviderAccount != e.ProviderAccount || review.ProviderRequest != e.ProviderRequest || review.RequestAssociation != "original_request_confirmed_by_provider_source" || (review.SourceAuthentication != "authenticated_account_export_reviewed" && review.SourceAuthentication != "authenticated_support_reply_reviewed") || review.ReviewedAt.Before(e.ObservedAt) || review.ReviewedAt.After(now) {
 		return errors.New("authenticated source review and exact request association are required")
 	}
 	signature := *review.Attestation
@@ -103,22 +107,49 @@ func verifyProviderUsageSourceReview(review providerUsageSourceReview, imported 
 }
 
 func newProviderUsageSettlementCmd() *cobra.Command {
+	return providerUsageSettlementCommand(resolveProviderUsageTarget, defaultProviderCodexSubscriptionAdmission, func(cmd *cobra.Command, profile string) (providerattestation.KeyMetadata, error) {
+		cfg := loadSelectedConfigOrDefault()
+		if cfg == nil {
+			return providerattestation.KeyMetadata{}, errors.New("configuration unavailable")
+		}
+		p, err := cfg.ProviderProfile(profile)
+		if err != nil {
+			return providerattestation.KeyMetadata{}, err
+		}
+		sign, err := providerProfilePinnedSigner(p)
+		if err != nil {
+			return providerattestation.KeyMetadata{}, err
+		}
+		trusted, err := preflightProviderReceiptSignerMetadataFor(providerCommandContext(cmd), sign, false)
+		return trusted.KeyMetadata, err
+	})
+}
+
+func providerUsageSettlementCommand(resolve func(string, string) (provider.Identity, *state.SendOperation, error), admission func() *ratelimit.SubscriptionAdmissionController, trust func(*cobra.Command, string) (providerattestation.KeyMetadata, error)) *cobra.Command {
 	var profile, operation, evidenceFile, sourceFile, reviewFile string
-	var apply bool
+	var apply, inspectLegacy bool
 	cmd := &cobra.Command{Use: "settle-reviewed-usage", Short: "Verify a signed authenticated-source review and atomically settle its exact reservation", Args: cobra.NoArgs}
 	cmd.Flags().StringVar(&profile, "profile", "", "Exact Z.ai Codex profile")
 	cmd.Flags().StringVar(&operation, "operation-id", "", "Original bound operation")
 	cmd.Flags().StringVar(&evidenceFile, "evidence-file", "", "Absolute structured usage evidence")
 	cmd.Flags().StringVar(&sourceFile, "source-file", "", "Absolute authenticated provider source")
 	cmd.Flags().StringVar(&reviewFile, "review-file", "", "Absolute review signed by the pinned owner reviewer")
-	cmd.Flags().BoolVar(&apply, "apply", false, "Apply the verified exact settlement; no legacy exception")
+	cmd.Flags().BoolVar(&apply, "apply", false, "Apply the verified exact settlement")
+	cmd.Flags().BoolVar(&inspectLegacy, "inspect-legacy-reservations", false, "Show local nonce-less row fingerprints for review; does not prove request association")
 	cmd.RunE = func(cmd *cobra.Command, _ []string) error {
-		if !filepath.IsAbs(evidenceFile) || !filepath.IsAbs(sourceFile) || !filepath.IsAbs(reviewFile) || !validProviderNativeOperationID(operation) {
+		if !validProviderNativeOperationID(operation) || (!inspectLegacy && (!filepath.IsAbs(evidenceFile) || !filepath.IsAbs(sourceFile) || !filepath.IsAbs(reviewFile))) || (inspectLegacy && (apply || evidenceFile != "" || sourceFile != "" || reviewFile != "")) {
 			return errors.New("absolute evidence, source, review and exact operation are required")
 		}
-		id, row, err := resolveProviderUsageTarget(profile, operation)
+		id, row, err := resolve(profile, operation)
 		if err != nil {
 			return err
+		}
+		if inspectLegacy {
+			rows, err := admission().LegacyUsageReservations(id)
+			if err != nil {
+				return err
+			}
+			return encodeIndentedJSON(cmd.OutOrStdout(), map[string]any{"schema_version": "ntm.legacy-reservation-inspection.v1", "identity_sha256": id.Hash(), "reservation_sha256": rows, "provider_association": "unverified", "accounting_mutated": false, "admission_granted": false, "generation_calls": 0})
 		}
 		data, err := readProviderUsageFile(evidenceFile)
 		if err != nil {
@@ -141,30 +172,20 @@ func newProviderUsageSettlementCmd() *cobra.Command {
 		if decoder.Decode(&review) != nil || decoder.Decode(&struct{}{}) != io.EOF {
 			return errors.New("invalid source review")
 		}
-		cfg := loadSelectedConfigOrDefault()
-		if cfg == nil {
-			return errors.New("configuration unavailable")
-		}
-		p, err := cfg.ProviderProfile(profile)
-		if err != nil {
-			return err
-		}
-		sign, err := providerProfilePinnedSigner(p)
-		if err != nil {
-			return err
-		}
-		trusted, err := preflightProviderReceiptSignerMetadataFor(providerCommandContext(cmd), sign, false)
+		trusted, err := trust(cmd, profile)
 		if err != nil {
 			return err
 		}
 		imported := validateProviderUsageEvidence(data, source, id, operation, row, time.Now().UTC())
-		if err := verifyProviderUsageSourceReview(review, imported, trusted.KeyMetadata, time.Now().UTC()); err != nil {
+		if err := verifyProviderUsageSourceReview(review, imported, trusted, time.Now().UTC()); err != nil {
 			return err
 		}
-		// Contemporary reservation binding is mandatory. Legacy rows with no
-		// nonce are rejected by the atomic store, even with a valid review.
-		if apply {
-			if err := defaultProviderCodexSubscriptionAdmission().SettleReviewedUsage(id, row.BindingHash, review.NonceSHA256, *imported.Evidence.FinalUsage, imported.Evidence.RequestCompletedAt, sha256TextCLI(reviewData)); err != nil {
+		if review.LegacyReservationSHA256 != "" {
+			if err := admission().ReviewLegacyUsage(id, row.BindingHash, review.LegacyReservationSHA256, *imported.Evidence.FinalUsage, imported.Evidence.RequestCompletedAt, sha256TextCLI(reviewData), apply); err != nil {
+				return err
+			}
+		} else if apply {
+			if err := admission().SettleReviewedUsage(id, row.BindingHash, review.NonceSHA256, *imported.Evidence.FinalUsage, imported.Evidence.RequestCompletedAt, sha256TextCLI(reviewData)); err != nil {
 				return err
 			}
 		}
@@ -449,14 +470,14 @@ func providerCodexReconciliationPlan(id provider.Identity, snapshot ratelimit.Su
 		"legacy_authoritative_resolution": map[string]any{
 			"state":                   "evidence_required_no_automatic_migration",
 			"nonce_may_be_fabricated": false,
-			"current_settlement_accepts_nonce_less_rows": false,
+			"current_settlement_accepts_nonce_less_rows": true,
 			"required_provider_evidence": []string{
 				"authenticated provider account identity and immutable source/export or support response",
 				"provider request identifier correlated to the original operation timestamp and recorded binding; timestamp proximity alone is insufficient",
 				"terminal status, final Coding Plan charge and units, and settlement coverage of the request",
 				"if request correlation is unavailable: provider-authoritative accounting of all requests in the affected account/window, including outstanding liabilities and settlement cutoff",
 			},
-			"required_review": "Preserve the original nonce-less row; review authenticated correlation or full-window coverage before implementing a separate atomic migration. Do not invent a nonce or pass this row through exact nonce settlement.",
+			"required_review": "Inspect the exact local row fingerprint, then obtain a pinned signed v2 source review associating it with the authenticated original request. Preview and apply settle-reviewed-usage use the same atomic engine, require one unknown row and no active leases, preserve the absent nonce, and reject stale or conflicting evidence. Full-window evidence without exact request association is not supported by this migration.",
 			"next_action":     "Obtain the account-bound provider response/export and retain its source digest; keep the unknown reservation until its coverage can be verified.",
 		},
 		"evidence_sources": []map[string]string{

@@ -33,6 +33,127 @@ func TestProviderUsageReviewRejectsAmbiguousNestedSignature(t *testing.T) {
 	}
 }
 
+func TestProviderLegacySettlementSurfacePreviewApplyAndRestart(t *testing.T) {
+	id, row, e, source, now := providerUsageFixture(t)
+	path := filepath.Join(t.TempDir(), "capacity.json")
+	open := func() *ratelimit.SubscriptionAdmissionController {
+		c, err := ratelimit.NewSubscriptionAdmissionController(ratelimit.DefaultSubscriptionAdmissionConfig(), path, func() time.Time { return now }, func() float64 { return .5 })
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	c := open()
+	d := c.Acquire(id)
+	if !d.Allowed {
+		t.Fatal(d)
+	}
+	if err := c.RecordUnknownUsage(id, d); err != nil {
+		t.Fatal(err)
+	}
+	c.Release(id, d)
+	resolve := func(profile, operation string) (provider.Identity, *state.SendOperation, error) {
+		if profile != "exact" || operation != row.OperationID {
+			t.Fatal("target changed")
+		}
+		return id, row, nil
+	}
+	var key providerattestation.KeyMetadata
+	run := func(args ...string) (string, error) {
+		cmd := providerUsageSettlementCommand(resolve, open, func(*cobra.Command, string) (providerattestation.KeyMetadata, error) { return key, nil })
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&bytes.Buffer{})
+		cmd.SetArgs(append([]string{"--profile", "exact", "--operation-id", row.OperationID}, args...))
+		err := cmd.Execute()
+		return out.String(), err
+	}
+	out, err := run("--inspect-legacy-reservations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inspection struct {
+		Reservations []string `json:"reservation_sha256"`
+	}
+	if json.Unmarshal([]byte(out), &inspection) != nil || len(inspection.Reservations) != 1 {
+		t.Fatal(out)
+	}
+	data, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	imported := validateProviderUsageEvidence(data, source, id, row.OperationID, row, now)
+	review := providerUsageSourceReview{Schema: "ntm.provider-usage-source-review.v2", EvidenceSHA256: imported.EvidenceSHA256, SourceSHA256: imported.SourceSHA256, IdentitySHA256: id.Hash(), OperationBinding: row.BindingHash, LegacyReservationSHA256: inspection.Reservations[0], LegacyAssociation: "exact_local_reservation_associated_with_authenticated_original_request", ProviderAccount: e.ProviderAccount, ProviderRequest: e.ProviderRequest, SourceAuthentication: "authenticated_support_reply_reviewed", RequestAssociation: "original_request_confirmed_by_provider_source", ReviewedAt: now}
+	sign := newProviderNativeTestSigner()
+	payload, err := json.Marshal(review)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := sign(t.Context(), payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	review.Attestation = &sig
+	key = sig.KeyMetadata
+	dir := t.TempDir()
+	evidencePath, sourcePath, reviewPath := filepath.Join(dir, "evidence.json"), filepath.Join(dir, "source.txt"), filepath.Join(dir, "review.json")
+	if err := os.WriteFile(evidencePath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourcePath, source, 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeReview := func(r providerUsageSourceReview) {
+		b, err := json.Marshal(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = os.WriteFile(reviewPath, b, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := []string{"--evidence-file", evidencePath, "--source-file", sourcePath, "--review-file", reviewPath}
+	for _, mutate := range []func(*providerUsageSourceReview){
+		func(r *providerUsageSourceReview) { r.Attestation = nil },
+		func(r *providerUsageSourceReview) { r.LegacyAssociation = "timestamp_proximity" },
+		func(r *providerUsageSourceReview) { r.LegacyReservationSHA256 = strings.Repeat("f", 64) },
+		func(r *providerUsageSourceReview) { r.NonceSHA256 = strings.Repeat("f", 64) },
+		func(r *providerUsageSourceReview) { r.SourceAuthentication = "unverified" },
+	} {
+		changed := review
+		mutate(&changed)
+		writeReview(changed)
+		if _, err := run(append(args, "--apply")...); err == nil {
+			t.Fatal("untrusted migration accepted")
+		}
+		if !open().Snapshot(id).UnknownUsageReserved {
+			t.Fatal("rejected evidence released capacity")
+		}
+	}
+	writeReview(review)
+	if _, err := run(args...); err != nil {
+		t.Fatal(err)
+	}
+	if !open().Snapshot(id).UnknownUsageReserved {
+		t.Fatal("preview released capacity")
+	}
+	for i := 0; i < 2; i++ {
+		out, err := run(append(args, "--apply")...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(out, "private-source-canary") || !strings.Contains(out, `"generation_calls": 0`) || !strings.Contains(out, `"admission_granted": false`) {
+			t.Fatal(out)
+		}
+	}
+	if snapshot := open().Snapshot(id); snapshot.UnknownUsageReserved || snapshot.WeeklyCreditsUsed != *e.FinalUsage {
+		t.Fatal(snapshot)
+	}
+	if row.Status != state.SendOperationInProgress {
+		t.Fatal("accounting settlement declared task completion")
+	}
+}
+
 func providerUsageFixture(t *testing.T) (provider.Identity, *state.SendOperation, providerUsageEvidence, []byte, time.Time) {
 	t.Helper()
 	id, err := providerCodexProfile(t.TempDir()).Identity()
@@ -224,7 +345,7 @@ func TestProviderReconciliationPlanCannotGrantAdmissionOrMutateUnknownUsage(t *t
 		t.Fatal("missing actionable evidence requirements")
 	}
 	legacy := out["legacy_authoritative_resolution"].(map[string]any)
-	if legacy["nonce_may_be_fabricated"] != false || legacy["current_settlement_accepts_nonce_less_rows"] != false || len(legacy["required_provider_evidence"].([]string)) != 4 {
+	if legacy["nonce_may_be_fabricated"] != false || legacy["current_settlement_accepts_nonce_less_rows"] != true || len(legacy["required_provider_evidence"].([]string)) != 4 {
 		t.Fatal("legacy plan weakened exact settlement or lost its evidence requirements")
 	}
 }
