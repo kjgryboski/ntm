@@ -2091,6 +2091,7 @@ func observeExecutionLog(reader io.Reader, session string) provider.GrokExecutio
 				Kind    string `json:"kind"`
 				Attempt int    `json:"attempt"`
 				Limit   int    `json:"max_retries"`
+				Reason  string `json:"reason"`
 			}
 			if json.Unmarshal(entry.Context, &retry) != nil || retry.Kind == "" || retry.Attempt <= 0 || retry.Limit < 0 {
 				out.LogEvidence = "incomplete"
@@ -2101,6 +2102,18 @@ func observeExecutionLog(reader io.Reader, session string) provider.GrokExecutio
 			out.LastRetryKind, out.LastRetryAttempt, out.LastRetryLimit = retry.Kind, retry.Attempt, retry.Limit
 			if retry.Kind == "http" {
 				out.HTTPRetries++
+				out.TransportCause = executionTransportCause(retry.Reason)
+			}
+		case "shell.turn.inference_failed":
+			// Zero-retry runs report their cause only on the terminal event.
+			var failure struct {
+				Kind    string `json:"kind"`
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(entry.Context, &failure) != nil {
+				out.LogEvidence = "incomplete"
+			} else if failure.Kind == "http" {
+				out.TransportCause = executionTransportCause(failure.Message)
 			}
 		}
 	}
@@ -2111,6 +2124,16 @@ func observeExecutionLog(reader io.Reader, session string) provider.GrokExecutio
 		out.LogEvidence = "observed"
 	}
 	return (provider.ProtocolObservation{Execution: out}).Redacted().Execution
+}
+
+func executionTransportCause(message string) string {
+	// Only the patched producer's exact closed marker is interpretable. Older
+	// runtime prose is deliberately unknown; never guess from its URL or body.
+	category, ok := strings.CutPrefix(message, "transport_cause=")
+	if !ok || category == "" {
+		return "unknown"
+	}
+	return (provider.ProtocolObservation{Execution: provider.GrokExecutionObservation{TransportCause: category}}).Redacted().Execution.TransportCause
 }
 
 func (a *updateAccumulator) observeProtocol(event rpcEvent) {
@@ -2559,13 +2582,20 @@ func IsolatedProcessEnvironment(environ []string, runtimeHome string, workspaceW
 	}
 	base := minimalGrokEnvironment(environ)
 	overrides := map[string]string{
-		"HOME":                       runtimeHome,
-		"USERPROFILE":                runtimeHome,
-		"XDG_CONFIG_HOME":            filepath.Join(runtimeHome, ".xdg-config"),
-		"XDG_CACHE_HOME":             filepath.Join(runtimeHome, ".cache"),
-		"XDG_DATA_HOME":              filepath.Join(runtimeHome, ".local", "share"),
-		"GROK_HOME":                  runtimeHome,
-		"GROK_DISABLE_AUTOUPDATER":   "1",
+		"HOME":                     runtimeHome,
+		"USERPROFILE":              runtimeHome,
+		"XDG_CONFIG_HOME":          filepath.Join(runtimeHome, ".xdg-config"),
+		"XDG_CACHE_HOME":           filepath.Join(runtimeHome, ".cache"),
+		"XDG_DATA_HOME":            filepath.Join(runtimeHome, ".local", "share"),
+		"GROK_HOME":                runtimeHome,
+		"GROK_DISABLE_AUTOUPDATER": "1",
+		// The reviewed sampler gives this override precedence over model
+		// defaults (15). Disable internal resubmissions: a campaign attempt
+		// must not silently become a sequence of transport retries.
+		"GROK_MAX_RETRIES": "0",
+		// These independent resampling layers do not consult MAX_RETRIES.
+		"GROK_DOOM_LOOP_RECOVERY":    "0",
+		"GROK_TURN_TRANSIENT_RETRY":  "0",
 		"GROK_MEMORY":                "0",
 		"GROK_SUBAGENTS":             "0",
 		"GROK_TOOL_SEARCH":           "0",
@@ -2589,7 +2619,8 @@ func IsolatedProcessEnvironment(environ []string, runtimeHome string, workspaceW
 	order := []string{
 		"PATH", "TMPDIR", "TMP", "TEMP", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT",
 		"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "GROK_HOME",
-		"GROK_DISABLE_AUTOUPDATER", "GROK_MEMORY", "GROK_SUBAGENTS", "GROK_WRITE_FILE", "GROK_TOOL_SEARCH", "GROK_LSP_TOOLS",
+		"GROK_DISABLE_AUTOUPDATER", "GROK_MAX_RETRIES", "GROK_MEMORY", "GROK_SUBAGENTS", "GROK_WRITE_FILE", "GROK_TOOL_SEARCH", "GROK_LSP_TOOLS",
+		"GROK_DOOM_LOOP_RECOVERY", "GROK_TURN_TRANSIENT_RETRY",
 		"GROK_CURSOR_SKILLS_ENABLED", "GROK_CURSOR_RULES_ENABLED", "GROK_CURSOR_AGENTS_ENABLED", "GROK_CURSOR_MCPS_ENABLED", "GROK_CURSOR_HOOKS_ENABLED",
 		"GROK_CLAUDE_SKILLS_ENABLED", "GROK_CLAUDE_RULES_ENABLED", "GROK_CLAUDE_AGENTS_ENABLED", "GROK_CLAUDE_MCPS_ENABLED", "GROK_CLAUDE_HOOKS_ENABLED",
 	}

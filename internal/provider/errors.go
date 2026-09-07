@@ -33,11 +33,17 @@ type GrokExecutionObservation struct {
 	LastRetryKind        string `json:"last_retry_kind,omitempty"`
 	LastRetryAttempt     int    `json:"last_retry_attempt,omitempty"`
 	LastRetryLimit       int    `json:"last_retry_limit,omitempty"`
+	TransportCause       string `json:"transport_cause,omitempty"`
 	TerminalResponse     bool   `json:"terminal_response"`
 	LogEvidence          string `json:"log_evidence"`
 }
 
 func (o ProtocolObservation) Redacted() ProtocolObservation {
+	switch o.Execution.TransportCause {
+	case "", "dns", "tls", "http2", "timeout", "request_build", "connection_refused", "connection_reset", "connection_aborted", "unexpected_eof", "connect", "body", "decode", "unknown":
+	default:
+		o.Execution.TransportCause = "unknown"
+	}
 	switch o.Execution.LogEvidence {
 	case "observed", "unobserved", "incomplete", "unavailable":
 	default:

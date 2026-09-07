@@ -771,6 +771,8 @@ func TestIsolatedProcessEnvironmentReplacesAmbientProviderState(t *testing.T) {
 	env, err := IsolatedProcessEnvironment([]string{
 		"PATH=/bin", "HOME=/real-home", "XDG_CONFIG_HOME=/real-config",
 		"GROK_HOME=/attacker", "GROK_DEFAULT_MODEL=third-party", "GROK_SANDBOX=off",
+		"GROK_MAX_RETRIES=999",
+		"GROK_DOOM_LOOP_RECOVERY=1", "GROK_TURN_TRANSIENT_RETRY=1",
 		"GROK_CLAUDE_MCPS_ENABLED=1", "XAI_API_KEY=secret", "HTTPS_PROXY=https://user:secret@example.invalid", "SSL_CERT_FILE=/tmp/attacker-ca.pem",
 	}, "/profiles/grok-kevin/.grok", false)
 	if err != nil {
@@ -780,6 +782,8 @@ func TestIsolatedProcessEnvironmentReplacesAmbientProviderState(t *testing.T) {
 	for _, want := range []string{
 		"\nHOME=/profiles/grok-kevin/.grok\n",
 		"\nGROK_HOME=/profiles/grok-kevin/.grok\n",
+		"\nGROK_MAX_RETRIES=0\n",
+		"\nGROK_DOOM_LOOP_RECOVERY=0\n", "\nGROK_TURN_TRANSIENT_RETRY=0\n",
 		"\nGROK_WRITE_FILE=0\n",
 		"\nGROK_CLAUDE_MCPS_ENABLED=0\n",
 		"\nGROK_CURSOR_HOOKS_ENABLED=0\n",
@@ -1155,6 +1159,25 @@ func TestExecutionLogSeparatesQueueDispatchAndInference(t *testing.T) {
 	}
 	if observeExecutionLog(strings.NewReader("malformed\n"), "session").LogEvidence != "incomplete" {
 		t.Fatal("malformed log hidden")
+	}
+}
+
+func TestExecutionLogTransportCauseSurvivesWithoutRetries(t *testing.T) {
+	for _, tc := range []struct{ message, want string }{
+		{"transport_cause=dns", "dns"},
+		{"transport_cause=connection_refused", "connection_refused"},
+		{"transport_cause=tls", "tls"},
+		{"transport_cause=http2", "http2"},
+		{"transport_cause=timeout", "timeout"},
+		{"transport_cause=secret-canary", "unknown"},
+		{"error sending request for url https://secret-canary", "unknown"},
+	} {
+		log := `{"sid":"s","pid":10,"msg":"prompt received"}` + "\n" +
+			fmt.Sprintf(`{"sid":"s","pid":10,"msg":"shell.turn.inference_failed","ctx":{"kind":"http","message":%q}}`, tc.message)
+		got := observeExecutionLog(strings.NewReader(log), "s")
+		if got.TransportCause != tc.want || got.InferenceRetries != 0 || strings.Contains(string(mustJSON(t, got)), "secret-canary") {
+			t.Fatalf("unsafe or incorrect terminal transport observation: %+v", got)
+		}
 	}
 }
 

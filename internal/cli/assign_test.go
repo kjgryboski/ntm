@@ -3155,13 +3155,26 @@ func TestWatchLoopRejectsExpiredQueuedEventAfterTakeoverBeforeSideEffects(t *tes
 		t.Fatal("first queued completion handler did not start")
 	}
 
-	time.Sleep(2 * queuedLease)
 	takeoverStore, err := assignment.LoadStoreStrict(session)
 	if err != nil {
 		t.Fatalf("load takeover completion consumer: %v", err)
 	}
-	if _, acquired, err := takeoverStore.ClaimPendingCompletionEvent(t.Context(), secondBead, secondEvent, takeoverToken, activeLease); err != nil || !acquired {
-		t.Fatalf("take over expired queued completion event acquired=%v error=%v", acquired, err)
+	// The persisted lease uses UTC; a fixed sleep is not evidence that its
+	// deadline elapsed when the host clock is corrected. Observe the actual
+	// takeover, while bounding the wait with Go's monotonic clock.
+	takeoverDeadline := time.Now().Add(5 * time.Second)
+	for {
+		_, acquired, claimErr := takeoverStore.ClaimPendingCompletionEvent(t.Context(), secondBead, secondEvent, takeoverToken, activeLease)
+		if claimErr != nil {
+			t.Fatalf("take over expired queued completion event: %v", claimErr)
+		}
+		if acquired {
+			break
+		}
+		if time.Now().After(takeoverDeadline) {
+			t.Fatal("queued completion lease did not become available within bounded wait")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	close(releaseFirstHandler)

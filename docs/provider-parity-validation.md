@@ -440,6 +440,32 @@ pinned revision. Retrospective log analysis remains unsigned supporting evidence
 existing receipts are never rewritten to add these fields. Zero retry fields
 are omitted to preserve both pre-execution and execution-era signed bytes.
 
+The isolated Grok environment now pins `GROK_MAX_RETRIES=0`, overriding ambient
+and model retry defaults through the reviewed sampler's existing setting. It also
+pins `GROK_DOOM_LOOP_RECOVERY=0` and `GROK_TURN_TRANSIENT_RETRY=0`: those independent
+resampling layers do not consult the sampler's transport retry limit. Controller
+campaign attempts remain separately counted. These settings do not bound every
+request made by other runtime subsystems or by the underlying HTTP library,
+prove remote acceptance, or measure billable usage. The controller deadline and
+campaign ceiling still apply. Changing this pin requires a reviewed policy change.
+
+The local source patch for grok-build preserves a closed `transport_cause=...`
+marker across the sampler's non-Clone HTTP error conversion, which otherwise loses
+the underlying source chain. NTM accepts only its exact category vocabulary from
+the bound session/process retry or terminal inference-failure event. Older runtime
+prose remains `unknown`; no substring interpretation of endpoint URLs or payloads
+grants a cause. Categories are diagnostic observations, never admission evidence.
+The source patch requires a separately pinned runtime qualification before it can
+replace the installed provider runtime. No existing receipt is rewritten.
+
+The retained September 7 broker regression establishes a host-clock reversal:
+the successful `go-vet` command's completion precedes its start by about 66 ms.
+Full safe audit receipts now survive a failed test's cleanup in test output.
+Timestamp-order validation remains strict. A rerun on a stable clock does not
+erase that failure or demonstrate that host-clock stability has been repaired.
+The noisy-pane test now waits for the static marker and for actual window activity
+to advance beyond its first observation instead of assuming a fixed sleep suffices.
+
 ## Historical Z.ai reservations without nonces
 
 The existing reconciliation plan now spells out the missing historical evidence.

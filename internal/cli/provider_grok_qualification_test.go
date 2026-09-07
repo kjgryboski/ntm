@@ -496,6 +496,11 @@ func TestProviderGrokWorkspaceBrokerProducesRealQualificationEvidence(t *testing
 	}
 	assertions := evaluateProviderGrokWorkspaceAudit(audit, workspace.Worktree, revision)
 	if !assertions.ReadObserved || !assertions.EditObserved || !assertions.SecretDenied || !assertions.TestObserved {
+		diagnostic, marshalErr := json.Marshal(audit)
+		if marshalErr != nil {
+			t.Fatalf("marshal failed broker evidence: %v", marshalErr)
+		}
+		t.Logf("compiled broker audit: %s", diagnostic)
 		t.Fatalf("real broker evidence was incomplete: %+v", assertions)
 	}
 	content, err := os.ReadFile(filepath.Join(workspace.Worktree, filepath.FromSlash(providerGrokWorkspaceTarget)))

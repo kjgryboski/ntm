@@ -605,7 +605,6 @@ func TestDetectPaneLocalActivityIgnoresNoisyNeighbor(t *testing.T) {
 	if out, err := noisyCmd.CombinedOutput(); err != nil {
 		t.Fatalf("create noisy pane: %v: %s", err, out)
 	}
-	time.Sleep(200 * time.Millisecond)
 
 	// Locate the static pane by its marker command.
 	listOut, err := exec.Command(tmux.BinaryPath(), "list-panes", "-t", sessionName,
@@ -625,13 +624,43 @@ func TestDetectPaneLocalActivityIgnoresNoisyNeighbor(t *testing.T) {
 	}
 
 	d := NewDetector()
+	// Observe the marker before establishing content history. Startup and
+	// tmux's whole-second activity clock have no fixed scheduling bound.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		output, captureErr := tmux.CapturePaneOutputContext(t.Context(), staticPane, d.Config().ScanLines)
+		if captureErr != nil {
+			t.Fatalf("capture static marker: %v", captureErr)
+		}
+		if strings.Contains(output, "NTM213_STATIC_DONE") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("static pane did not produce its marker")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	first, err := d.Detect(staticPane)
 	if err != nil {
 		t.Fatalf("first Detect: %v", err)
 	}
 
-	// Let the neighbor churn well past the first observation.
-	time.Sleep(1500 * time.Millisecond)
+	// Wait for the actual window clock to advance beyond the observation.
+	// A fixed sleep can finish while window_activity still has the old second.
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		activity, activityErr := tmux.GetPaneActivity(staticPane)
+		if activityErr != nil {
+			t.Fatalf("wait for neighbor activity: %v", activityErr)
+		}
+		if activity.After(first.UpdatedAt) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("neighbor window activity did not advance: activity=%v observation=%v", activity, first.UpdatedAt)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	second, err := d.Detect(staticPane)
 	if err != nil {

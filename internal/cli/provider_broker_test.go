@@ -97,6 +97,13 @@ func TestProviderBrokerControllerUsesRealWorkspaceAndIsolatedVerifier(t *testing
 	}
 	checks := evaluateProviderGrokWorkspaceAudit(audit, workspace.Worktree, revision)
 	if !checks.ReadObserved || !checks.EditObserved || !checks.SecretDenied || !checks.TestObserved {
+		// The audit contains only bounded receipts and hashes. Retain it in
+		// failed test output so command status and time ordering survive cleanup.
+		diagnostic, marshalErr := json.Marshal(audit)
+		if marshalErr != nil {
+			t.Fatalf("marshal failed controller evidence: %v", marshalErr)
+		}
+		t.Logf("controller audit: %s", diagnostic)
 		t.Fatalf("controller evidence incomplete: %+v", checks)
 	}
 	if broker.RejectedCalls() != 1 {
