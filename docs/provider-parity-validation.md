@@ -498,6 +498,40 @@ accept a self-reported duration as proof of completion or remote usage settlemen
 
 ## Historical Z.ai reservations without nonces
 
+`TestZaiSupportResponseFixturesPreserveOriginalReservation` runs synthetic support
+responses through `provider codex import-usage-evidence`: sufficient for source
+review, missing final usage, unknown outstanding liability, incomplete cutoff,
+a later operation, a different local account, and complete-account-window evidence.
+It verifies that rejected responses still persist digest-bound review reasons and
+that every original reservation remains byte-for-byte unchanged. A different but
+well-formed provider account/request claim deliberately remains **unverified**:
+structural validation cannot authenticate the source or prove its association.
+Complete-window evidence needs a separately reviewed migration; the current
+request-only importer does not reinterpret it or clear nonce-less reservations.
+
+## One-command comparison across configurations
+
+Use `provider readiness --profile first,second --profile-config first=/absolute/first.toml
+--profile-config second=/absolute/second.toml --json` to inspect profiles whose
+evidence lives in different configuration-specific ledgers. Bind every selected
+profile exactly once. Duplicate, unknown, relative or incomplete bindings fail
+before inspection; there is no implicit fallback to another ledger.
+
+Each profile uses the same executable's existing readiness command in a separate
+process, sequentially, with a one-minute deadline and 8 MiB output ceiling. This
+preserves configuration isolation without swapping the controller's environment.
+The combined observation validates the exact profile identity, configuration hash
+before/after inspection, and ledger path. Each lane includes `source` with the
+configuration path/hash, ledger path and observation time. Existing signed receipt
+observations, individual capabilities, qualification expiry, account/model/runtime
+identity and capacity remain intact. Configuration hashes describe the selected
+global file; normal project policy overlays still apply. This is a current local
+observation, not a signed portable authorization or an atomic cross-ledger snapshot.
+It grants no dispatch, renews no evidence, and performs no generation or quota poll.
+When a campaign is selected, the same campaign ID is inspected in each selected
+configuration's campaign store; purpose and external authorization still apply.
+
+## Resolving the historical reservation
 
 The existing reconciliation plan now spells out the missing historical evidence.
 Exact nonce settlement cannot accept the original nonce-less reservation. Do not

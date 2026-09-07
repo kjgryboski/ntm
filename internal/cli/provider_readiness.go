@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -27,6 +30,7 @@ type providerReadinessEvidence struct {
 }
 
 type providerReadinessLane struct {
+	Source                 *providerReadinessSource      `json:"source,omitempty"`
 	Profile                string                        `json:"profile"`
 	Identity               providerDoctorIdentity        `json:"identity"`
 	AccountSHA256          string                        `json:"account_sha256"`
@@ -52,6 +56,13 @@ type providerReadinessLane struct {
 	AssignmentPreview      providerAssignmentPreview     `json:"assignment_preview"`
 	TaskStatistics         providerTaskStatistics        `json:"task_statistics"`
 	Operator               providerOperatorReadiness     `json:"operator"`
+}
+
+type providerReadinessSource struct {
+	ConfigPath   string    `json:"config_path"`
+	ConfigSHA256 string    `json:"config_sha256"`
+	LedgerPath   string    `json:"ledger_path"`
+	ObservedAt   time.Time `json:"observed_at"`
 }
 
 type providerOperatorReadiness struct {
@@ -195,12 +206,17 @@ func providerTaskRequirementPassed(current, parent providerAssignmentStatus, req
 // This is a single read surface over existing admission and receipt owners.
 // It never reserves capacity, sends a prompt, or manufactures a qualification.
 func newProviderReadinessCmd() *cobra.Command {
-	var profiles, operations, requirements []string
+	return providerReadinessCommand(runProviderReadinessChild)
+}
+
+func providerReadinessCommand(run func(context.Context, []string) ([]byte, error)) *cobra.Command {
+	var profiles, operations, requirements, profileConfigs []string
 	var cwd string
 	var duration time.Duration
 	cmd := &cobra.Command{Use: "readiness", Aliases: []string{"preview"}, Short: "Compare exact provider readiness, capability evidence and separate capacity units without generation", Args: cobra.NoArgs}
 	cmd.Flags().StringSliceVar(&requirements, "require", []string{"model_identity", "workspace_edit", "test_execution", "permission_denial", "cleanup"}, "Required demonstrated capabilities for the read-only assignment preview")
 	cmd.Flags().StringSliceVar(&profiles, "profile", nil, "Exact provider profiles; repeat to compare providers")
+	cmd.Flags().StringArrayVar(&profileConfigs, "profile-config", nil, "PROFILE=absolute config path; when used, bind every selected profile exactly once to its own configuration and ledger")
 	cmd.Flags().StringSliceVar(&operations, "operation", nil, "Existing task evidence as PROFILE=OPERATION_ID; repeat for completion and cancellation")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "Absolute intended workspace for local policy inspection; defaults to current directory")
 	cmd.Flags().DurationVar(&duration, "task-timeout", 5*time.Minute, "Intended task duration for credential and qualification window checks")
@@ -221,12 +237,37 @@ func newProviderReadinessCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		loaded := loadSelectedConfigOrDefault()
-		if loaded == nil {
+		routes, err := providerReadinessConfigBindings(profiles, profileConfigs)
+		if err != nil {
+			return err
+		}
+		var loaded *config.Config
+		if len(routes) == 0 {
+			loaded = loadSelectedConfigOrDefault()
+		}
+		if loaded == nil && len(routes) == 0 {
 			return errors.New("configuration unavailable")
 		}
 		lanes := make([]providerReadinessLane, 0, len(profiles))
 		for _, name := range profiles {
+			if path, routed := routes[name]; routed {
+				args := []string{"--config", path, "--json", "provider", "readiness", "--profile", name, "--require", strings.Join(requirements, ","), "--task-timeout", duration.String()}
+				if cwd != "" {
+					args = append(args, "--cwd", cwd)
+				}
+				if providerCampaignID != "" {
+					args = append(args, "--campaign-id", providerCampaignID)
+				}
+				for _, operation := range bindings[name] {
+					args = append(args, "--operation", name+"="+operation)
+				}
+				lane, err := readProviderReadinessConfig(cmd.Context(), name, path, args, run)
+				if err != nil {
+					return fmt.Errorf("readiness for %s: %w", name, err)
+				}
+				lanes = append(lanes, lane)
+				continue
+			}
 			lane, err := buildProviderReadiness(cmd, loaded, name, cwd)
 			if err != nil {
 				return err
@@ -268,6 +309,14 @@ func newProviderReadinessCmd() *cobra.Command {
 			lane.AssignmentPreview = previewProviderAssignment(lane, requirements)
 			lane.TaskStatistics = summarizeProviderTasks(lane.Operations)
 			lane.Operator = providerOperatorView(lane)
+			if data, err := readProviderReadinessConfigFile(selectedConfigPath()); err == nil {
+				path, pathErr := filepath.Abs(selectedConfigPath())
+				ledger, ledgerErr := filepath.Abs(state.DefaultPath())
+				if pathErr != nil || ledgerErr != nil {
+					return errors.New("cannot resolve readiness provenance")
+				}
+				lane.Source = &providerReadinessSource{ConfigPath: path, ConfigSHA256: sha256TextCLI(data), LedgerPath: ledger, ObservedAt: time.Now().UTC()}
+			}
 			lanes = append(lanes, lane)
 		}
 		if IsJSONOutput() {
@@ -297,6 +346,122 @@ func newProviderReadinessCmd() *cobra.Command {
 		return nil
 	}
 	return cmd
+}
+
+func providerReadinessConfigBindings(profiles, entries []string) (map[string]string, error) {
+	routes := map[string]string{}
+	selected := map[string]bool{}
+	for _, name := range profiles {
+		if selected[name] {
+			return nil, errors.New("duplicate readiness profile")
+		}
+		selected[name] = true
+	}
+	for _, entry := range entries {
+		name, path, ok := strings.Cut(entry, "=")
+		if !ok || !selected[name] || routes[name] != "" || !filepath.IsAbs(path) {
+			return nil, errors.New("profile-config requires one absolute configuration for each exact selected profile")
+		}
+		routes[name] = filepath.Clean(path)
+	}
+	if len(entries) > 0 && len(routes) != len(profiles) {
+		return nil, errors.New("profile-config must bind every selected profile; implicit ledger fallback is not allowed")
+	}
+	return routes, nil
+}
+
+func readProviderReadinessConfigFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, errors.New("readiness configuration unavailable")
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<20 {
+		return nil, errors.New("readiness requires a regular configuration of at most 1 MiB")
+	}
+	data, err := io.ReadAll(io.LimitReader(f, (1<<20)+1))
+	if err != nil || len(data) > 1<<20 {
+		return nil, errors.New("readiness configuration read failed")
+	}
+	return data, nil
+}
+
+// Each child runs the existing read surface with its own selected config. No
+// global config/environment is swapped in this process and no generation route
+// is reachable through the fixed arguments constructed above.
+func runProviderReadinessChild(ctx context.Context, args []string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, errors.New("readiness executable unavailable")
+	}
+	child := exec.CommandContext(ctx, executable, args...)
+	child.WaitDelay = 2 * time.Second
+	child.Stderr = io.Discard
+	out := &providerReadinessOutput{cancel: cancel}
+	child.Stdout = out
+	if err := child.Run(); err != nil {
+		return nil, errors.New("readiness child failed, timed out or exceeded output limit; no generation was requested")
+	}
+	return out.buffer.Bytes(), nil
+}
+
+type providerReadinessOutput struct {
+	buffer bytes.Buffer
+	cancel context.CancelFunc
+}
+
+func (out *providerReadinessOutput) Write(data []byte) (int, error) {
+	if len(data) > (8<<20)-out.buffer.Len() {
+		out.cancel()
+		return 0, errors.New("readiness output limit exceeded")
+	}
+	return out.buffer.Write(data)
+}
+
+func readProviderReadinessConfig(ctx context.Context, name, path string, args []string, run func(context.Context, []string) ([]byte, error)) (providerReadinessLane, error) {
+	var empty providerReadinessLane
+	before, err := readProviderReadinessConfigFile(path)
+	if err != nil {
+		return empty, err
+	}
+	workingDir, err := os.Getwd()
+	if err != nil {
+		return empty, err
+	}
+	loaded, err := config.LoadMerged(workingDir, path)
+	if err != nil {
+		return empty, errors.New("selected readiness configuration is invalid")
+	}
+	profile, found := loaded.ProviderProfiles[name]
+	identity, identityErr := profile.Identity()
+	if !found || identityErr != nil {
+		return empty, errors.New("exact readiness profile is unavailable")
+	}
+	data, err := run(ctx, args)
+	if err != nil {
+		return empty, err
+	}
+	after, err := readProviderReadinessConfigFile(path)
+	if err != nil || sha256TextCLI(before) != sha256TextCLI(after) {
+		return empty, errors.New("readiness configuration changed during inspection")
+	}
+	var report struct {
+		Schema             string                  `json:"schema_version"`
+		GenerationCalls    *int                    `json:"generation_calls"`
+		DispatchAuthorized *bool                   `json:"dispatch_authorized"`
+		Providers          []providerReadinessLane `json:"providers"`
+	}
+	if len(data) > 8<<20 || json.Unmarshal(data, &report) != nil || report.Schema != "ntm.provider-readiness.v1" || report.GenerationCalls == nil || *report.GenerationCalls != 0 || report.DispatchAuthorized == nil || *report.DispatchAuthorized || len(report.Providers) != 1 {
+		return empty, errors.New("invalid read-only readiness observation")
+	}
+	lane := report.Providers[0]
+	if lane.Profile != name || lane.Identity.SHA256 != identity.Hash() || lane.DispatchAuthorized || lane.Source == nil || lane.Source.ConfigPath != path || lane.Source.ConfigSHA256 != sha256TextCLI(before) || lane.Source.LedgerPath != filepath.Join(filepath.Dir(path), "state.db") || lane.Source.ObservedAt.IsZero() {
+		return empty, errors.New("readiness identity or configuration/ledger provenance mismatch")
+	}
+	return lane, nil
 }
 
 // A campaign records a ceiling and the digest of external authorization, not

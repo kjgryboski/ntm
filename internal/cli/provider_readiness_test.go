@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,11 +11,155 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/ntm/internal/config"
 	"github.com/Dicklesworthstone/ntm/internal/provider"
 	"github.com/Dicklesworthstone/ntm/internal/providerqualification"
 	"github.com/Dicklesworthstone/ntm/internal/state"
 	"github.com/spf13/cobra"
 )
+
+func TestReadinessSurfaceRoutesEachProfileToItsOwnConfigAndLedger(t *testing.T) {
+	previous := jsonOutput
+	jsonOutput = true
+	t.Cleanup(func() { jsonOutput = previous })
+	paths := map[string]string{}
+	for _, name := range []string{"first", "second"} {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		text := fmt.Sprintf("[provider_profiles.%s]\nprovider='xai'\naccount_alias='%s'\nmodel='grok-fixture'\nendpoint='https://api.x.ai/v1'\nruntime='grok'\nconfig_sha256='%s'\n", name, name, strings.Repeat("a", 64))
+		if err := os.WriteFile(path, []byte(text), 0600); err != nil {
+			t.Fatal(err)
+		}
+		paths[name] = path
+	}
+	expires := time.Now().UTC().Add(time.Hour)
+	calls := 0
+	run := func(_ context.Context, args []string) ([]byte, error) {
+		calls++
+		name, path := args[6], args[1]
+		if path != paths[name] || strings.Contains(strings.Join(args, " "), "--profile-config") || args[4] != "readiness" || args[2] != "--json" || !strings.Contains(strings.Join(args, " "), "--task-timeout 3m0s") {
+			t.Fatalf("wrong read-only route: %v", args)
+		}
+		if name == "second" && !strings.Contains(strings.Join(args, " "), "--operation second=original") {
+			t.Fatal("explicit task binding lost")
+		}
+		loaded, err := config.Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := loaded.ProviderProfiles[name].Identity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lane := providerReadinessLane{Profile: name, Identity: providerDoctorIdentity{SHA256: id.Hash()}, QualificationExpiresAt: &expires, Operations: []providerAssignmentStatus{{OutcomeSHA256: strings.Repeat("b", 64), IdentityBindingVerified: true}}, Checks: []providerReadinessEvidence{{Operation: "workspace_edit", State: "passed", EvidenceSHA256: strings.Repeat("c", 64)}}, Source: &providerReadinessSource{ConfigPath: path, ConfigSHA256: sha256TextCLI(data), LedgerPath: filepath.Join(filepath.Dir(path), "state.db"), ObservedAt: time.Now().UTC()}}
+		return json.Marshal(map[string]any{"schema_version": "ntm.provider-readiness.v1", "generation_calls": 0, "dispatch_authorized": false, "providers": []providerReadinessLane{lane}})
+	}
+	cmd := providerReadinessCommand(run)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--profile", "first,second", "--profile-config", "first=" + paths["first"], "--profile-config", "second=" + paths["second"], "--operation", "second=original", "--task-timeout", "3m"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	var report struct {
+		Providers []providerReadinessLane `json:"providers"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || len(report.Providers) != 2 {
+		t.Fatal("lost a provider")
+	}
+	for _, lane := range report.Providers {
+		if lane.Source == nil || lane.Source.ConfigPath != paths[lane.Profile] || !lane.QualificationExpiresAt.Equal(expires) || len(lane.Operations) != 1 || lane.Operations[0].OutcomeSHA256 != strings.Repeat("b", 64) || len(lane.Checks) != 1 || lane.Checks[0].EvidenceSHA256 != strings.Repeat("c", 64) || lane.DispatchAuthorized {
+			t.Fatal("receipt, provenance, expiry or authority changed")
+		}
+	}
+	for _, mutation := range []string{"wrong-ledger", "wrong-identity", "wrong-config-hash", "wrong-profile", "missing-source", "generation", "dispatch", "missing-generation", "extra-provider", "malformed", "config-drift"} {
+		t.Run(mutation, func(t *testing.T) {
+			child := func(ctx context.Context, args []string) ([]byte, error) {
+				data, err := run(ctx, args)
+				if err != nil {
+					return nil, err
+				}
+				var raw map[string]any
+				if err := json.Unmarshal(data, &raw); err != nil {
+					t.Fatal(err)
+				}
+				lane := raw["providers"].([]any)[0].(map[string]any)
+				source := lane["source"].(map[string]any)
+				switch mutation {
+				case "wrong-ledger":
+					source["ledger_path"] = paths["second"]
+				case "wrong-identity":
+					lane["identity"].(map[string]any)["sha256"] = strings.Repeat("f", 64)
+				case "wrong-config-hash":
+					source["config_sha256"] = strings.Repeat("f", 64)
+				case "wrong-profile":
+					lane["profile"] = "second"
+				case "missing-source":
+					delete(lane, "source")
+				case "generation":
+					raw["generation_calls"] = 1
+				case "dispatch":
+					raw["dispatch_authorized"] = true
+				case "missing-generation":
+					delete(raw, "generation_calls")
+				case "extra-provider":
+					raw["providers"] = []any{lane, lane}
+				case "malformed":
+					return []byte("{"), nil
+				case "config-drift":
+					old, err := os.ReadFile(args[1])
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() {
+						if err := os.WriteFile(args[1], old, 0600); err != nil {
+							t.Error(err)
+						}
+					})
+					if err := os.WriteFile(args[1], append(old, []byte("\n# changed\n")...), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return json.Marshal(raw)
+			}
+			cmd := providerReadinessCommand(child)
+			cmd.SetOut(&bytes.Buffer{})
+			cmd.SetErr(&bytes.Buffer{})
+			cmd.SetArgs([]string{"--profile", "first", "--profile-config", "first=" + paths["first"], "--task-timeout", "3m"})
+			if cmd.Execute() == nil {
+				t.Fatal("invalid observation accepted")
+			}
+		})
+	}
+}
+
+func TestReadinessConfigRoutesRejectAmbiguousFallbackBeforeInspection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	for _, entries := range [][]string{{"first=" + path}, {"first=" + path, "first=" + path}, {"first=" + path, "third=" + path}, {"first=relative", "second=" + path}} {
+		cmd := providerReadinessCommand(func(context.Context, []string) ([]byte, error) { t.Fatal("inspected invalid routing"); return nil, nil })
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		args := []string{"--profile", "first,second"}
+		for _, entry := range entries {
+			args = append(args, "--profile-config", entry)
+		}
+		cmd.SetArgs(args)
+		if cmd.Execute() == nil {
+			t.Fatal("ambiguous config accepted")
+		}
+	}
+	cancelled := false
+	out := &providerReadinessOutput{cancel: func() { cancelled = true }}
+	if _, err := out.Write(make([]byte, (8<<20)+1)); err == nil || !cancelled || out.buffer.Len() != 0 {
+		t.Fatal("output limit failed to cancel without retaining oversized output")
+	}
+}
 
 func TestOperatorViewNeverPromotesConditionalAttemptCeiling(t *testing.T) {
 	for _, remaining := range []int{-1, 0, 1, 2} {

@@ -229,6 +229,100 @@ func TestProviderReconciliationPlanCannotGrantAdmissionOrMutateUnknownUsage(t *t
 	}
 }
 
+// Support-response triage exercises the actual import surface and its durable
+// output, including rejected replies. The synthetic original is nonce-less:
+// even a complete structural record remains an unauthenticated source claim.
+func TestZaiSupportResponseFixturesPreserveOriginalReservation(t *testing.T) {
+	for _, scenario := range []struct {
+		name, reason string
+		valid        bool
+	}{
+		{"sufficient-for-source-review", "", true},
+		{"partial-no-final-usage", "invalid_usage_or_units", false},
+		{"partial-unknown-outstanding", "request_settlement_incomplete", false},
+		{"partial-cutoff", "settlement_window_invalid", false},
+		{"mismatched-later-operation", "local_identity_or_operation_mismatch", false},
+		{"mismatched-local-account", "local_identity_or_operation_mismatch", false},
+		{"complete-window-needs-separate-migration", "request_settlement_incomplete", false},
+		{"different-provider-association-still-unverified", "", true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			id, row, evidence, source, _ := providerUsageFixture(t)
+			row.OperationID = "synthetic-zai-model-probe-a1"
+			evidence.OperationIDSHA256 = sha256StringCLI(row.OperationID)
+			switch scenario.name {
+			case "partial-no-final-usage":
+				evidence.FinalUsage = nil
+			case "partial-unknown-outstanding":
+				evidence.OutstandingUsage = nil
+			case "partial-cutoff":
+				evidence.SettledThrough = evidence.RequestCompletedAt.Add(-time.Second)
+			case "mismatched-later-operation":
+				evidence.OperationIDSHA256 = sha256StringCLI("synthetic-zai-model-probe-a2")
+			case "mismatched-local-account":
+				evidence.AccountAliasSHA256 = sha256StringCLI("different-account")
+			case "complete-window-needs-separate-migration":
+				evidence.SettlementScope = "complete_account_window"
+				evidence.SourceKind = "provider_account_export"
+			case "different-provider-association-still-unverified":
+				evidence.ProviderAccount = strings.Repeat("d", 64)
+				evidence.ProviderRequest = strings.Repeat("e", 64)
+			}
+			before, err := json.Marshal(row)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(evidence)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			recordPath, sourcePath, outputPath := filepath.Join(dir, "record.json"), filepath.Join(dir, "source.txt"), filepath.Join(dir, "review.json")
+			if err := os.WriteFile(recordPath, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(sourcePath, source, 0600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := providerUsageImportCommand(func(profile, operation string) (provider.Identity, *state.SendOperation, error) {
+				if profile != "synthetic-zai" || operation != row.OperationID {
+					t.Fatal("original reservation target changed")
+				}
+				return id, row, nil
+			})
+			var stdout bytes.Buffer
+			cmd.SetOut(&stdout)
+			cmd.SetErr(&bytes.Buffer{})
+			cmd.SetArgs([]string{"--profile", "synthetic-zai", "--operation-id", row.OperationID, "--evidence-file", recordPath, "--source-file", sourcePath, "--output", outputPath})
+			err = cmd.Execute()
+			if (err == nil) != scenario.valid {
+				t.Fatalf("wrong result: %v", err)
+			}
+			persisted, err := os.ReadFile(outputPath)
+			if err != nil {
+				t.Fatal("rejected reply lost diagnostic review:", err)
+			}
+			var result providerUsageImportResult
+			if err := json.Unmarshal(persisted, &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.ValidationPassed != scenario.valid || result.AccountingMutated || result.AdmissionGranted || result.GenerationCalls != 0 || result.Authority != "external_source_review_required" || result.ProviderAssociation != "unverified_source_claim" || result.EvidenceSHA256 != sha256TextCLI(data) || result.SourceSHA256 != sha256TextCLI(source) {
+				t.Fatal("reply changed authority or lost exact evidence binding")
+			}
+			if scenario.reason != "" && !strings.Contains(strings.Join(result.Reasons, ","), scenario.reason) {
+				t.Fatalf("missing actionable reason: %+v", result.Reasons)
+			}
+			after, err := json.Marshal(row)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatal("nonce-less original reservation mutated")
+			}
+			if bytes.Contains(persisted, []byte("private-source-canary")) || bytes.Contains(stdout.Bytes(), []byte("private-source-canary")) {
+				t.Fatal("private source retained in diagnostic output")
+			}
+		})
+	}
+}
+
 type providerCodexCapacityRecoveryAdmissionFake struct {
 	status       ratelimit.CapacityStatus
 	before       ratelimit.SubscriptionCapacitySnapshot
